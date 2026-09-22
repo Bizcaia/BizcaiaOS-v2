@@ -337,4 +337,88 @@ describe('operationsApi demo adapter', () => {
     const withArchived = await operationsApi.listTasks(negotiationProperty, { includeArchived: true });
     expect(withArchived.some((task) => task.id === seeded.id)).toBe(true);
   });
+
+  // The demo actor is fixed as Alex Villanueva (system_admin), so only the
+  // elevated-writer path is reachable through the demo API for payments too
+  // -- supervisor/negotiator/legal_documentation/viewer denial is exercised
+  // exhaustively in the mocked route tests and the real-Postgres RLS
+  // integration tests instead.
+
+  it('lists the seeded payments for a property', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    const payments = await operationsApi.listPayments(negotiationProperty);
+    expect(payments).toHaveLength(2);
+    expect(payments.some((payment) => payment.payment_type === 'deposit' && payment.status === 'paid')).toBe(true);
+    expect(payments.some((payment) => payment.payment_type === 'installment' && payment.status === 'scheduled')).toBe(
+      true,
+    );
+  });
+
+  it('creates a payment as the elevated demo actor', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    const payment = await operationsApi.createPayment(negotiationProperty, {
+      amount: 250000,
+      paymentType: 'final_payment',
+      referenceNumber: 'FINAL-01',
+    });
+    expect(payment).toMatchObject({
+      amount: 250000,
+      currency_code: 'PHP',
+      payment_type: 'final_payment',
+      status: 'pending',
+      reference_number: 'FINAL-01',
+      recorded_by_user_id: '758d5718-53d9-4ea2-b9d5-02828fcc0e2c',
+      recorded_by_name: 'Alex Villanueva',
+    });
+
+    const payments = await operationsApi.listPayments(negotiationProperty);
+    expect(payments.some((entry) => entry.id === payment.id)).toBe(true);
+  });
+
+  it('rejects a non-positive payment amount', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    await expect(
+      operationsApi.createPayment(negotiationProperty, { amount: 0, paymentType: 'deposit' }),
+    ).rejects.toThrow(/greater than zero/i);
+    await expect(
+      operationsApi.createPayment(negotiationProperty, { amount: -100, paymentType: 'deposit' }),
+    ).rejects.toThrow(/greater than zero/i);
+  });
+
+  it('rejects a payment negotiation link that does not belong to the same property', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    await expect(
+      operationsApi.createPayment(negotiationProperty, {
+        amount: 100000,
+        paymentType: 'deposit',
+        negotiationId: 'aaaaaaaa-0000-0000-0000-000000000000',
+      }),
+    ).rejects.toThrow(/negotiation must belong to the same property/i);
+  });
+
+  it('updates status and paid date, and archives a payment', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+    const [seeded] = await operationsApi.listPayments(negotiationProperty);
+
+    const updated = await operationsApi.updatePayment(seeded.id, { status: 'paid', paidOn: '2026-10-05' });
+    expect(updated).toMatchObject({ status: 'paid', paid_on: '2026-10-05' });
+
+    const archived = await operationsApi.updatePayment(seeded.id, { archived: true });
+    expect(archived.archived_at).not.toBeNull();
+
+    const defaultList = await operationsApi.listPayments(negotiationProperty);
+    expect(defaultList.some((payment) => payment.id === seeded.id)).toBe(false);
+
+    const withArchived = await operationsApi.listPayments(negotiationProperty, { includeArchived: true });
+    expect(withArchived.some((payment) => payment.id === seeded.id)).toBe(true);
+  });
 });
