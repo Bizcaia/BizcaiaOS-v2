@@ -1,0 +1,260 @@
+openapi: 3.1.0
+info:
+  title: BizcaiaOS Organization and User Management API
+  version: 0.1.0
+  description: Authenticated onboarding, organization profile, invitations, and membership management endpoints aligned with PostgreSQL RBAC/RLS.
+servers:
+  - url: http://localhost:8787/api/v1
+security:
+  - bearerAuth: []
+paths:
+  /me:
+    get:
+      summary: Return the authenticated application user and active organizations
+      responses:
+        '200':
+          description: Current user and organization memberships
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /organizations/onboard:
+    post:
+      summary: Create an organization and the first System Administrator membership
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OnboardOrganization'
+      responses:
+        '201':
+          description: Organization created
+        '409':
+          description: Slug conflict or user already belongs to an active organization
+  /organizations:
+    get:
+      summary: List organizations for the authenticated user
+      responses:
+        '200':
+          description: Active organization memberships
+  /organizations/{organizationId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      summary: Get an organization visible to the authenticated member
+      responses:
+        '200':
+          description: Organization
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      summary: Update an organization profile as a System Administrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrganization'
+      responses:
+        '200':
+          description: Updated organization
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /organizations/{organizationId}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      summary: List organization members visible to an active member
+      responses:
+        '200':
+          description: Organization member list
+  /organizations/{organizationId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      summary: Change a member role or active state as a System Administrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMembership'
+      responses:
+        '200':
+          description: Updated membership
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: Change would remove the final active System Administrator
+    delete:
+      summary: Remove an organization member as a System Administrator
+      responses:
+        '204':
+          description: Membership removed
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: Change would remove the final active System Administrator
+  /organizations/{organizationId}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      summary: List invitations as a System Administrator
+      responses:
+        '200':
+          description: Invitation list without token digests
+    post:
+      summary: Create a single-use organization invitation as a System Administrator
+      description: Returns the raw token exactly once. Deliver it through a trusted email or invitation service and never log it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvitation'
+      responses:
+        '201':
+          description: Invitation created; raw token returned once
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: A pending invitation already exists for this email and organization
+  /organizations/{organizationId}/invitations/{invitationId}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/InvitationId'
+    post:
+      summary: Revoke a pending invitation as a System Administrator
+      responses:
+        '200':
+          description: Invitation revoked
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /invitations/accept:
+    post:
+      summary: Accept an invitation as the authenticated user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  minLength: 32
+      responses:
+        '200':
+          description: Membership activated
+        '403':
+          description: Invitation email does not match the authenticated user
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Invitation is expired or no longer pending
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    OrganizationId:
+      name: organizationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    InvitationId:
+      name: invitationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    OrganizationRole:
+      type: string
+      enum:
+        - system_admin
+        - land_acquisition_manager
+        - supervisor
+        - negotiator
+        - legal_documentation
+        - finance
+        - viewer
+    OnboardOrganization:
+      type: object
+      additionalProperties: false
+      required: [name, slug]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'
+        timezone:
+          type: string
+          default: Asia/Manila
+    UpdateOrganization:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        legalName:
+          type: [string, 'null']
+          maxLength: 160
+        timezone:
+          type: string
+        settings:
+          type: object
+          additionalProperties: true
+    CreateInvitation:
+      type: object
+      additionalProperties: false
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          allOf:
+            - $ref: '#/components/schemas/OrganizationRole'
+          not:
+            const: system_admin
+        expiresInHours:
+          type: integer
+          minimum: 1
+          maximum: 336
+          default: 72
+    UpdateMembership:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        role:
+          $ref: '#/components/schemas/OrganizationRole'
+        isActive:
+          type: boolean
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+    Forbidden:
+      description: Authenticated user lacks the required role or organization scope
+    NotFound:
+      description: Resource is absent or invisible under RLS

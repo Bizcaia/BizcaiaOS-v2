@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #efe6dd; color: #0d0d0d; font-family: 'Inter', sans-serif; }
+    .slide-container { 
+      width: 1280px; 
+      height: 720px; 
+      background: #efe6dd; 
+      display: flex; 
+      flex-direction: column;
+      padding: 64px;
+      position: relative;
+    }
+    .eyebrow {
+      font-size: 14px;
+      font-weight: 600;
+      color: #9a0002;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+    h2 {
+      font-family: 'Baloo 2', sans-serif;
+      font-size: 56px;
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      margin-bottom: 48px;
+    }
+    .brand-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 80px;
+      flex: 1;
+    }
+    .palette-zone h3, .typo-zone h3 {
+      font-family: 'Baloo 2', sans-serif;
+      font-size: 24px;
+      font-weight: 600;
+      margin-bottom: 24px;
+      color: #6e0001;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .swatches {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+    .swatch {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .color-box {
+      height: 120px;
+      border-radius: 4px;
+      border: 1px solid rgba(0,0,0,0.05);
+    }
+    .swatch span {
+      font-size: 12px;
+      font-weight: 600;
+      color: #675f59;
+    }
+    .typo-sample {
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+    .sample-item span {
+      display: block;
+      font-size: 12px;
+      color: #9a0002;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    .sample-display {
+      font-family: 'Baloo 2', sans-serif;
+      font-size: 48px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .sample-body {
+      font-family: 'Inter', sans-serif;
+      font-size: 24px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="slide-container">
+    <div class="eyebrow">Brand System</div>
+    <h2>Visual language & identity.</h2>
+    <div class="brand-grid">
+      <div class="palette-zone">
+        <h3>Color Palette</h3>
+        <div class="swatches">
+          <div class="swatch">
+            <div class="color-box" style="background: #9a0002;"></div>
+            <span>Bizcaia Red<br>#9A0002</span>
+          </div>
+          <div class="swatch">
+            <div class="color-box" style="background: #0d0d0d;"></div>
+            <span>Near Black<br>#0D0D0D</span>
+          </div>
+          <div class="swatch">
+            <div class="color-box" style="background: #efe6dd;"></div>
+            <span>Cream Base<br>#EFE6DD</span>
+          </div>
+        </div>
+      </div>
+      <div class="typo-zone">
+        <h3>Typography</h3>
+        <div class="typo-sample">
+          <div class="sample-item">
+            <span>Display / Baloo 2</span>
+            <div class="sample-display">Move every property closer to close.</div>
+          </div>
+          <div class="divider h-px bg-black opacity-10"></div>
+          <div class="sample-item">
+            <span>Body / Inter</span>
+            <div class="sample-body">BizcaiaOS brings your acquisition pipeline into one clear operating view.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

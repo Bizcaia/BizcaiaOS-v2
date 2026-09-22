@@ -1,0 +1,45 @@
+{
+  "name": "bizcaiaos-ops-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "dev:api": "tsx watch server/index.ts",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "typecheck": "tsc -p tsconfig.client.json --noEmit",
+    "start:api": "tsx server/index.ts",
+    "typecheck:api": "tsc -p tsconfig.server.json --noEmit",
+    "test:api": "vitest run server --environment node",
+    "test:frontend": "vitest run src",
+    "test:frontend:watch": "vitest src",
+    "test:frontend:coverage": "vitest run src --coverage",
+    "test": "pnpm run test:frontend && pnpm run test:api"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "express": "^5.1.0",
+    "jose": "^6.1.0",
+    "lucide-react": "latest",
+    "pg": "^8.16.3",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.6.0",
+    "@types/pg": "^8.15.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "jsdom": "^30.1.0",
+    "tsx": "^4.20.6",
+    "vitest": "^3.2.4"
+  }
+}
