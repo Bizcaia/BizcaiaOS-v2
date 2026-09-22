@@ -9,6 +9,19 @@ export const app = express();
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+
+app.use((request, response, next) => {
+  const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
+  response.setHeader('Access-Control-Allow-Origin', origin);
+  response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  if (request.method === 'OPTIONS') {
+    response.status(204).end();
+    return;
+  }
+  next();
+});
+
 app.use(express.json({ limit: '256kb' }));
 
 app.get('/health', async (_request, response, next) => {
@@ -78,7 +91,7 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => 
 
 app.use(errorHandler);
 
-if (process.env.NODE_ENV !== 'test') {
+if (process.env.NODE_ENV !== 'test' && process.env.VITEST !== 'true') {
   const port = Number(process.env.API_PORT ?? 8787);
   app.listen(port, '0.0.0.0', () => {
     console.log(`BizcaiaOS API listening on http://0.0.0.0:${port}`);

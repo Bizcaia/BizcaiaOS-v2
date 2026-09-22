@@ -58,6 +58,7 @@ declare global {
   }
 }
 
+/** Live mode expects VITE_API_BASE_URL to include the /api/v1 prefix. Empty = demo adapter. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const organizationApiMode = apiBase ? 'live' : 'demo';
 
