@@ -32,7 +32,6 @@
 ./src/api/organizationApi.ts
 ./src/components/ErrorBoundary.tsx
 ./src/contexts/ThemeContext.tsx
-./src/index.css
 ./src/main.tsx
 ./src/pages/Home.tsx
 ./src/pages/OpsApp.tsx

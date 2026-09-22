@@ -15,18 +15,18 @@
     "test:frontend": "vitest run src",
     "test:frontend:watch": "vitest src",
     "test:frontend:coverage": "vitest run src --coverage",
-    "test": "pnpm run test:frontend && pnpm run test:api"
+    "test": "npm run test:frontend && npm run test:api"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
+    "@vitejs/plugin-react": "4.7.0",
     "express": "^5.1.0",
     "jose": "^6.1.0",
-    "lucide-react": "latest",
+    "lucide-react": "0.544.0",
     "pg": "^8.16.3",
-    "react": "latest",
-    "react-dom": "latest",
-    "typescript": "latest",
-    "vite": "latest",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript": "5.9.3",
+    "vite": "6.4.3",
     "zod": "^4.1.11"
   },
   "devDependencies": {

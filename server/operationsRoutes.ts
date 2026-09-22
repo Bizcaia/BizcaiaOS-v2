@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import type { PoolClient } from 'pg';
 import { requireUser } from './auth.js';
 import { firstRow, withActorTransaction } from './database.js';
 import { organizationIdParamsSchema, type OrganizationRole } from './schemas.js';
@@ -6,7 +7,7 @@ import { createProjectSchema, createPropertySchema, idParamsSchema, projectListQ
 
 export const operationsRouter = Router();
 
-async function requireRole(client: any, organizationId: string, userId: string, roles: OrganizationRole[]) {
+async function requireRole(client: PoolClient, organizationId: string, userId: string, roles: OrganizationRole[]) {
   const result = await client.query<{ role: OrganizationRole }>('select role from public.organization_memberships where organization_id=$1 and user_id=$2 and is_active=true', [organizationId, userId]);
   if (!result.rows[0] || !roles.includes(result.rows[0].role)) { const error = new Error('You do not have permission for this operation') as Error & { status?: number }; error.status = 403; throw error; }
 }
