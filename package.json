@@ -11,11 +11,16 @@
     "typecheck": "tsc -p tsconfig.client.json --noEmit",
     "start:api": "tsx server/index.ts",
     "typecheck:api": "tsc -p tsconfig.server.json --noEmit",
-    "test:api": "vitest run server --environment node",
+    "test:api": "vitest run server --environment node --exclude server/integration/**",
     "test:frontend": "vitest run src",
     "test:frontend:watch": "vitest src",
     "test:frontend:coverage": "vitest run src --coverage",
-    "test": "npm run test:frontend && npm run test:api"
+    "test": "npm run test:frontend && npm run test:api",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d --wait && npm run db:migrate",
+    "db:migrate": "tsx server/migrate.ts",
+    "test:integration": "vitest run server/integration --environment node"
   },
   "dependencies": {
     "@vitejs/plugin-react": "4.7.0",
