@@ -26,6 +26,9 @@ import {
   createTaskSchema,
   taskListQuerySchema,
   updateTaskSchema,
+  createPaymentSchema,
+  paymentListQuerySchema,
+  updatePaymentSchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 
@@ -36,6 +39,7 @@ const PROPERTY_CREATE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisi
 const NEGOTIATION_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const DOCUMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
 const TASK_SELF_ASSIGN_CREATE_ROLES: OrganizationRole[] = ['legal_documentation', 'finance'];
+const PAYMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'finance'];
 
 const negotiationPatchColumns: Record<string, string> = {
   status: 'status',
@@ -1020,4 +1024,134 @@ operationsRouter.patch('/tasks/:id', async (request, response) => {
     return firstRow(result.rows, 'Task update failed');
   });
   response.json({ data: task });
+});
+
+const paymentSelect = `
+  select pm.*, u.display_name as recorded_by_name
+    from public.payments pm
+    left join public.app_users u on u.id = pm.recorded_by_user_id`;
+
+const paymentPatchColumns: Record<string, string> = {
+  amount: 'amount',
+  currencyCode: 'currency_code',
+  paymentType: 'payment_type',
+  negotiationId: 'negotiation_id',
+  status: 'status',
+  scheduledOn: 'scheduled_on',
+  paidOn: 'paid_on',
+  referenceNumber: 'reference_number',
+};
+
+operationsRouter.get('/properties/:id/payments', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const query = paymentListQuerySchema.parse(request.query);
+  const payments = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    if (!(await currentRole(client, property.organization_id, user.id))) {
+      throw httpError(404, 'Property not found');
+    }
+    const values: unknown[] = [id];
+    const where = ['pm.property_id=$1'];
+    if (query.status) {
+      values.push(query.status);
+      where.push(`pm.status=$${values.length}`);
+    }
+    if (query.paymentType) {
+      values.push(query.paymentType);
+      where.push(`pm.payment_type=$${values.length}`);
+    }
+    if (!query.includeArchived) {
+      where.push('pm.archived_at is null');
+    }
+    const result = await client.query(
+      `${paymentSelect} where ${where.join(' and ')} order by pm.created_at desc`,
+      values,
+    );
+    return result.rows;
+  });
+  response.json({ data: payments });
+});
+
+operationsRouter.post('/properties/:id/payments', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = createPaymentSchema.parse(request.body);
+  const payment = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    const role = await requireVisibleProperty(client, property.organization_id, user.id);
+    if (!PAYMENT_WRITE_ROLES.includes(role)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+
+    const inserted = await client.query<{ id: string }>(
+      `insert into public.payments (
+          organization_id, property_id, negotiation_id, amount, currency_code, payment_type,
+          scheduled_on, paid_on, reference_number, recorded_by_user_id
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        returning id`,
+      [
+        property.organization_id,
+        id,
+        body.negotiationId ?? null,
+        body.amount,
+        body.currencyCode.toUpperCase(),
+        body.paymentType,
+        body.scheduledOn ?? null,
+        body.paidOn ?? null,
+        body.referenceNumber ?? null,
+        user.id,
+      ],
+    );
+    const paymentId = firstRow(inserted.rows, 'Payment creation failed').id;
+    const result = await client.query(`${paymentSelect} where pm.id=$1`, [paymentId]);
+    return firstRow(result.rows, 'Payment creation failed');
+  });
+  response.status(201).json({ data: payment });
+});
+
+operationsRouter.patch('/payments/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = updatePaymentSchema.parse(request.body);
+  const payment = await withActorTransaction(user.id, async (client) => {
+    const existing = firstRow(
+      (await client.query(`select * from public.payments where id=$1`, [id])).rows,
+      'Payment not found',
+    );
+    const role = await requireVisibleProperty(client, existing.organization_id, user.id);
+    if (!PAYMENT_WRITE_ROLES.includes(role)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    const add = (column: string, value: unknown) => {
+      values.push(value);
+      sets.push(`${column}=$${values.length}`);
+    };
+    if (body.amount !== undefined) add(paymentPatchColumns.amount, body.amount);
+    if (body.currencyCode !== undefined) add(paymentPatchColumns.currencyCode, body.currencyCode.toUpperCase());
+    if (body.paymentType !== undefined) add(paymentPatchColumns.paymentType, body.paymentType);
+    if (body.negotiationId !== undefined) add(paymentPatchColumns.negotiationId, body.negotiationId);
+    if (body.status !== undefined) add(paymentPatchColumns.status, body.status);
+    if (body.scheduledOn !== undefined) add(paymentPatchColumns.scheduledOn, body.scheduledOn);
+    if (body.paidOn !== undefined) add(paymentPatchColumns.paidOn, body.paidOn);
+    if (body.referenceNumber !== undefined) add(paymentPatchColumns.referenceNumber, body.referenceNumber);
+    if (body.archived !== undefined) add('archived_at', body.archived ? new Date().toISOString() : null);
+
+    if (sets.length) {
+      values.push(id);
+      await client.query(`update public.payments set ${sets.join(', ')} where id=$${values.length}`, values);
+    }
+    const result = await client.query(`${paymentSelect} where pm.id=$1`, [id]);
+    return firstRow(result.rows, 'Payment update failed');
+  });
+  response.json({ data: payment });
 });

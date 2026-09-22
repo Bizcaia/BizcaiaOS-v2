@@ -14,9 +14,12 @@ import {
   type Owner,
   type OwnerType,
   type Project,
+  type PaymentStatus,
+  type PaymentType,
   type Property,
   type PropertyDocument,
   type PropertyOwner,
+  type PropertyPayment,
   type PropertyTask,
   type TaskPriority,
   type TaskStatus,
@@ -109,6 +112,22 @@ const taskPriorityLabels: Record<TaskPriority, string> = {
 
 const taskManagerRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const taskSelfAssignCreateRoles: OrganizationRole[] = ['legal_documentation', 'finance'];
+
+const paymentTypeLabels: Record<PaymentType, string> = {
+  deposit: 'Deposit',
+  installment: 'Installment',
+  final_payment: 'Final payment',
+};
+
+const paymentStatusLabels: Record<PaymentStatus, string> = {
+  pending: 'Pending',
+  scheduled: 'Scheduled',
+  paid: 'Paid',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
+
+const paymentWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'finance'];
 
 type OpsTab = 'dashboard' | 'projects' | 'properties' | 'team';
 
@@ -765,6 +784,7 @@ function PropertyDrawer({
         />
         <DocumentBlock property={property} role={role} />
         <TaskBlock property={property} role={role} members={members} projects={projects} currentUserId={currentUserId} />
+        <PaymentBlock property={property} role={role} />
       </aside>
     </div>
   );
@@ -1311,6 +1331,154 @@ function TaskBlock({
             }}
           >
             Create task
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
+
+function PaymentBlock({ property, role }: { property: Property; role: OrganizationRole }) {
+  const [payments, setPayments] = useState<PropertyPayment[]>([]);
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const [amount, setAmount] = useState('');
+  const [currencyCode, setCurrencyCode] = useState('PHP');
+  const [paymentType, setPaymentType] = useState<PaymentType>('deposit');
+  const [scheduledOn, setScheduledOn] = useState('');
+  const [referenceNumber, setReferenceNumber] = useState('');
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const canWrite = paymentWriteRoles.includes(role);
+
+  const refresh = async () => {
+    setPayments(await operationsApi.listPayments(property.id, { includeArchived }));
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) => setError(cause instanceof Error ? cause.message : 'Unable to load payments'));
+  }, [property.id, includeArchived]);
+
+  return (
+    <section className="owner-block">
+      <h3>Payments</h3>
+      {error && <p className="form-error">{error}</p>}
+      <label className="checkbox-row">
+        <input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} />
+        Include archived payments
+      </label>
+      {payments.length === 0 ? (
+        <p>No payments recorded yet.</p>
+      ) : (
+        <ul className="owner-list">
+          {payments.map((paymentRecord) => (
+            <li key={paymentRecord.id}>
+              <strong>{formatMoney(paymentRecord.amount, paymentRecord.currency_code)}</strong>
+              <small>
+                {paymentTypeLabels[paymentRecord.payment_type]} · {paymentStatusLabels[paymentRecord.status]}
+                {paymentRecord.recorded_by_name ? ` · ${paymentRecord.recorded_by_name}` : ''}
+                {paymentRecord.scheduled_on ? ` · Scheduled ${paymentRecord.scheduled_on}` : ''}
+                {paymentRecord.paid_on ? ` · Paid ${paymentRecord.paid_on}` : ''}
+                {paymentRecord.reference_number ? ` · Ref ${paymentRecord.reference_number}` : ''}
+                {paymentRecord.archived_at ? ' · Archived' : ''}
+              </small>
+              {canWrite && (
+                <>
+                  <label>
+                    Status for payment of {formatMoney(paymentRecord.amount, paymentRecord.currency_code)}
+                    <select
+                      value={paymentRecord.status}
+                      onChange={async (event) => {
+                        await operationsApi.updatePayment(paymentRecord.id, {
+                          status: event.target.value as PaymentStatus,
+                        });
+                        await refresh();
+                      }}
+                    >
+                      {Object.entries(paymentStatusLabels).map(([key, label]) => (
+                        <option key={key} value={key}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Paid date for payment {paymentRecord.id}
+                    <input
+                      type="date"
+                      value={paymentRecord.paid_on ?? ''}
+                      onChange={async (event) => {
+                        await operationsApi.updatePayment(paymentRecord.id, { paidOn: event.target.value || null });
+                        await refresh();
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await operationsApi.updatePayment(paymentRecord.id, { archived: !paymentRecord.archived_at });
+                      await refresh();
+                    }}
+                  >
+                    {paymentRecord.archived_at ? 'Unarchive payment' : 'Archive payment'}
+                  </button>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {canWrite && (
+        <>
+          <h3>Record payment</h3>
+          <label>
+            Payment amount
+            <input value={amount} onChange={(event) => setAmount(event.target.value)} type="number" min="0" step="0.01" />
+          </label>
+          <label>
+            Payment currency
+            <input value={currencyCode} onChange={(event) => setCurrencyCode(event.target.value)} maxLength={3} />
+          </label>
+          <label>
+            Payment type
+            <select value={paymentType} onChange={(event) => setPaymentType(event.target.value as PaymentType)}>
+              {Object.entries(paymentTypeLabels).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Payment scheduled date
+            <input type="date" value={scheduledOn} onChange={(event) => setScheduledOn(event.target.value)} />
+          </label>
+          <label>
+            Payment reference number
+            <input value={referenceNumber} onChange={(event) => setReferenceNumber(event.target.value)} />
+          </label>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={!amount || saving}
+            onClick={async () => {
+              setSaving(true);
+              setError('');
+              try {
+                await operationsApi.createPayment(property.id, {
+                  amount: Number(amount),
+                  currencyCode,
+                  paymentType,
+                  scheduledOn: scheduledOn || null,
+                  referenceNumber: referenceNumber || null,
+                });
+                setAmount('');
+                setReferenceNumber('');
+                setScheduledOn('');
+                await refresh();
+              } catch (cause) {
+                setError(cause instanceof Error ? cause.message : 'Unable to record payment');
+              } finally {
+                setSaving(false);
+              }
+            }}
+          >
+            Record payment
           </button>
         </>
       )}

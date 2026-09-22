@@ -266,5 +266,49 @@ describe('OpsApp property workflow', () => {
     expect(screen.queryByLabelText('Task title')).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/Status for Follow up on survey plan/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Archive task' })).not.toBeInTheDocument();
+
+    expect(await screen.findByRole('heading', { name: 'Payments' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Record payment' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Payment amount')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Archive payment' })).not.toBeInTheDocument();
+  });
+
+  it('shows seeded payments and lets an elevated role record a payment', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Payments' })).toBeVisible();
+    expect(screen.getByText(/Deposit · Paid/)).toBeVisible();
+    expect(screen.getByText(/Installment · Scheduled/)).toBeVisible();
+
+    await user.type(screen.getByLabelText('Payment amount'), '250000');
+    await user.selectOptions(screen.getByLabelText('Payment type'), 'Final payment');
+    await user.click(screen.getByRole('button', { name: 'Record payment' }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Final payment · Pending/)).toBeVisible();
+    });
+  });
+
+  it('hides payment creation and edit controls from a negotiator, unlike tasks', async () => {
+    apiMocks.getMe.mockResolvedValue({
+      id: members[2].user_id,
+      email: members[2].email,
+      displayName: members[2].display_name,
+      organizations: [{ ...organization, role: 'negotiator' }],
+    });
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    // Negotiators can create/edit their own tasks, but have no payment access at all.
+    expect(await screen.findByRole('heading', { name: 'Create task' })).toBeVisible();
+    expect(await screen.findByRole('heading', { name: 'Payments' })).toBeVisible();
+    expect(screen.getByText(/Deposit · Paid/)).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Record payment' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Payment amount')).not.toBeInTheDocument();
   });
 });

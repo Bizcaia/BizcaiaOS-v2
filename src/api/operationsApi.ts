@@ -173,6 +173,28 @@ export type PropertyTask = {
   archived_at: string | null;
 };
 
+export type PaymentType = 'deposit' | 'installment' | 'final_payment';
+export type PaymentStatus = 'pending' | 'scheduled' | 'paid' | 'failed' | 'cancelled';
+
+export type PropertyPayment = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  negotiation_id: string | null;
+  amount: number;
+  currency_code: string;
+  payment_type: PaymentType;
+  status: PaymentStatus;
+  scheduled_on: string | null;
+  paid_on: string | null;
+  reference_number: string | null;
+  recorded_by_user_id: string;
+  recorded_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const operationsApiMode = apiBase ? 'live' : 'demo';
@@ -408,6 +430,20 @@ function decorateTask(task: PropertyTask): PropertyTask {
     assigned_user_name: task.assigned_user_id ? demoUsers[task.assigned_user_id] ?? null : null,
     created_by_name: demoUsers[task.created_by_user_id] ?? null,
   };
+}
+
+let demoPayments: PropertyPayment[] = [];
+
+const paymentWriteRoles = new Set(['system_admin', 'land_acquisition_manager', 'finance']);
+
+/** Fixed role set, organization-wide -- no property scoping and no assignee/self-service model, unlike tasks. */
+function demoCanWritePayment(): boolean {
+  const member = demoActorMembership();
+  return !!member && paymentWriteRoles.has(member.role);
+}
+
+function decoratePayment(payment: PropertyPayment): PropertyPayment {
+  return { ...payment, recorded_by_name: demoUsers[payment.recorded_by_user_id] ?? null };
 }
 
 function decorateNegotiation(negotiation: Negotiation): Negotiation {
@@ -657,6 +693,42 @@ export function resetOperationsDemoState() {
       created_by_user_id: '419fa143-1d97-40cd-b47b-812cb364acfd',
       created_at: '2026-09-05T00:00:00.000Z',
       updated_at: '2026-09-11T00:00:00.000Z',
+      archived_at: null,
+    }),
+  ];
+  demoPayments = [
+    decoratePayment({
+      id: 'b1000000-0000-4000-8000-000000000001',
+      organization_id: demoOrg,
+      property_id: '70000000-0000-4000-8000-000000000001',
+      negotiation_id: '90000000-0000-4000-8000-000000000001',
+      amount: 500000,
+      currency_code: 'PHP',
+      payment_type: 'deposit',
+      status: 'paid',
+      scheduled_on: '2026-08-15',
+      paid_on: '2026-08-15',
+      reference_number: 'WIRE-2026-0815',
+      recorded_by_user_id: '8714eff3-6be9-4cc8-bf5f-c4dbb62d90cb',
+      created_at: '2026-08-15T00:00:00.000Z',
+      updated_at: '2026-08-15T00:00:00.000Z',
+      archived_at: null,
+    }),
+    decoratePayment({
+      id: 'b1000000-0000-4000-8000-000000000002',
+      organization_id: demoOrg,
+      property_id: '70000000-0000-4000-8000-000000000001',
+      negotiation_id: '90000000-0000-4000-8000-000000000001',
+      amount: 1200000,
+      currency_code: 'PHP',
+      payment_type: 'installment',
+      status: 'scheduled',
+      scheduled_on: '2026-10-01',
+      paid_on: null,
+      reference_number: null,
+      recorded_by_user_id: '8714eff3-6be9-4cc8-bf5f-c4dbb62d90cb',
+      created_at: '2026-09-20T00:00:00.000Z',
+      updated_at: '2026-09-20T00:00:00.000Z',
       archived_at: null,
     }),
   ];
@@ -1300,6 +1372,124 @@ export const operationsApi = {
       updated_at: now(),
     });
     demoTasks[index] = next;
+    return next;
+  },
+
+  async listPayments(
+    propertyId: string,
+    filters?: { status?: PaymentStatus; paymentType?: PaymentType; includeArchived?: boolean },
+  ) {
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams();
+      if (filters?.status) query.set('status', filters.status);
+      if (filters?.paymentType) query.set('paymentType', filters.paymentType);
+      if (filters?.includeArchived) query.set('includeArchived', 'true');
+      const qs = query.toString();
+      return request<PropertyPayment[]>(`/ops/properties/${propertyId}/payments${qs ? `?${qs}` : ''}`);
+    }
+    return demoPayments
+      .filter((payment) => payment.property_id === propertyId)
+      .filter((payment) => !filters?.status || payment.status === filters.status)
+      .filter((payment) => !filters?.paymentType || payment.payment_type === filters.paymentType)
+      .filter((payment) => filters?.includeArchived || !payment.archived_at)
+      .map(decoratePayment)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  },
+
+  async createPayment(
+    propertyId: string,
+    input: {
+      amount: number;
+      currencyCode?: string;
+      paymentType: PaymentType;
+      negotiationId?: string | null;
+      scheduledOn?: string | null;
+      paidOn?: string | null;
+      referenceNumber?: string | null;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyPayment>(`/ops/properties/${propertyId}/payments`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    }
+    if (!demoCanWritePayment()) throw new Error('You do not have permission for this operation');
+    if (!(input.amount > 0)) throw new Error('Payment amount must be greater than zero');
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property) throw new Error('Property not found');
+    if (input.negotiationId) {
+      const negotiation = demoNegotiations.find((entry) => entry.id === input.negotiationId);
+      if (!negotiation || negotiation.property_id !== propertyId) {
+        throw new Error('Payment negotiation must belong to the same property');
+      }
+    }
+    const timestamp = now();
+    const payment = decoratePayment({
+      id: crypto.randomUUID(),
+      organization_id: property.organization_id,
+      property_id: propertyId,
+      negotiation_id: input.negotiationId ?? null,
+      amount: input.amount,
+      currency_code: (input.currencyCode ?? 'PHP').toUpperCase(),
+      payment_type: input.paymentType,
+      status: 'pending',
+      scheduled_on: input.scheduledOn ?? null,
+      paid_on: input.paidOn ?? null,
+      reference_number: input.referenceNumber ?? null,
+      recorded_by_user_id: DEMO_ACTOR_ID,
+      created_at: timestamp,
+      updated_at: timestamp,
+      archived_at: null,
+    });
+    demoPayments = [payment, ...demoPayments];
+    return payment;
+  },
+
+  async updatePayment(
+    id: string,
+    input: {
+      amount?: number;
+      currencyCode?: string;
+      paymentType?: PaymentType;
+      negotiationId?: string | null;
+      status?: PaymentStatus;
+      scheduledOn?: string | null;
+      paidOn?: string | null;
+      referenceNumber?: string | null;
+      archived?: boolean;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyPayment>(`/ops/payments/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+    }
+    if (!demoCanWritePayment()) throw new Error('You do not have permission for this operation');
+    if (input.amount !== undefined && !(input.amount > 0)) {
+      throw new Error('Payment amount must be greater than zero');
+    }
+    const index = demoPayments.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('Payment not found');
+    const existing = demoPayments[index];
+    if (input.negotiationId) {
+      const negotiation = demoNegotiations.find((entry) => entry.id === input.negotiationId);
+      if (!negotiation || negotiation.property_id !== existing.property_id) {
+        throw new Error('Payment negotiation must belong to the same property');
+      }
+    }
+    const next = decoratePayment({
+      ...existing,
+      amount: input.amount ?? existing.amount,
+      currency_code: input.currencyCode ? input.currencyCode.toUpperCase() : existing.currency_code,
+      payment_type: input.paymentType ?? existing.payment_type,
+      negotiation_id: input.negotiationId === undefined ? existing.negotiation_id : input.negotiationId,
+      status: input.status ?? existing.status,
+      scheduled_on: input.scheduledOn === undefined ? existing.scheduled_on : input.scheduledOn,
+      paid_on: input.paidOn === undefined ? existing.paid_on : input.paidOn,
+      reference_number: input.referenceNumber === undefined ? existing.reference_number : input.referenceNumber,
+      archived_at: input.archived === undefined ? existing.archived_at : input.archived ? now() : null,
+      updated_at: now(),
+    });
+    demoPayments[index] = next;
     return next;
   },
 

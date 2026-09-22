@@ -38,6 +38,7 @@ type Store = {
   negotiationEvents: Array<Record<string, unknown>>;
   documents: Array<Record<string, unknown>>;
   tasks: Array<Record<string, unknown>>;
+  payments: Array<Record<string, unknown>>;
 };
 
 const TASK_USER_NAMES: Record<string, string> = {
@@ -134,6 +135,7 @@ function seedStore(role: Role = 'system_admin'): Store {
     negotiationEvents: [],
     documents: [],
     tasks: [],
+    payments: [],
   };
 }
 
@@ -549,6 +551,98 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
       paramIndex += 1;
     }
     return { rows: [store.tasks[index]], rowCount: 1 };
+  }
+  if (normalized.startsWith('insert into public.payments')) {
+    const row = {
+      id: crypto.randomUUID(),
+      organization_id: params[0],
+      property_id: params[1],
+      negotiation_id: params[2] ?? null,
+      amount: params[3],
+      currency_code: params[4],
+      payment_type: params[5],
+      status: 'pending',
+      scheduled_on: params[6] ?? null,
+      paid_on: params[7] ?? null,
+      reference_number: params[8] ?? null,
+      recorded_by_user_id: params[9],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      archived_at: null,
+    };
+    store.payments.push(row);
+    return { rows: [{ id: row.id }], rowCount: 1 };
+  }
+  if (normalized.includes('from public.payments pm')) {
+    let rows: Array<Record<string, unknown>> = store.payments.map((payment) => ({
+      ...payment,
+      recorded_by_name: TASK_USER_NAMES[payment.recorded_by_user_id as string] ?? null,
+    }));
+    if (normalized.includes('where pm.id=$1')) {
+      rows = rows.filter((payment) => payment.id === params[0]);
+    } else if (normalized.includes('pm.property_id=$1')) {
+      rows = rows.filter((payment) => payment.property_id === params[0]);
+      let paramIndex = 1;
+      if (normalized.includes('pm.status=$')) {
+        rows = rows.filter((payment) => payment.status === params[paramIndex]);
+        paramIndex += 1;
+      }
+      if (normalized.includes('pm.payment_type=$')) {
+        rows = rows.filter((payment) => payment.payment_type === params[paramIndex]);
+        paramIndex += 1;
+      }
+      if (normalized.includes('pm.archived_at is null')) {
+        rows = rows.filter((payment) => payment.archived_at == null);
+      }
+    }
+    return { rows, rowCount: rows.length };
+  }
+  if (normalized.startsWith('select * from public.payments where id=$1')) {
+    const payment = store.payments.find((entry) => entry.id === params[0]);
+    return { rows: payment ? [payment] : [], rowCount: payment ? 1 : 0 };
+  }
+  if (normalized.startsWith('update public.payments')) {
+    const id = params[params.length - 1];
+    const index = store.payments.findIndex((entry) => entry.id === id);
+    if (index < 0) return { rows: [], rowCount: 0 };
+    let paramIndex = 0;
+    if (normalized.includes('amount=$')) {
+      store.payments[index].amount = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('currency_code=$')) {
+      store.payments[index].currency_code = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('payment_type=$')) {
+      store.payments[index].payment_type = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('negotiation_id=$')) {
+      store.payments[index].negotiation_id = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('status=$')) {
+      store.payments[index].status = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('scheduled_on=$')) {
+      store.payments[index].scheduled_on = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('paid_on=$')) {
+      store.payments[index].paid_on = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('reference_number=$')) {
+      store.payments[index].reference_number = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('archived_at=$')) {
+      store.payments[index].archived_at = params[paramIndex];
+      paramIndex += 1;
+    }
+    return { rows: [store.payments[index]], rowCount: 1 };
   }
   return { rows: [], rowCount: 0 };
 }
@@ -1457,4 +1551,144 @@ describe('property workflow API', () => {
       expect(response.status).toBe(403);
     });
   });
+
+  function seedPayment(overrides: Partial<Record<string, unknown>> = {}) {
+    const payment = {
+      id: crypto.randomUUID(),
+      organization_id: ORG_A,
+      property_id: PROPERTY_A,
+      negotiation_id: null,
+      amount: 500000,
+      currency_code: 'PHP',
+      payment_type: 'deposit',
+      status: 'pending',
+      scheduled_on: null,
+      paid_on: null,
+      reference_number: null,
+      recorded_by_user_id: USER_ID,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      archived_at: null,
+      ...overrides,
+    };
+    store.payments.push(payment);
+    return payment;
+  }
+
+  it.each(['system_admin', 'land_acquisition_manager', 'finance'] as const)(
+    'lets %s create a payment',
+    async (role) => {
+      store.role = role;
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/payments`, {
+          method: 'POST',
+          headers: AUTH,
+          body: JSON.stringify({ amount: 750000, paymentType: 'installment', referenceNumber: 'REF-1' }),
+        });
+        const body = await response.json();
+        expect(response.status).toBe(201);
+        expect(body.data).toMatchObject({
+          property_id: PROPERTY_A,
+          organization_id: ORG_A,
+          amount: 750000,
+          currency_code: 'PHP',
+          payment_type: 'installment',
+          status: 'pending',
+          reference_number: 'REF-1',
+          recorded_by_user_id: USER_ID,
+          recorded_by_name: 'Test User',
+        });
+      });
+    },
+  );
+
+  it.each(['supervisor', 'negotiator', 'legal_documentation', 'viewer'] as const)(
+    'denies %s from creating a payment',
+    async (role) => {
+      store.role = role;
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/payments`, {
+          method: 'POST',
+          headers: AUTH,
+          body: JSON.stringify({ amount: 100000, paymentType: 'deposit' }),
+        });
+        expect(response.status).toBe(403);
+      });
+    },
+  );
+
+  it('rejects a non-positive payment amount', async () => {
+    store.role = 'finance';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/payments`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ amount: 0, paymentType: 'deposit' }),
+      });
+      expect(response.status).toBe(400);
+    });
+  });
+
+  it('returns 404 creating a payment on a foreign property', async () => {
+    store.role = 'finance';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_B}/payments`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ amount: 100000, paymentType: 'deposit' }),
+      });
+      const body = await response.json();
+      expect(response.status).toBe(404);
+      expect(body.error.message).toBe('Property not found');
+    });
+  });
+
+  it('lists payments for a property, excluding archived by default', async () => {
+    seedPayment({ amount: 200000, archived_at: null });
+    seedPayment({ amount: 300000, archived_at: '2026-02-01T00:00:00Z' });
+    await withApi(async (baseUrl) => {
+      const defaultList = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/payments`, { headers: AUTH });
+      const defaultBody = await defaultList.json();
+      expect(defaultBody.data.map((payment: { amount: number }) => payment.amount)).toEqual([200000]);
+
+      const withArchived = await fetch(
+        `${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/payments?includeArchived=true`,
+        { headers: AUTH },
+      );
+      const withArchivedBody = await withArchived.json();
+      expect(withArchivedBody.data).toHaveLength(2);
+    });
+  });
+
+  it('lets finance and admin update and archive a payment', async () => {
+    store.role = 'finance';
+    const payment = seedPayment();
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/payments/${payment.id}`, {
+        method: 'PATCH',
+        headers: AUTH,
+        body: JSON.stringify({ status: 'paid', paidOn: '2026-03-01', archived: true }),
+      });
+      const body = await response.json();
+      expect(response.status).toBe(200);
+      expect(body.data).toMatchObject({ status: 'paid', paid_on: '2026-03-01' });
+      expect(body.data.archived_at).not.toBeNull();
+    });
+  });
+
+  it.each(['supervisor', 'negotiator', 'legal_documentation', 'viewer'] as const)(
+    'denies %s from updating a payment',
+    async (role) => {
+      store.role = role;
+      const payment = seedPayment();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/payments/${payment.id}`, {
+          method: 'PATCH',
+          headers: AUTH,
+          body: JSON.stringify({ status: 'paid' }),
+        });
+        expect(response.status).toBe(403);
+      });
+    },
+  );
 });

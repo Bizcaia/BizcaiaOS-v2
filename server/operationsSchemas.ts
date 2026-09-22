@@ -161,3 +161,37 @@ export const updateTaskSchema = z.object({
 
 export type TaskStatus = z.infer<typeof taskStatusSchema>;
 export type TaskPriority = z.infer<typeof taskPrioritySchema>;
+
+export const paymentTypeSchema = z.enum(['deposit', 'installment', 'final_payment']);
+export const paymentStatusSchema = z.enum(['pending', 'scheduled', 'paid', 'failed', 'cancelled']);
+
+export const paymentListQuerySchema = z.object({
+  status: paymentStatusSchema.optional(),
+  paymentType: paymentTypeSchema.optional(),
+  includeArchived: z.coerce.boolean().default(false),
+});
+
+export const createPaymentSchema = z.object({
+  amount: z.number().positive(),
+  currencyCode: z.string().trim().length(3).default('PHP'),
+  paymentType: paymentTypeSchema,
+  negotiationId: z.uuid().nullable().optional(),
+  scheduledOn: z.string().date().nullable().optional(),
+  paidOn: z.string().date().nullable().optional(),
+  referenceNumber: z.string().trim().max(120).nullable().optional(),
+});
+
+export const updatePaymentSchema = z.object({
+  amount: z.number().positive().optional(),
+  currencyCode: z.string().trim().length(3).optional(),
+  paymentType: paymentTypeSchema.optional(),
+  negotiationId: z.uuid().nullable().optional(),
+  status: paymentStatusSchema.optional(),
+  scheduledOn: z.string().date().nullable().optional(),
+  paidOn: z.string().date().nullable().optional(),
+  referenceNumber: z.string().trim().max(120).nullable().optional(),
+  archived: z.boolean().optional(),
+});
+
+export type PaymentType = z.infer<typeof paymentTypeSchema>;
+export type PaymentStatus = z.infer<typeof paymentStatusSchema>;

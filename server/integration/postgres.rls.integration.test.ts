@@ -89,6 +89,7 @@ describe('PostgreSQL property workflow security', () => {
         '006_negotiations_rls.sql',
         '007_documents.sql',
         '008_tasks.sql',
+        '009_payments.sql',
       ]);
     } finally {
       await admin.end();
