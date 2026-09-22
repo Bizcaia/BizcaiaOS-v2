@@ -147,4 +147,61 @@ describe('OpsApp property workflow', () => {
       expect(screen.getByText(/Owner counter/)).toBeVisible();
     });
   });
+
+  it('shows the seeded document and lets an allowed role upload a new one', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Documents' })).toBeVisible();
+    expect(screen.getByText('Transfer Certificate of Title')).toBeVisible();
+    expect(screen.getByText(/Title deed · Submitted/)).toBeVisible();
+
+    const file = new File(['a small pdf'], 'deed.pdf', { type: 'application/pdf' });
+    await user.type(screen.getByLabelText('Document title'), 'Second Title Deed');
+    await user.selectOptions(screen.getByLabelText('Document category'), 'Title deed');
+    await user.upload(screen.getByLabelText('File'), file);
+    await user.click(screen.getByRole('button', { name: 'Upload document' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Second Title Deed')).toBeVisible();
+    });
+  });
+
+  it('archives a document and hides it from the default list', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    await screen.findByText('Transfer Certificate of Title');
+    await user.click(screen.getByRole('button', { name: 'Archive' }));
+
+    await waitFor(() => {
+      expect(screen.queryByText('Transfer Certificate of Title')).not.toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText('Include archived'));
+    expect(await screen.findByText('Transfer Certificate of Title')).toBeVisible();
+    expect(screen.getByText(/· Archived/)).toBeVisible();
+  });
+
+  it('hides the document upload form from a role without document-write access', async () => {
+    apiMocks.getMe.mockResolvedValue({
+      id: members[2].user_id,
+      email: members[2].email,
+      displayName: members[2].display_name,
+      organizations: [{ ...organization, role: 'negotiator' }],
+    });
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Documents' })).toBeVisible();
+    expect(screen.getByText('Transfer Certificate of Title')).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Upload document' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Document title')).not.toBeInTheDocument();
+  });
 });

@@ -1,5 +1,6 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { Readable } from 'node:stream';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 process.env.NODE_ENV = 'test';
@@ -25,6 +26,7 @@ const OWNER_B = '88888888-8888-4888-8888-888888888888';
 const NEGOTIATOR_ID = '22222222-2222-4222-8222-222222222222';
 const NEGOTIATION_A = '33333333-3333-4333-8333-333333333333';
 const AUTH = { Authorization: 'Bearer valid-test-token', 'Content-Type': 'application/json' };
+const AUTH_NO_CONTENT_TYPE = { Authorization: 'Bearer valid-test-token' };
 
 type Store = {
   role: Role;
@@ -34,7 +36,44 @@ type Store = {
   links: Array<{ property_id: string; owner_id: string; ownership_percent: number | null; is_primary: boolean; created_at: string }>;
   negotiations: Array<Record<string, unknown>>;
   negotiationEvents: Array<Record<string, unknown>>;
+  documents: Array<Record<string, unknown>>;
 };
+
+const fakeFiles = new Map<string, Buffer>();
+const storagePutMock = vi.fn(
+  async (params: {
+    organizationId: string;
+    propertyId: string;
+    documentId: string;
+    filename: string;
+    contentType: string;
+    data: Buffer;
+  }) => {
+    const key = `${params.organizationId}/${params.propertyId}/${params.documentId}/${params.filename}`;
+    fakeFiles.set(key, params.data);
+    return { key, size: params.data.byteLength };
+  },
+);
+const storageRemoveMock = vi.fn(async (key: string) => {
+  fakeFiles.delete(key);
+});
+const storageGetReadStreamMock = vi.fn(async (key: string) => {
+  const data = fakeFiles.get(key);
+  if (!data) throw new Error('Stored file not found');
+  return Readable.from(data);
+});
+
+vi.mock('./storage/documentStorage.js', async () => {
+  const actual = await vi.importActual<typeof import('./storage/documentStorage.js')>('./storage/documentStorage.js');
+  return {
+    ...actual,
+    getDocumentStorage: vi.fn(async () => ({
+      put: storagePutMock,
+      remove: storageRemoveMock,
+      getReadStream: storageGetReadStreamMock,
+    })),
+  };
+});
 
 let store: Store;
 
@@ -87,6 +126,7 @@ function seedStore(role: Role = 'system_admin'): Store {
     links: [],
     negotiations: [],
     negotiationEvents: [],
+    documents: [],
   };
 }
 
@@ -342,6 +382,84 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
       .map((entry) => ({ ...entry, actor_name: 'Test User' }));
     return { rows, rowCount: rows.length };
   }
+  if (normalized.startsWith('insert into public.documents')) {
+    const row = {
+      id: params[0],
+      organization_id: params[1],
+      property_id: params[2],
+      negotiation_id: params[3] ?? null,
+      category: params[4],
+      status: 'draft',
+      title: params[5],
+      original_filename: params[6],
+      content_type: params[7],
+      size_bytes: params[8],
+      storage_provider: 'local',
+      storage_key: params[9],
+      uploaded_by_user_id: params[10],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      archived_at: null,
+    };
+    store.documents.push(row);
+    return { rows: [row], rowCount: 1 };
+  }
+  if (normalized.includes('from public.documents d')) {
+    let rows: Array<Record<string, unknown>> = store.documents.map((doc) => ({ ...doc, uploaded_by_name: 'Test User' }));
+    if (normalized.includes('where d.id=$1')) {
+      rows = rows.filter((doc) => doc.id === params[0]);
+    } else if (normalized.includes('d.property_id=$1')) {
+      rows = rows.filter((doc) => doc.property_id === params[0]);
+      let paramIndex = 1;
+      if (normalized.includes('d.category=$')) {
+        rows = rows.filter((doc) => doc.category === params[paramIndex]);
+        paramIndex += 1;
+      }
+      if (normalized.includes('d.status=$')) {
+        rows = rows.filter((doc) => doc.status === params[paramIndex]);
+        paramIndex += 1;
+      }
+      if (normalized.includes('d.archived_at is null')) {
+        rows = rows.filter((doc) => doc.archived_at == null);
+      }
+    }
+    return { rows, rowCount: rows.length };
+  }
+  if (normalized.startsWith('select organization_id, original_filename, content_type, storage_key from public.documents')) {
+    const doc = store.documents.find((entry) => entry.id === params[0]);
+    return { rows: doc ? [doc] : [], rowCount: doc ? 1 : 0 };
+  }
+  if (normalized.startsWith('select * from public.documents where id=$1')) {
+    const doc = store.documents.find((entry) => entry.id === params[0]);
+    return { rows: doc ? [doc] : [], rowCount: doc ? 1 : 0 };
+  }
+  if (normalized.startsWith('update public.documents')) {
+    const id = params[params.length - 1];
+    const index = store.documents.findIndex((entry) => entry.id === id);
+    if (index < 0) return { rows: [], rowCount: 0 };
+    let paramIndex = 0;
+    if (normalized.includes('category=$')) {
+      store.documents[index].category = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('status=$')) {
+      store.documents[index].status = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('title=$')) {
+      store.documents[index].title = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('negotiation_id=$')) {
+      store.documents[index].negotiation_id = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('archived_at=$')) {
+      store.documents[index].archived_at = params[paramIndex];
+      paramIndex += 1;
+    }
+    return { rows: [store.documents[index]], rowCount: 1 };
+  }
   return { rows: [], rowCount: 0 };
 }
 
@@ -357,6 +475,12 @@ describe('property workflow API', () => {
     actorQuery.mockReset();
     transactionQuery.mockResolvedValue({ rows: [{ user_id: USER_ID }] });
     actorQuery.mockImplementation(async (sql: string, params?: unknown[]) => handleActorQuery(sql, params));
+    fakeFiles.clear();
+    storagePutMock.mockClear();
+    storageRemoveMock.mockClear();
+    storageGetReadStreamMock.mockClear();
+    delete process.env.DOCUMENT_MAX_SIZE_BYTES;
+    delete process.env.DOCUMENT_ACCEPTED_MIME_TYPES;
   });
 
   afterAll(() => {
@@ -682,6 +806,310 @@ describe('property workflow API', () => {
         headers: AUTH,
         body: JSON.stringify({ organizationId: ORG_A, propertyId: PROPERTY_A }),
       });
+      expect(response.status).toBe(403);
+    });
+  });
+
+  it('returns configured document upload limits', async () => {
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/config`, { headers: AUTH_NO_CONTENT_TYPE });
+      const body = await response.json();
+      expect(response.status).toBe(200);
+      expect(body.data.documentUpload.maxSizeBytes).toBeGreaterThan(0);
+      expect(body.data.documentUpload.acceptedMimeTypes).toContain('application/pdf');
+    });
+  });
+
+  it('uploads a document as an allowed role and stores server-set metadata only', async () => {
+    store.role = 'land_acquisition_manager';
+    await withApi(async (baseUrl) => {
+      const form = new FormData();
+      form.set('category', 'title_deed');
+      form.set('title', 'Original Title');
+      form.set('storageProvider', 's3'); // must be ignored -- not a real field
+      form.set('file', new File(['title deed contents'], 'title.pdf', { type: 'application/pdf' }));
+
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, {
+        method: 'POST',
+        headers: AUTH_NO_CONTENT_TYPE,
+        body: form,
+      });
+      const body = await response.json();
+      expect(response.status).toBe(201);
+      expect(body.data).toMatchObject({
+        property_id: PROPERTY_A,
+        organization_id: ORG_A,
+        category: 'title_deed',
+        title: 'Original Title',
+        status: 'draft',
+        storage_provider: 'local',
+        original_filename: 'title.pdf',
+        content_type: 'application/pdf',
+        uploaded_by_user_id: USER_ID,
+        uploaded_by_name: 'Test User',
+      });
+      expect(storagePutMock).toHaveBeenCalledTimes(1);
+      expect(store.documents).toHaveLength(1);
+    });
+  });
+
+  it('rejects document upload for an unauthorized role', async () => {
+    store.role = 'negotiator';
+    await withApi(async (baseUrl) => {
+      const form = new FormData();
+      form.set('category', 'title_deed');
+      form.set('title', 'Blocked Upload');
+      form.set('file', new File(['blocked'], 'blocked.pdf', { type: 'application/pdf' }));
+
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, {
+        method: 'POST',
+        headers: AUTH_NO_CONTENT_TYPE,
+        body: form,
+      });
+      expect(response.status).toBe(403);
+      expect(store.documents).toHaveLength(0);
+      expect(storagePutMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('rejects document upload for an unsupported file type', async () => {
+    store.role = 'system_admin';
+    await withApi(async (baseUrl) => {
+      const form = new FormData();
+      form.set('category', 'other');
+      form.set('title', 'Bad Type');
+      form.set('file', new File(['not allowed'], 'script.exe', { type: 'application/x-msdownload' }));
+
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, {
+        method: 'POST',
+        headers: AUTH_NO_CONTENT_TYPE,
+        body: form,
+      });
+      const body = await response.json();
+      expect(response.status).toBe(422);
+      expect(body.error.code).toBe('unsupported_file_type');
+      expect(storagePutMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('rejects document upload that exceeds the configured size limit', async () => {
+    process.env.DOCUMENT_MAX_SIZE_BYTES = '10';
+    store.role = 'system_admin';
+    await withApi(async (baseUrl) => {
+      const form = new FormData();
+      form.set('category', 'other');
+      form.set('title', 'Too Big');
+      form.set('file', new File(['this file is definitely longer than ten bytes'], 'big.pdf', { type: 'application/pdf' }));
+
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, {
+        method: 'POST',
+        headers: AUTH_NO_CONTENT_TYPE,
+        body: form,
+      });
+      expect(response.status).toBe(422);
+      expect(storagePutMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('returns 404 when uploading to a foreign property', async () => {
+    store.role = 'system_admin';
+    await withApi(async (baseUrl) => {
+      const form = new FormData();
+      form.set('category', 'other');
+      form.set('title', 'Cross tenant');
+      form.set('file', new File(['data'], 'file.pdf', { type: 'application/pdf' }));
+
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_B}/documents`, {
+        method: 'POST',
+        headers: AUTH_NO_CONTENT_TYPE,
+        body: form,
+      });
+      const body = await response.json();
+      expect(response.status).toBe(404);
+      expect(body.error.message).toBe('Property not found');
+    });
+  });
+
+  it('lists documents for a property, excluding archived by default', async () => {
+    store.documents.push(
+      {
+        id: 'aaaa1111-1111-4111-8111-111111111111',
+        organization_id: ORG_A,
+        property_id: PROPERTY_A,
+        negotiation_id: null,
+        category: 'title_deed',
+        status: 'draft',
+        title: 'Active Doc',
+        original_filename: 'a.pdf',
+        content_type: 'application/pdf',
+        size_bytes: 10,
+        storage_provider: 'local',
+        storage_key: 'k1',
+        uploaded_by_user_id: USER_ID,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        archived_at: null,
+      },
+      {
+        id: 'aaaa2222-2222-4222-8222-222222222222',
+        organization_id: ORG_A,
+        property_id: PROPERTY_A,
+        negotiation_id: null,
+        category: 'other',
+        status: 'superseded',
+        title: 'Archived Doc',
+        original_filename: 'b.pdf',
+        content_type: 'application/pdf',
+        size_bytes: 10,
+        storage_provider: 'local',
+        storage_key: 'k2',
+        uploaded_by_user_id: USER_ID,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        archived_at: '2026-02-01T00:00:00Z',
+      },
+    );
+    await withApi(async (baseUrl) => {
+      const defaultList = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, { headers: AUTH });
+      const defaultBody = await defaultList.json();
+      expect(defaultBody.data.map((doc: { title: string }) => doc.title)).toEqual(['Active Doc']);
+
+      const withArchived = await fetch(
+        `${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents?includeArchived=true`,
+        { headers: AUTH },
+      );
+      const withArchivedBody = await withArchived.json();
+      expect(withArchivedBody.data).toHaveLength(2);
+    });
+  });
+
+  it('returns 404 for a document on a foreign property', async () => {
+    store.documents.push({
+      id: 'bbbb1111-1111-4111-8111-111111111111',
+      organization_id: ORG_B,
+      property_id: PROPERTY_B,
+      negotiation_id: null,
+      category: 'other',
+      status: 'draft',
+      title: 'Foreign Doc',
+      original_filename: 'c.pdf',
+      content_type: 'application/pdf',
+      size_bytes: 10,
+      storage_provider: 'local',
+      storage_key: 'k3',
+      uploaded_by_user_id: USER_ID,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      archived_at: null,
+    });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/documents/bbbb1111-1111-4111-8111-111111111111`, {
+        headers: AUTH,
+      });
+      const body = await response.json();
+      expect(response.status).toBe(404);
+      expect(body.error.message).toBe('Document not found');
+    });
+  });
+
+  it('streams document content with the correct headers', async () => {
+    const key = `${ORG_A}/${PROPERTY_A}/cccc1111-1111-4111-8111-111111111111/note.txt`;
+    fakeFiles.set(key, Buffer.from('hello from storage'));
+    store.documents.push({
+      id: 'cccc1111-1111-4111-8111-111111111111',
+      organization_id: ORG_A,
+      property_id: PROPERTY_A,
+      negotiation_id: null,
+      category: 'other',
+      status: 'draft',
+      title: 'Streamed Doc',
+      original_filename: 'note.txt',
+      content_type: 'text/plain',
+      size_bytes: 19,
+      storage_provider: 'local',
+      storage_key: key,
+      uploaded_by_user_id: USER_ID,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      archived_at: null,
+    });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/api/v1/ops/documents/cccc1111-1111-4111-8111-111111111111/content`,
+        { headers: AUTH },
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('text/plain');
+      expect(response.headers.get('content-disposition')).toContain('note.txt');
+      expect(await response.text()).toBe('hello from storage');
+    });
+  });
+
+  it('patches document category, status, and archive state as an allowed role', async () => {
+    store.role = 'legal_documentation';
+    store.documents.push({
+      id: 'dddd1111-1111-4111-8111-111111111111',
+      organization_id: ORG_A,
+      property_id: PROPERTY_A,
+      negotiation_id: null,
+      category: 'other',
+      status: 'draft',
+      title: 'Patchable Doc',
+      original_filename: 'd.pdf',
+      content_type: 'application/pdf',
+      size_bytes: 10,
+      storage_provider: 'local',
+      storage_key: 'k4',
+      uploaded_by_user_id: USER_ID,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      archived_at: null,
+    });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/api/v1/ops/documents/dddd1111-1111-4111-8111-111111111111`,
+        {
+          method: 'PATCH',
+          headers: AUTH,
+          body: JSON.stringify({ status: 'verified', archived: true }),
+        },
+      );
+      const body = await response.json();
+      expect(response.status).toBe(200);
+      expect(body.data.status).toBe('verified');
+      expect(body.data.archived_at).not.toBeNull();
+    });
+  });
+
+  it('rejects a document patch for an unauthorized role', async () => {
+    store.role = 'negotiator';
+    store.documents.push({
+      id: 'eeee1111-1111-4111-8111-111111111111',
+      organization_id: ORG_A,
+      property_id: PROPERTY_A,
+      negotiation_id: null,
+      category: 'other',
+      status: 'draft',
+      title: 'Locked Doc',
+      original_filename: 'e.pdf',
+      content_type: 'application/pdf',
+      size_bytes: 10,
+      storage_provider: 'local',
+      storage_key: 'k5',
+      uploaded_by_user_id: USER_ID,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      archived_at: null,
+    });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/api/v1/ops/documents/eeee1111-1111-4111-8111-111111111111`,
+        {
+          method: 'PATCH',
+          headers: AUTH,
+          body: JSON.stringify({ status: 'verified' }),
+        },
+      );
       expect(response.status).toBe(403);
     });
   });

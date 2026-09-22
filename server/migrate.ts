@@ -13,6 +13,7 @@ const MIGRATION_FILES = [
   '004_property_workflow_rls.sql',
   '005_projects_write_rls.sql',
   '006_negotiations_rls.sql',
+  '007_documents.sql',
 ];
 
 function requiredEnv(name: string) {

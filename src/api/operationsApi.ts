@@ -114,6 +114,44 @@ export type NegotiationEvent = {
   created_at: string;
 };
 
+export type DocumentCategory =
+  | 'ownership_evidence'
+  | 'title_deed'
+  | 'tax_declaration'
+  | 'legal_opinion'
+  | 'survey_plan'
+  | 'agreement_draft'
+  | 'agreement_executed'
+  | 'payment_proof'
+  | 'other';
+
+export type DocumentStatus = 'draft' | 'submitted' | 'under_review' | 'verified' | 'rejected' | 'superseded';
+
+/** Named PropertyDocument, not Document, to avoid colliding with the DOM's global Document type. */
+export type PropertyDocument = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  negotiation_id: string | null;
+  category: DocumentCategory;
+  status: DocumentStatus;
+  title: string;
+  original_filename: string;
+  content_type: string;
+  size_bytes: number;
+  storage_provider: string;
+  uploaded_by_user_id: string;
+  uploaded_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
+export type DocumentUploadConfig = {
+  maxSizeBytes: number;
+  acceptedMimeTypes: string[];
+};
+
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const operationsApiMode = apiBase ? 'live' : 'demo';
@@ -194,6 +232,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return payload.data as T;
 }
 
+/** Like request(), but sends multipart/form-data without forcing a JSON Content-Type. */
+async function uploadRequest<T>(path: string, formData: FormData): Promise<T> {
+  if (!apiBase) throw new Error('Live API mode is not configured');
+  const auth = window.__BIZCAIAOS_AUTH__;
+  if (!auth) throw new Error('Authentication provider is not connected');
+  const token = await auth.getAccessToken();
+  const response = await fetch(`${apiBase}${path}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error?.message ?? 'Request failed');
+  return payload.data as T;
+}
+
+/**
+ * A plain <a href> can't carry an Authorization header, so document downloads
+ * are fetched as a blob and handed to the caller to save client-side.
+ */
+async function downloadRequest(path: string): Promise<{ blob: Blob; filename: string }> {
+  if (!apiBase) throw new Error('Live API mode is not configured');
+  const auth = window.__BIZCAIAOS_AUTH__;
+  if (!auth) throw new Error('Authentication provider is not connected');
+  const token = await auth.getAccessToken();
+  const response = await fetch(`${apiBase}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error?.message ?? 'Request failed');
+  }
+  const disposition = response.headers.get('Content-Disposition') ?? '';
+  const filename = /filename="([^"]*)"/.exec(disposition)?.[1] ?? 'document';
+  const blob = await response.blob();
+  return { blob, filename };
+}
+
 const propertyPatchColumns: Record<string, string> = {
   acquisitionStage: 'acquisition_stage',
   acquisitionStatus: 'acquisition_status',
@@ -228,6 +304,32 @@ let demoPropertyOwners: Array<{
 }> = [];
 let demoNegotiations: Negotiation[] = [];
 let demoNegotiationEvents: NegotiationEvent[] = [];
+let demoDocuments: PropertyDocument[] = [];
+const demoDocumentBlobs = new Map<string, Blob>();
+
+const DEMO_DOCUMENT_UPLOAD_CONFIG: DocumentUploadConfig = {
+  maxSizeBytes: 26_214_400,
+  acceptedMimeTypes: [
+    'application/pdf',
+    'image/jpeg',
+    'image/png',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ],
+};
+
+const documentWriteRoles = new Set(['system_admin', 'land_acquisition_manager', 'legal_documentation']);
+
+function demoCanWriteDocument() {
+  const member = demoMemberships.find((entry) => entry.user_id === DEMO_ACTOR_ID && entry.is_active);
+  return !!member && documentWriteRoles.has(member.role);
+}
+
+function decorateDocument(document: PropertyDocument): PropertyDocument {
+  return { ...document, uploaded_by_name: demoUsers[document.uploaded_by_user_id] ?? null };
+}
 
 function decorateNegotiation(negotiation: Negotiation): Negotiation {
   return {
@@ -423,6 +525,28 @@ export function resetOperationsDemoState() {
       occurred_at: '2026-08-12T00:00:00.000Z',
       metadata: {},
       created_at: '2026-08-12T00:00:00.000Z',
+    }),
+  ];
+  demoDocumentBlobs.clear();
+  const seededDocumentId = '92000000-0000-4000-8000-000000000001';
+  demoDocumentBlobs.set(seededDocumentId, new Blob(['Seeded demo title deed contents'], { type: 'application/pdf' }));
+  demoDocuments = [
+    decorateDocument({
+      id: seededDocumentId,
+      organization_id: demoOrg,
+      property_id: '70000000-0000-4000-8000-000000000001',
+      negotiation_id: '90000000-0000-4000-8000-000000000001',
+      category: 'title_deed',
+      status: 'submitted',
+      title: 'Transfer Certificate of Title',
+      original_filename: 'tct-102.pdf',
+      content_type: 'application/pdf',
+      size_bytes: 32,
+      storage_provider: 'local',
+      uploaded_by_user_id: '419fa143-1d97-40cd-b47b-812cb364acfd',
+      created_at: '2026-08-05T00:00:00.000Z',
+      updated_at: '2026-08-05T00:00:00.000Z',
+      archived_at: null,
     }),
   ];
 }
@@ -826,6 +950,136 @@ export const operationsApi = {
       });
     }
     return event;
+  },
+
+  async getConfig() {
+    if (operationsApiMode === 'live') return request<{ documentUpload: DocumentUploadConfig }>('/ops/config');
+    return { documentUpload: DEMO_DOCUMENT_UPLOAD_CONFIG };
+  },
+
+  async listDocuments(
+    propertyId: string,
+    filters?: { category?: DocumentCategory; status?: DocumentStatus; includeArchived?: boolean },
+  ) {
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams();
+      if (filters?.category) query.set('category', filters.category);
+      if (filters?.status) query.set('status', filters.status);
+      if (filters?.includeArchived) query.set('includeArchived', 'true');
+      const qs = query.toString();
+      return request<PropertyDocument[]>(`/ops/properties/${propertyId}/documents${qs ? `?${qs}` : ''}`);
+    }
+    return demoDocuments
+      .filter((document) => document.property_id === propertyId)
+      .filter((document) => !filters?.category || document.category === filters.category)
+      .filter((document) => !filters?.status || document.status === filters.status)
+      .filter((document) => filters?.includeArchived || !document.archived_at)
+      .map(decorateDocument)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  },
+
+  async uploadDocument(
+    propertyId: string,
+    input: { category: DocumentCategory; title: string; negotiationId?: string | null; file: File },
+  ) {
+    const config = await operationsApi.getConfig();
+    if (input.file.size > config.documentUpload.maxSizeBytes) {
+      throw new Error(`File exceeds the maximum allowed size of ${config.documentUpload.maxSizeBytes} bytes`);
+    }
+    if (!config.documentUpload.acceptedMimeTypes.includes(input.file.type)) {
+      throw new Error(`File type ${input.file.type} is not accepted`);
+    }
+    if (operationsApiMode === 'live') {
+      const form = new FormData();
+      form.set('category', input.category);
+      form.set('title', input.title);
+      if (input.negotiationId) form.set('negotiationId', input.negotiationId);
+      form.set('file', input.file);
+      return uploadRequest<PropertyDocument>(`/ops/properties/${propertyId}/documents`, form);
+    }
+    if (!demoCanWriteDocument()) throw new Error('You do not have permission for this operation');
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property) throw new Error('Property not found');
+    if (input.negotiationId) {
+      const negotiation = demoNegotiations.find((entry) => entry.id === input.negotiationId);
+      if (!negotiation || negotiation.property_id !== propertyId) {
+        throw new Error('Document negotiation must belong to the same property');
+      }
+    }
+    const timestamp = now();
+    const id = crypto.randomUUID();
+    demoDocumentBlobs.set(id, input.file);
+    const document = decorateDocument({
+      id,
+      organization_id: property.organization_id,
+      property_id: propertyId,
+      negotiation_id: input.negotiationId ?? null,
+      category: input.category,
+      status: 'draft',
+      title: input.title,
+      original_filename: input.file.name,
+      content_type: input.file.type,
+      size_bytes: input.file.size,
+      storage_provider: 'local',
+      uploaded_by_user_id: DEMO_ACTOR_ID,
+      created_at: timestamp,
+      updated_at: timestamp,
+      archived_at: null,
+    });
+    demoDocuments = [document, ...demoDocuments];
+    return document;
+  },
+
+  async getDocument(id: string) {
+    if (operationsApiMode === 'live') return request<PropertyDocument>(`/ops/documents/${id}`);
+    const document = demoDocuments.find((entry) => entry.id === id);
+    if (!document) throw new Error('Document not found');
+    return decorateDocument(document);
+  },
+
+  async updateDocument(
+    id: string,
+    input: {
+      category?: DocumentCategory;
+      status?: DocumentStatus;
+      title?: string;
+      negotiationId?: string | null;
+      archived?: boolean;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyDocument>(`/ops/documents/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+    }
+    if (!demoCanWriteDocument()) throw new Error('You do not have permission for this operation');
+    const index = demoDocuments.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('Document not found');
+    const existing = demoDocuments[index];
+    if (input.negotiationId) {
+      const negotiation = demoNegotiations.find((entry) => entry.id === input.negotiationId);
+      if (!negotiation || negotiation.property_id !== existing.property_id) {
+        throw new Error('Document negotiation must belong to the same property');
+      }
+    }
+    const next = decorateDocument({
+      ...existing,
+      category: input.category ?? existing.category,
+      status: input.status ?? existing.status,
+      title: input.title ?? existing.title,
+      negotiation_id: input.negotiationId === undefined ? existing.negotiation_id : input.negotiationId,
+      archived_at: input.archived === undefined ? existing.archived_at : input.archived ? now() : null,
+      updated_at: now(),
+    });
+    demoDocuments[index] = next;
+    return next;
+  },
+
+  async downloadDocument(id: string): Promise<{ blob: Blob; filename: string }> {
+    if (operationsApiMode === 'live') return downloadRequest(`/ops/documents/${id}/content`);
+    const document = demoDocuments.find((entry) => entry.id === id);
+    if (!document) throw new Error('Document not found');
+    const blob = demoDocumentBlobs.get(id);
+    if (!blob) throw new Error('Stored file not found');
+    return { blob, filename: document.original_filename };
   },
 
   async dashboard(orgId: string) {

@@ -1,4 +1,6 @@
-import { Router } from 'express';
+import { randomUUID } from 'node:crypto';
+import { Router, type Request, type Response } from 'express';
+import multer from 'multer';
 import type { PoolClient } from 'pg';
 import { requireUser } from './auth.js';
 import { firstRow, withActorTransaction } from './database.js';
@@ -18,13 +20,18 @@ import {
   negotiationListQuerySchema,
   updateNegotiationSchema,
   updatePropertySchema,
+  createDocumentFieldsSchema,
+  documentListQuerySchema,
+  updateDocumentSchema,
 } from './operationsSchemas.js';
+import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 
 export const operationsRouter = Router();
 
 const OWNER_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const PROPERTY_CREATE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const NEGOTIATION_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
+const DOCUMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
 
 const negotiationPatchColumns: Record<string, string> = {
   status: 'status',
@@ -596,4 +603,225 @@ operationsRouter.post('/negotiations/:id/events', async (request, response) => {
     return firstRow(result.rows, 'Negotiation event creation failed');
   });
   response.status(201).json({ data: event });
+});
+
+const documentSelect = `
+  select d.*, u.display_name as uploaded_by_name
+    from public.documents d
+    left join public.app_users u on u.id = d.uploaded_by_user_id`;
+
+const documentPatchColumns: Record<string, string> = {
+  category: 'category',
+  status: 'status',
+  title: 'title',
+  negotiationId: 'negotiation_id',
+};
+
+/**
+ * Parses the single "file" multipart field into memory and enforces multer's
+ * own fileSize cutoff before any application code sees the buffer -- this is
+ * the DoS backstop; assertAcceptedFile() below is the authoritative,
+ * user-facing size/type check with our own error codes.
+ */
+function parseUploadedFile(request: Request, response: Response): Promise<void> {
+  const config = loadDocumentUploadConfig();
+  const middleware = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxSizeBytes } }).single('file');
+  return new Promise((resolve, reject) => {
+    middleware(request, response, (error: unknown) => {
+      if (!error) {
+        resolve();
+        return;
+      }
+      if (error instanceof multer.MulterError) {
+        reject(
+          httpError(
+            422,
+            error.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the maximum allowed size' : error.message,
+          ),
+        );
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
+function contentDispositionFilename(name: string): string {
+  return name.replace(/[\r\n"]/g, '_');
+}
+
+operationsRouter.get('/config', async (request, response) => {
+  requireUser(request);
+  response.json({ data: { documentUpload: loadDocumentUploadConfig() } });
+});
+
+operationsRouter.get('/properties/:id/documents', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const query = documentListQuerySchema.parse(request.query);
+  const documents = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    if (!(await currentRole(client, property.organization_id, user.id))) {
+      throw httpError(404, 'Property not found');
+    }
+    const values: unknown[] = [id];
+    const where = ['d.property_id=$1'];
+    if (query.category) {
+      values.push(query.category);
+      where.push(`d.category=$${values.length}`);
+    }
+    if (query.status) {
+      values.push(query.status);
+      where.push(`d.status=$${values.length}`);
+    }
+    if (!query.includeArchived) {
+      where.push('d.archived_at is null');
+    }
+    const result = await client.query(
+      `${documentSelect} where ${where.join(' and ')} order by d.created_at desc`,
+      values,
+    );
+    return result.rows;
+  });
+  response.json({ data: documents });
+});
+
+operationsRouter.post('/properties/:id/documents', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  await parseUploadedFile(request, response);
+  const file = request.file;
+  if (!file) throw httpError(400, 'A file is required');
+  const fields = createDocumentFieldsSchema.parse(request.body);
+  assertAcceptedFile({ size: file.size, mimetype: file.mimetype }, loadDocumentUploadConfig());
+
+  const document = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    const role = await requireVisibleProperty(client, property.organization_id, user.id);
+    if (!DOCUMENT_WRITE_ROLES.includes(role)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+
+    const documentId = randomUUID();
+    const storage = await getDocumentStorage();
+    const stored = await storage.put({
+      organizationId: property.organization_id,
+      propertyId: id,
+      documentId,
+      filename: file.originalname,
+      contentType: file.mimetype,
+      data: file.buffer,
+    });
+    try {
+      const result = await client.query(
+        `insert into public.documents (
+            id, organization_id, property_id, negotiation_id, category, title,
+            original_filename, content_type, size_bytes, storage_provider, storage_key, uploaded_by_user_id
+          ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'local',$10,$11)
+          returning *`,
+        [
+          documentId,
+          property.organization_id,
+          id,
+          fields.negotiationId ?? null,
+          fields.category,
+          fields.title,
+          file.originalname,
+          file.mimetype,
+          stored.size,
+          stored.key,
+          user.id,
+        ],
+      );
+      return firstRow(result.rows, 'Document creation failed');
+    } catch (error) {
+      await storage.remove(stored.key);
+      throw error;
+    }
+  });
+  response.status(201).json({ data: { ...document, uploaded_by_name: user.displayName } });
+});
+
+operationsRouter.get('/documents/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const document = await withActorTransaction(user.id, async (client) => {
+    const result = await client.query(`${documentSelect} where d.id=$1`, [id]);
+    const row = firstRow(result.rows, 'Document not found');
+    if (!(await currentRole(client, row.organization_id, user.id))) {
+      throw httpError(404, 'Document not found');
+    }
+    return row;
+  });
+  response.json({ data: document });
+});
+
+operationsRouter.get('/documents/:id/content', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const document = await withActorTransaction(user.id, async (client) => {
+    const result = await client.query<{
+      organization_id: string;
+      original_filename: string;
+      content_type: string;
+      storage_key: string;
+    }>(
+      `select organization_id, original_filename, content_type, storage_key from public.documents where id=$1`,
+      [id],
+    );
+    const row = firstRow(result.rows, 'Document not found');
+    if (!(await currentRole(client, row.organization_id, user.id))) {
+      throw httpError(404, 'Document not found');
+    }
+    return row;
+  });
+  const storage = await getDocumentStorage();
+  const stream = await storage.getReadStream(document.storage_key);
+  response.setHeader('Content-Type', document.content_type);
+  response.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${contentDispositionFilename(document.original_filename)}"`,
+  );
+  stream.pipe(response);
+});
+
+operationsRouter.patch('/documents/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = updateDocumentSchema.parse(request.body);
+  const document = await withActorTransaction(user.id, async (client) => {
+    const existing = firstRow(
+      (await client.query(`select * from public.documents where id=$1`, [id])).rows,
+      'Document not found',
+    );
+    const role = await requireVisibleProperty(client, existing.organization_id, user.id);
+    if (!DOCUMENT_WRITE_ROLES.includes(role)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    const add = (column: string, value: unknown) => {
+      values.push(value);
+      sets.push(`${column}=$${values.length}`);
+    };
+    if (body.category !== undefined) add(documentPatchColumns.category, body.category);
+    if (body.status !== undefined) add(documentPatchColumns.status, body.status);
+    if (body.title !== undefined) add(documentPatchColumns.title, body.title);
+    if (body.negotiationId !== undefined) add(documentPatchColumns.negotiationId, body.negotiationId);
+    if (body.archived !== undefined) add('archived_at', body.archived ? new Date().toISOString() : null);
+    if (!sets.length) return existing;
+    values.push(id);
+    const result = await client.query(
+      `update public.documents set ${sets.join(', ')} where id=$${values.length} returning *`,
+      values,
+    );
+    return firstRow(result.rows, 'Document update failed');
+  });
+  response.json({ data: document });
 });
