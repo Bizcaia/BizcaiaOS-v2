@@ -37,6 +37,12 @@ type Store = {
   negotiations: Array<Record<string, unknown>>;
   negotiationEvents: Array<Record<string, unknown>>;
   documents: Array<Record<string, unknown>>;
+  tasks: Array<Record<string, unknown>>;
+};
+
+const TASK_USER_NAMES: Record<string, string> = {
+  [USER_ID]: 'Test User',
+  [NEGOTIATOR_ID]: 'Negotiator User',
 };
 
 const fakeFiles = new Map<string, Buffer>();
@@ -127,6 +133,7 @@ function seedStore(role: Role = 'system_admin'): Store {
     negotiations: [],
     negotiationEvents: [],
     documents: [],
+    tasks: [],
   };
 }
 
@@ -459,6 +466,89 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
       paramIndex += 1;
     }
     return { rows: [store.documents[index]], rowCount: 1 };
+  }
+  if (normalized.startsWith('insert into public.tasks')) {
+    const row = {
+      id: crypto.randomUUID(),
+      organization_id: params[0],
+      property_id: params[1],
+      title: params[2],
+      description: params[3] ?? null,
+      status: 'open',
+      priority: params[4],
+      assigned_user_id: params[5] ?? null,
+      due_on: params[6] ?? null,
+      created_by_user_id: params[7],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      archived_at: null,
+    };
+    store.tasks.push(row);
+    return { rows: [{ id: row.id }], rowCount: 1 };
+  }
+  if (normalized.includes('from public.tasks t')) {
+    let rows: Array<Record<string, unknown>> = store.tasks.map((task) => ({
+      ...task,
+      assigned_user_name: task.assigned_user_id ? TASK_USER_NAMES[task.assigned_user_id as string] ?? null : null,
+      created_by_name: TASK_USER_NAMES[task.created_by_user_id as string] ?? null,
+    }));
+    if (normalized.includes('where t.id=$1')) {
+      rows = rows.filter((task) => task.id === params[0]);
+    } else if (normalized.includes('t.property_id=$1')) {
+      rows = rows.filter((task) => task.property_id === params[0]);
+      let paramIndex = 1;
+      if (normalized.includes('t.status=$')) {
+        rows = rows.filter((task) => task.status === params[paramIndex]);
+        paramIndex += 1;
+      }
+      if (normalized.includes('t.priority=$')) {
+        rows = rows.filter((task) => task.priority === params[paramIndex]);
+        paramIndex += 1;
+      }
+      if (normalized.includes('t.archived_at is null')) {
+        rows = rows.filter((task) => task.archived_at == null);
+      }
+    }
+    return { rows, rowCount: rows.length };
+  }
+  if (normalized.startsWith('select * from public.tasks where id=$1')) {
+    const task = store.tasks.find((entry) => entry.id === params[0]);
+    return { rows: task ? [task] : [], rowCount: task ? 1 : 0 };
+  }
+  if (normalized.startsWith('update public.tasks')) {
+    const id = params[params.length - 1];
+    const index = store.tasks.findIndex((entry) => entry.id === id);
+    if (index < 0) return { rows: [], rowCount: 0 };
+    let paramIndex = 0;
+    if (normalized.includes('title=$')) {
+      store.tasks[index].title = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('description=$')) {
+      store.tasks[index].description = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('status=$')) {
+      store.tasks[index].status = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('priority=$')) {
+      store.tasks[index].priority = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('assigned_user_id=$')) {
+      store.tasks[index].assigned_user_id = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('due_on=$')) {
+      store.tasks[index].due_on = params[paramIndex];
+      paramIndex += 1;
+    }
+    if (normalized.includes('archived_at=$')) {
+      store.tasks[index].archived_at = params[paramIndex];
+      paramIndex += 1;
+    }
+    return { rows: [store.tasks[index]], rowCount: 1 };
   }
   return { rows: [], rowCount: 0 };
 }
@@ -1110,6 +1200,260 @@ describe('property workflow API', () => {
           body: JSON.stringify({ status: 'verified' }),
         },
       );
+      expect(response.status).toBe(403);
+    });
+  });
+
+  function seedTask(overrides: Partial<Record<string, unknown>> = {}) {
+    const task = {
+      id: crypto.randomUUID(),
+      organization_id: ORG_A,
+      property_id: PROPERTY_A,
+      title: 'Seeded task',
+      description: null,
+      status: 'open',
+      priority: 'normal',
+      assigned_user_id: null,
+      due_on: null,
+      created_by_user_id: USER_ID,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      archived_at: null,
+      ...overrides,
+    };
+    store.tasks.push(task);
+    return task;
+  }
+
+  it('creates a task as an elevated manager, assigned to another active member', async () => {
+    store.role = 'system_admin';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Follow up with owner', priority: 'high', assignedUserId: NEGOTIATOR_ID }),
+      });
+      const body = await response.json();
+      expect(response.status).toBe(201);
+      expect(body.data).toMatchObject({
+        title: 'Follow up with owner',
+        priority: 'high',
+        status: 'open',
+        assigned_user_id: NEGOTIATOR_ID,
+        assigned_user_name: 'Negotiator User',
+        created_by_user_id: USER_ID,
+      });
+    });
+  });
+
+  it('creates an unassigned task as an elevated manager', async () => {
+    store.role = 'land_acquisition_manager';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Unassigned follow-up' }),
+      });
+      const body = await response.json();
+      expect(response.status).toBe(201);
+      expect(body.data.assigned_user_id).toBeNull();
+    });
+  });
+
+  it('lets a negotiator create only a self-assigned task on their assigned property', async () => {
+    store.role = 'negotiator';
+    store.properties[0].assigned_negotiator_id = USER_ID;
+    await withApi(async (baseUrl) => {
+      const selfAssigned = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Call the owner back', assignedUserId: USER_ID }),
+      });
+      expect(selfAssigned.status).toBe(201);
+
+      const forOther = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Assign to someone else', assignedUserId: NEGOTIATOR_ID }),
+      });
+      expect(forOther.status).toBe(403);
+    });
+  });
+
+  it('denies a negotiator not assigned to the property from creating a task', async () => {
+    store.role = 'negotiator';
+    store.properties[0].assigned_negotiator_id = NEGOTIATOR_ID; // not USER_ID
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Not my property', assignedUserId: USER_ID }),
+      });
+      expect(response.status).toBe(403);
+    });
+  });
+
+  it('lets legal_documentation create only a self-assigned task, on any property in the org', async () => {
+    store.role = 'legal_documentation';
+    await withApi(async (baseUrl) => {
+      const selfAssigned = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Review title documents', assignedUserId: USER_ID }),
+      });
+      expect(selfAssigned.status).toBe(201);
+
+      const forOther = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Assign to someone else', assignedUserId: NEGOTIATOR_ID }),
+      });
+      expect(forOther.status).toBe(403);
+    });
+  });
+
+  it('lets finance create only a self-assigned task', async () => {
+    store.role = 'finance';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Confirm payment schedule', assignedUserId: USER_ID }),
+      });
+      expect(response.status).toBe(201);
+    });
+  });
+
+  it('denies a viewer from creating any task', async () => {
+    store.role = 'viewer';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Viewer attempt', assignedUserId: USER_ID }),
+      });
+      expect(response.status).toBe(403);
+    });
+  });
+
+  it('lets a supervisor manage tasks within their managed property/project scope', async () => {
+    store.role = 'supervisor';
+    // PROPERTY_A.assigned_manager_id and PROJECT_A.manager_user_id both default to USER_ID.
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Supervisor in scope', assignedUserId: NEGOTIATOR_ID }),
+      });
+      expect(response.status).toBe(201);
+    });
+  });
+
+  it('denies a supervisor outside their managed property/project scope', async () => {
+    store.role = 'supervisor';
+    store.properties[0].assigned_manager_id = NEGOTIATOR_ID;
+    store.projects[0].manager_user_id = NEGOTIATOR_ID;
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Out of scope', assignedUserId: USER_ID }),
+      });
+      expect(response.status).toBe(403);
+    });
+  });
+
+  it('returns 404 creating a task on a foreign property', async () => {
+    store.role = 'system_admin';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_B}/tasks`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ title: 'Cross tenant' }),
+      });
+      const body = await response.json();
+      expect(response.status).toBe(404);
+      expect(body.error.message).toBe('Property not found');
+    });
+  });
+
+  it('lists tasks for a property, excluding archived by default', async () => {
+    seedTask({ title: 'Active task', archived_at: null });
+    seedTask({ title: 'Archived task', archived_at: '2026-02-01T00:00:00Z' });
+    await withApi(async (baseUrl) => {
+      const defaultList = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks`, { headers: AUTH });
+      const defaultBody = await defaultList.json();
+      expect(defaultBody.data.map((task: { title: string }) => task.title)).toEqual(['Active task']);
+
+      const withArchived = await fetch(
+        `${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/tasks?includeArchived=true`,
+        { headers: AUTH },
+      );
+      const withArchivedBody = await withArchived.json();
+      expect(withArchivedBody.data).toHaveLength(2);
+    });
+  });
+
+  it('lets an elevated manager edit, reassign, and archive any task', async () => {
+    store.role = 'system_admin';
+    const task = seedTask({ assigned_user_id: NEGOTIATOR_ID });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/tasks/${task.id}`, {
+        method: 'PATCH',
+        headers: AUTH,
+        body: JSON.stringify({ status: 'in_progress', assignedUserId: USER_ID, archived: true }),
+      });
+      const body = await response.json();
+      expect(response.status).toBe(200);
+      expect(body.data).toMatchObject({ status: 'in_progress', assigned_user_id: USER_ID });
+      expect(body.data.archived_at).not.toBeNull();
+    });
+  });
+
+  it('lets an assignee edit and complete their own task but not reassign it', async () => {
+    store.role = 'negotiator';
+    const task = seedTask({ assigned_user_id: USER_ID });
+    await withApi(async (baseUrl) => {
+      const edit = await fetch(`${baseUrl}/api/v1/ops/tasks/${task.id}`, {
+        method: 'PATCH',
+        headers: AUTH,
+        body: JSON.stringify({ status: 'done', priority: 'urgent' }),
+      });
+      const editBody = await edit.json();
+      expect(edit.status).toBe(200);
+      expect(editBody.data).toMatchObject({ status: 'done', priority: 'urgent' });
+
+      const reassign = await fetch(`${baseUrl}/api/v1/ops/tasks/${task.id}`, {
+        method: 'PATCH',
+        headers: AUTH,
+        body: JSON.stringify({ assignedUserId: NEGOTIATOR_ID }),
+      });
+      expect(reassign.status).toBe(403);
+    });
+  });
+
+  it('denies a viewer from editing or archiving even their own assigned task', async () => {
+    store.role = 'viewer';
+    const task = seedTask({ assigned_user_id: USER_ID });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/tasks/${task.id}`, {
+        method: 'PATCH',
+        headers: AUTH,
+        body: JSON.stringify({ status: 'done' }),
+      });
+      expect(response.status).toBe(403);
+    });
+  });
+
+  it('denies a user who is neither manager nor assignee from editing a task', async () => {
+    store.role = 'negotiator';
+    const task = seedTask({ assigned_user_id: NEGOTIATOR_ID });
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/tasks/${task.id}`, {
+        method: 'PATCH',
+        headers: AUTH,
+        body: JSON.stringify({ status: 'done' }),
+      });
       expect(response.status).toBe(403);
     });
   });

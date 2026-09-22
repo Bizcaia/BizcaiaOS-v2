@@ -204,4 +204,67 @@ describe('OpsApp property workflow', () => {
     expect(screen.queryByRole('heading', { name: 'Upload document' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Document title')).not.toBeInTheDocument();
   });
+
+  it('shows seeded tasks and lets an elevated role create a task with an assignee picker', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Tasks' })).toBeVisible();
+    expect(screen.getByText('Follow up on survey plan')).toBeVisible();
+    expect(screen.getByText(/High · Open/)).toBeVisible();
+
+    await user.type(screen.getByLabelText('Task title'), 'Confirm HOA clearance');
+    await user.selectOptions(screen.getByLabelText('Assign task to'), 'Luis Reyes');
+    await user.click(screen.getByRole('button', { name: 'Create task' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Confirm HOA clearance')).toBeVisible();
+    });
+  });
+
+  it('lets a negotiator create a self-assigned task on their assigned property, with no assignee picker', async () => {
+    apiMocks.getMe.mockResolvedValue({
+      id: members[2].user_id,
+      email: members[2].email,
+      displayName: members[2].display_name,
+      organizations: [{ ...organization, role: 'negotiator' }],
+    });
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Create task' })).toBeVisible();
+    expect(screen.queryByLabelText('Assign task to')).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('Task title'), 'Call the owner back');
+    await user.click(screen.getByRole('button', { name: 'Create task' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Call the owner back')).toBeVisible();
+      expect(screen.getAllByText(/Luis Reyes/).length).toBeGreaterThan(0);
+    });
+  });
+
+  it('hides task creation and edit controls from a viewer', async () => {
+    apiMocks.getMe.mockResolvedValue({
+      id: members[0].user_id,
+      email: members[0].email,
+      displayName: members[0].display_name,
+      organizations: [{ ...organization, role: 'viewer' }],
+    });
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Tasks' })).toBeVisible();
+    expect(screen.getByText('Follow up on survey plan')).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Create task' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Task title')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Status for Follow up on survey plan/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Archive task' })).not.toBeInTheDocument();
+  });
 });

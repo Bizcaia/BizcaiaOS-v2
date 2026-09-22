@@ -131,3 +131,33 @@ export const updateDocumentSchema = z.object({
 
 export type DocumentCategory = z.infer<typeof documentCategorySchema>;
 export type DocumentStatus = z.infer<typeof documentStatusSchema>;
+
+export const taskStatusSchema = z.enum(['open', 'in_progress', 'done', 'cancelled']);
+export const taskPrioritySchema = z.enum(['low', 'normal', 'high', 'urgent']);
+
+export const taskListQuerySchema = z.object({
+  status: taskStatusSchema.optional(),
+  priority: taskPrioritySchema.optional(),
+  includeArchived: z.coerce.boolean().default(false),
+});
+
+export const createTaskSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  description: z.string().trim().max(4000).nullable().optional(),
+  priority: taskPrioritySchema.default('normal'),
+  assignedUserId: z.uuid().nullable().optional(),
+  dueOn: z.string().date().nullable().optional(),
+});
+
+export const updateTaskSchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  description: z.string().trim().max(4000).nullable().optional(),
+  status: taskStatusSchema.optional(),
+  priority: taskPrioritySchema.optional(),
+  assignedUserId: z.uuid().nullable().optional(),
+  dueOn: z.string().date().nullable().optional(),
+  archived: z.boolean().optional(),
+});
+
+export type TaskStatus = z.infer<typeof taskStatusSchema>;
+export type TaskPriority = z.infer<typeof taskPrioritySchema>;

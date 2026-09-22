@@ -152,6 +152,27 @@ export type DocumentUploadConfig = {
   acceptedMimeTypes: string[];
 };
 
+export type TaskStatus = 'open' | 'in_progress' | 'done' | 'cancelled';
+export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
+
+export type PropertyTask = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  title: string;
+  description: string | null;
+  status: TaskStatus;
+  priority: TaskPriority;
+  assigned_user_id: string | null;
+  assigned_user_name?: string | null;
+  due_on: string | null;
+  created_by_user_id: string;
+  created_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const operationsApiMode = apiBase ? 'live' : 'demo';
@@ -329,6 +350,64 @@ function demoCanWriteDocument() {
 
 function decorateDocument(document: PropertyDocument): PropertyDocument {
   return { ...document, uploaded_by_name: demoUsers[document.uploaded_by_user_id] ?? null };
+}
+
+let demoTasks: PropertyTask[] = [];
+
+const taskManagerRoles = new Set(['system_admin', 'land_acquisition_manager']);
+const taskSelfAssignCreateRoles = new Set(['legal_documentation', 'finance']);
+
+function demoActorMembership() {
+  return demoMemberships.find((entry) => entry.user_id === DEMO_ACTOR_ID && entry.is_active);
+}
+
+/** Mirrors isTaskManager on the server: system_admin/LAM org-wide, supervisor only within a managed property/project. */
+function demoIsTaskManager(property: Property): boolean {
+  const member = demoActorMembership();
+  if (!member) return false;
+  if (taskManagerRoles.has(member.role)) return true;
+  if (member.role !== 'supervisor') return false;
+  if (property.assigned_manager_id === DEMO_ACTOR_ID) return true;
+  const project = demoProjects.find((entry) => entry.id === property.project_id);
+  return project?.manager_user_id === DEMO_ACTOR_ID;
+}
+
+function demoCanCreateTask(property: Property, assignedUserId: string | null): boolean {
+  const member = demoActorMembership();
+  if (!member) return false;
+  if (demoIsTaskManager(property)) return true;
+  if (member.role === 'negotiator' && property.assigned_negotiator_id === DEMO_ACTOR_ID) {
+    return assignedUserId === DEMO_ACTOR_ID;
+  }
+  if (taskSelfAssignCreateRoles.has(member.role)) {
+    return assignedUserId === DEMO_ACTOR_ID;
+  }
+  return false;
+}
+
+/** Viewer is excluded even when assigned: assignment must never grant write capability. */
+function demoCanWriteOwnTask(task: PropertyTask): boolean {
+  const member = demoActorMembership();
+  if (!member || member.role === 'viewer') return false;
+  return task.assigned_user_id === DEMO_ACTOR_ID;
+}
+
+function demoAssertActiveAssignee(organizationId: string, assignedUserId: string | null) {
+  if (!assignedUserId) return;
+  const member = demoMemberships.find(
+    (entry) => entry.user_id === assignedUserId && entry.organization_id === organizationId && entry.is_active,
+  );
+  if (!member) {
+    throw new Error('Assigned user must be an active member of the task organization');
+  }
+}
+
+function decorateTask(task: PropertyTask): PropertyTask {
+  return {
+    ...task,
+    assigned_user_name: task.assigned_user_id ? demoUsers[task.assigned_user_id] ?? null : null,
+    created_by_name: demoUsers[task.created_by_user_id] ?? null,
+  };
 }
 
 function decorateNegotiation(negotiation: Negotiation): Negotiation {
@@ -546,6 +625,38 @@ export function resetOperationsDemoState() {
       uploaded_by_user_id: '419fa143-1d97-40cd-b47b-812cb364acfd',
       created_at: '2026-08-05T00:00:00.000Z',
       updated_at: '2026-08-05T00:00:00.000Z',
+      archived_at: null,
+    }),
+  ];
+  demoTasks = [
+    decorateTask({
+      id: 'a1000000-0000-4000-8000-000000000001',
+      organization_id: demoOrg,
+      property_id: '70000000-0000-4000-8000-000000000001',
+      title: 'Follow up on survey plan',
+      description: 'Confirm the licensed geodetic engineer can deliver the updated survey plan this week.',
+      status: 'open',
+      priority: 'high',
+      assigned_user_id: '5517eab7-57db-412f-b381-33844d31a64f',
+      due_on: '2026-09-26',
+      created_by_user_id: DEMO_ACTOR_ID,
+      created_at: '2026-09-20T00:00:00.000Z',
+      updated_at: '2026-09-20T00:00:00.000Z',
+      archived_at: null,
+    }),
+    decorateTask({
+      id: 'a1000000-0000-4000-8000-000000000002',
+      organization_id: demoOrg,
+      property_id: '70000000-0000-4000-8000-000000000001',
+      title: 'Review title deed for encumbrances',
+      description: null,
+      status: 'done',
+      priority: 'normal',
+      assigned_user_id: '419fa143-1d97-40cd-b47b-812cb364acfd',
+      due_on: '2026-09-10',
+      created_by_user_id: '419fa143-1d97-40cd-b47b-812cb364acfd',
+      created_at: '2026-09-05T00:00:00.000Z',
+      updated_at: '2026-09-11T00:00:00.000Z',
       archived_at: null,
     }),
   ];
@@ -1080,6 +1191,116 @@ export const operationsApi = {
     const blob = demoDocumentBlobs.get(id);
     if (!blob) throw new Error('Stored file not found');
     return { blob, filename: document.original_filename };
+  },
+
+  async listTasks(
+    propertyId: string,
+    filters?: { status?: TaskStatus; priority?: TaskPriority; includeArchived?: boolean },
+  ) {
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams();
+      if (filters?.status) query.set('status', filters.status);
+      if (filters?.priority) query.set('priority', filters.priority);
+      if (filters?.includeArchived) query.set('includeArchived', 'true');
+      const qs = query.toString();
+      return request<PropertyTask[]>(`/ops/properties/${propertyId}/tasks${qs ? `?${qs}` : ''}`);
+    }
+    return demoTasks
+      .filter((task) => task.property_id === propertyId)
+      .filter((task) => !filters?.status || task.status === filters.status)
+      .filter((task) => !filters?.priority || task.priority === filters.priority)
+      .filter((task) => filters?.includeArchived || !task.archived_at)
+      .map(decorateTask)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  },
+
+  async createTask(
+    propertyId: string,
+    input: {
+      title: string;
+      description?: string | null;
+      priority?: TaskPriority;
+      assignedUserId?: string | null;
+      dueOn?: string | null;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyTask>(`/ops/properties/${propertyId}/tasks`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    }
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property) throw new Error('Property not found');
+    const assignedUserId = input.assignedUserId ?? null;
+    if (!demoCanCreateTask(property, assignedUserId)) {
+      throw new Error('You do not have permission for this operation');
+    }
+    demoAssertActiveAssignee(property.organization_id, assignedUserId);
+    const timestamp = now();
+    const task = decorateTask({
+      id: crypto.randomUUID(),
+      organization_id: property.organization_id,
+      property_id: propertyId,
+      title: input.title,
+      description: input.description ?? null,
+      status: 'open',
+      priority: input.priority ?? 'normal',
+      assigned_user_id: assignedUserId,
+      due_on: input.dueOn ?? null,
+      created_by_user_id: DEMO_ACTOR_ID,
+      created_at: timestamp,
+      updated_at: timestamp,
+      archived_at: null,
+    });
+    demoTasks = [task, ...demoTasks];
+    return task;
+  },
+
+  async updateTask(
+    id: string,
+    input: {
+      title?: string;
+      description?: string | null;
+      status?: TaskStatus;
+      priority?: TaskPriority;
+      assignedUserId?: string | null;
+      dueOn?: string | null;
+      archived?: boolean;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyTask>(`/ops/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+    }
+    const index = demoTasks.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('Task not found');
+    const existing = demoTasks[index];
+    const property = demoProperties.find((entry) => entry.id === existing.property_id);
+    if (!property) throw new Error('Property not found');
+    const manager = demoIsTaskManager(property);
+    const selfService = demoCanWriteOwnTask(existing);
+    if (!manager && !selfService) {
+      throw new Error('You do not have permission for this operation');
+    }
+    if (!manager && input.assignedUserId !== undefined) {
+      throw new Error('Only elevated task managers may reassign a task');
+    }
+    if (input.assignedUserId !== undefined) {
+      demoAssertActiveAssignee(existing.organization_id, input.assignedUserId);
+    }
+    const next = decorateTask({
+      ...existing,
+      title: input.title ?? existing.title,
+      description: input.description === undefined ? existing.description : input.description,
+      status: input.status ?? existing.status,
+      priority: input.priority ?? existing.priority,
+      assigned_user_id: input.assignedUserId === undefined ? existing.assigned_user_id : input.assignedUserId,
+      due_on: input.dueOn === undefined ? existing.due_on : input.dueOn,
+      archived_at: input.archived === undefined ? existing.archived_at : input.archived ? now() : null,
+      updated_at: now(),
+    });
+    demoTasks[index] = next;
+    return next;
   },
 
   async dashboard(orgId: string) {

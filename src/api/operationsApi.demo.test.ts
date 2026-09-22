@@ -235,4 +235,106 @@ describe('operationsApi demo adapter', () => {
       }),
     ).rejects.toThrow(/negotiation must belong to the same property/i);
   });
+
+  // The demo actor is fixed as Alex Villanueva (system_admin), so only the
+  // elevated-manager path is reachable through the demo API -- the full
+  // negotiator/legal/finance/viewer authorization matrix is exercised
+  // exhaustively in the mocked route tests and the real-Postgres RLS
+  // integration tests instead, where the acting role can be varied freely.
+
+  it('lists the seeded tasks for a property', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    const tasks = await operationsApi.listTasks(negotiationProperty);
+    expect(tasks).toHaveLength(2);
+    expect(tasks[0]).toMatchObject({
+      title: 'Follow up on survey plan',
+      status: 'open',
+      priority: 'high',
+      assigned_user_name: 'Luis Reyes',
+    });
+    expect(tasks.some((task) => task.title === 'Review title deed for encumbrances' && task.status === 'done')).toBe(
+      true,
+    );
+  });
+
+  it('creates a task as the elevated demo actor, assigned to another active member', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    const task = await operationsApi.createTask(negotiationProperty, {
+      title: 'Schedule site visit',
+      priority: 'urgent',
+      assignedUserId: '5517eab7-57db-412f-b381-33844d31a64f',
+      dueOn: '2026-10-01',
+    });
+    expect(task).toMatchObject({
+      title: 'Schedule site visit',
+      status: 'open',
+      priority: 'urgent',
+      assigned_user_id: '5517eab7-57db-412f-b381-33844d31a64f',
+      assigned_user_name: 'Luis Reyes',
+      created_by_user_id: '758d5718-53d9-4ea2-b9d5-02828fcc0e2c',
+    });
+
+    const tasks = await operationsApi.listTasks(negotiationProperty);
+    expect(tasks.some((entry) => entry.id === task.id)).toBe(true);
+  });
+
+  it('creates an unassigned task', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    const task = await operationsApi.createTask(negotiationProperty, { title: 'Unassigned follow-up' });
+    expect(task.assigned_user_id).toBeNull();
+  });
+
+  it('rejects assigning a task to an inactive member', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+
+    await expect(
+      operationsApi.createTask(negotiationProperty, {
+        title: 'Assign to inactive member',
+        // Paolo Lim is seeded as an inactive finance member.
+        assignedUserId: '884e9d32-aad1-42e5-8603-4f9846cff79d',
+      }),
+    ).rejects.toThrow(/active member/i);
+  });
+
+  it('updates status, priority, due date, and reassigns a task as the elevated demo actor', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+    const [seeded] = await operationsApi.listTasks(negotiationProperty);
+
+    const updated = await operationsApi.updateTask(seeded.id, {
+      status: 'in_progress',
+      priority: 'urgent',
+      dueOn: '2026-10-05',
+      assignedUserId: '419fa143-1d97-40cd-b47b-812cb364acfd',
+    });
+    expect(updated).toMatchObject({
+      status: 'in_progress',
+      priority: 'urgent',
+      due_on: '2026-10-05',
+      assigned_user_id: '419fa143-1d97-40cd-b47b-812cb364acfd',
+      assigned_user_name: 'Celina Cruz',
+    });
+  });
+
+  it('archives a task and excludes it from the default list until includeArchived is set', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+    const [seeded] = await operationsApi.listTasks(negotiationProperty);
+
+    const archived = await operationsApi.updateTask(seeded.id, { archived: true });
+    expect(archived.archived_at).not.toBeNull();
+
+    const defaultList = await operationsApi.listTasks(negotiationProperty);
+    expect(defaultList.some((task) => task.id === seeded.id)).toBe(false);
+
+    const withArchived = await operationsApi.listTasks(negotiationProperty, { includeArchived: true });
+    expect(withArchived.some((task) => task.id === seeded.id)).toBe(true);
+  });
 });
