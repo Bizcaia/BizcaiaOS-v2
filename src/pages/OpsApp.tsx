@@ -17,6 +17,9 @@ import {
   type Property,
   type PropertyDocument,
   type PropertyOwner,
+  type PropertyTask,
+  type TaskPriority,
+  type TaskStatus,
 } from '../api/operationsApi';
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
@@ -89,6 +92,23 @@ const documentStatusLabels: Record<DocumentStatus, string> = {
 };
 
 const documentWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
+
+const taskStatusLabels: Record<TaskStatus, string> = {
+  open: 'Open',
+  in_progress: 'In progress',
+  done: 'Done',
+  cancelled: 'Cancelled',
+};
+
+const taskPriorityLabels: Record<TaskPriority, string> = {
+  low: 'Low',
+  normal: 'Normal',
+  high: 'High',
+  urgent: 'Urgent',
+};
+
+const taskManagerRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
+const taskSelfAssignCreateRoles: OrganizationRole[] = ['legal_documentation', 'finance'];
 
 type OpsTab = 'dashboard' | 'projects' | 'properties' | 'team';
 
@@ -428,6 +448,7 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
                 property={selected}
                 members={members}
                 owners={owners}
+                projects={projects}
                 role={role}
                 currentUserId={currentUserId}
                 canManageOwners={canManageOwners}
@@ -480,6 +501,7 @@ function PropertyDrawer({
   property,
   members,
   owners,
+  projects,
   role,
   currentUserId,
   canManageOwners,
@@ -489,6 +511,7 @@ function PropertyDrawer({
   property: Property;
   members: Member[];
   owners: Owner[];
+  projects: Project[];
   role: OrganizationRole;
   currentUserId: string | null;
   canManageOwners: boolean;
@@ -741,6 +764,7 @@ function PropertyDrawer({
           currentUserId={currentUserId}
         />
         <DocumentBlock property={property} role={role} />
+        <TaskBlock property={property} role={role} members={members} projects={projects} currentUserId={currentUserId} />
       </aside>
     </div>
   );
@@ -1077,6 +1101,216 @@ function DocumentBlock({ property, role }: { property: Property; role: Organizat
             }}
           >
             Upload document
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
+
+function TaskBlock({
+  property,
+  role,
+  members,
+  projects,
+  currentUserId,
+}: {
+  property: Property;
+  role: OrganizationRole;
+  members: Member[];
+  projects: Project[];
+  currentUserId: string | null;
+}) {
+  const [tasks, setTasks] = useState<PropertyTask[]>([]);
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [priority, setPriority] = useState<TaskPriority>('normal');
+  const [dueOn, setDueOn] = useState('');
+  const [assigneeId, setAssigneeId] = useState('');
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const project = projects.find((entry) => entry.id === property.project_id);
+  const isManager =
+    taskManagerRoles.includes(role) ||
+    (role === 'supervisor' &&
+      (property.assigned_manager_id === currentUserId || project?.manager_user_id === currentUserId));
+  const canCreateSelfAssigned =
+    (role === 'negotiator' && property.assigned_negotiator_id === currentUserId) ||
+    taskSelfAssignCreateRoles.includes(role);
+  const canCreate = isManager || canCreateSelfAssigned;
+  const activeMembers = members.filter((member) => member.is_active);
+
+  const isSelfAssignee = (task: PropertyTask) => role !== 'viewer' && task.assigned_user_id === currentUserId;
+  const canEdit = (task: PropertyTask) => isManager || isSelfAssignee(task);
+
+  const refresh = async () => {
+    setTasks(await operationsApi.listTasks(property.id, { includeArchived }));
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) => setError(cause instanceof Error ? cause.message : 'Unable to load tasks'));
+  }, [property.id, includeArchived]);
+
+  return (
+    <section className="owner-block">
+      <h3>Tasks</h3>
+      {error && <p className="form-error">{error}</p>}
+      <label className="checkbox-row">
+        <input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} />
+        Include archived tasks
+      </label>
+      {tasks.length === 0 ? (
+        <p>No tasks yet.</p>
+      ) : (
+        <ul className="owner-list">
+          {tasks.map((task) => (
+            <li key={task.id}>
+              <strong>{task.title}</strong>
+              <small>
+                {taskPriorityLabels[task.priority]} · {taskStatusLabels[task.status]}
+                {task.assigned_user_name ? ` · ${task.assigned_user_name}` : ' · Unassigned'}
+                {task.due_on ? ` · Due ${task.due_on}` : ''}
+                {task.archived_at ? ' · Archived' : ''}
+              </small>
+              {task.description && <small>{task.description}</small>}
+              {canEdit(task) && (
+                <>
+                  <label>
+                    Status for {task.title}
+                    <select
+                      value={task.status}
+                      onChange={async (event) => {
+                        await operationsApi.updateTask(task.id, { status: event.target.value as TaskStatus });
+                        await refresh();
+                      }}
+                    >
+                      {Object.entries(taskStatusLabels).map(([key, label]) => (
+                        <option key={key} value={key}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Priority for {task.title}
+                    <select
+                      value={task.priority}
+                      onChange={async (event) => {
+                        await operationsApi.updateTask(task.id, { priority: event.target.value as TaskPriority });
+                        await refresh();
+                      }}
+                    >
+                      {Object.entries(taskPriorityLabels).map(([key, label]) => (
+                        <option key={key} value={key}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Due date for {task.title}
+                    <input
+                      type="date"
+                      value={task.due_on ?? ''}
+                      onChange={async (event) => {
+                        await operationsApi.updateTask(task.id, { dueOn: event.target.value || null });
+                        await refresh();
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await operationsApi.updateTask(task.id, { archived: !task.archived_at });
+                      await refresh();
+                    }}
+                  >
+                    {task.archived_at ? 'Unarchive task' : 'Archive task'}
+                  </button>
+                </>
+              )}
+              {isManager && (
+                <label>
+                  Assignee for {task.title}
+                  <select
+                    value={task.assigned_user_id ?? ''}
+                    onChange={async (event) => {
+                      await operationsApi.updateTask(task.id, { assignedUserId: event.target.value || null });
+                      await refresh();
+                    }}
+                  >
+                    <option value="">Unassigned</option>
+                    {activeMembers.map((member) => (
+                      <option key={member.user_id} value={member.user_id}>{member.display_name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {canCreate && (
+        <>
+          <h3>Create task</h3>
+          <label>
+            Task title
+            <input value={title} onChange={(event) => setTitle(event.target.value)} />
+          </label>
+          <label>
+            Task description
+            <input value={description} onChange={(event) => setDescription(event.target.value)} />
+          </label>
+          <label>
+            Task priority
+            <select value={priority} onChange={(event) => setPriority(event.target.value as TaskPriority)}>
+              {Object.entries(taskPriorityLabels).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Task due date
+            <input type="date" value={dueOn} onChange={(event) => setDueOn(event.target.value)} />
+          </label>
+          {isManager && (
+            <label>
+              Assign task to
+              <select value={assigneeId} onChange={(event) => setAssigneeId(event.target.value)}>
+                <option value="">Unassigned</option>
+                {activeMembers.map((member) => (
+                  <option key={member.user_id} value={member.user_id}>{member.display_name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            className="primary-button"
+            type="button"
+            disabled={!title || saving}
+            onClick={async () => {
+              setSaving(true);
+              setError('');
+              try {
+                await operationsApi.createTask(property.id, {
+                  title,
+                  description: description || null,
+                  priority,
+                  dueOn: dueOn || null,
+                  assignedUserId: isManager ? assigneeId || null : currentUserId,
+                });
+                setTitle('');
+                setDescription('');
+                setPriority('normal');
+                setDueOn('');
+                setAssigneeId('');
+                await refresh();
+              } catch (cause) {
+                setError(cause instanceof Error ? cause.message : 'Unable to create task');
+              } finally {
+                setSaving(false);
+              }
+            }}
+          >
+            Create task
           </button>
         </>
       )}

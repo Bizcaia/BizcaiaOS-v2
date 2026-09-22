@@ -23,6 +23,9 @@ import {
   createDocumentFieldsSchema,
   documentListQuerySchema,
   updateDocumentSchema,
+  createTaskSchema,
+  taskListQuerySchema,
+  updateTaskSchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 
@@ -32,6 +35,7 @@ const OWNER_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisiti
 const PROPERTY_CREATE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const NEGOTIATION_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const DOCUMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
+const TASK_SELF_ASSIGN_CREATE_ROLES: OrganizationRole[] = ['legal_documentation', 'finance'];
 
 const negotiationPatchColumns: Record<string, string> = {
   status: 'status',
@@ -824,4 +828,196 @@ operationsRouter.patch('/documents/:id', async (request, response) => {
     return firstRow(result.rows, 'Document update failed');
   });
   response.json({ data: document });
+});
+
+const taskSelect = `
+  select t.*, u.display_name as assigned_user_name, c.display_name as created_by_name
+    from public.tasks t
+    left join public.app_users u on u.id = t.assigned_user_id
+    left join public.app_users c on c.id = t.created_by_user_id`;
+
+const taskPatchColumns: Record<string, string> = {
+  title: 'title',
+  description: 'description',
+  status: 'status',
+  priority: 'priority',
+  assignedUserId: 'assigned_user_id',
+  dueOn: 'due_on',
+};
+
+/**
+ * Mirrors the inline supervisor-scope check already used in PATCH
+ * /properties/:id: system_admin/land_acquisition_manager manage tasks
+ * organization-wide; a supervisor only within a property/project they
+ * manage. Not a reuse of can_update_property's scope, since that function
+ * also grants legal_documentation/finance -- deliberately excluded here.
+ */
+async function isTaskManager(
+  client: PoolClient,
+  role: OrganizationRole,
+  propertyManagerId: string | null,
+  propertyProjectId: string,
+  userId: string,
+): Promise<boolean> {
+  if (role === 'system_admin' || role === 'land_acquisition_manager') return true;
+  if (role !== 'supervisor') return false;
+  if (propertyManagerId === userId) return true;
+  const project = firstRow(
+    (
+      await client.query<{ manager_user_id: string | null }>(
+        `select manager_user_id from public.projects where id=$1`,
+        [propertyProjectId],
+      )
+    ).rows,
+    'Project not found',
+  );
+  return project.manager_user_id === userId;
+}
+
+operationsRouter.get('/properties/:id/tasks', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const query = taskListQuerySchema.parse(request.query);
+  const tasks = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    if (!(await currentRole(client, property.organization_id, user.id))) {
+      throw httpError(404, 'Property not found');
+    }
+    const values: unknown[] = [id];
+    const where = ['t.property_id=$1'];
+    if (query.status) {
+      values.push(query.status);
+      where.push(`t.status=$${values.length}`);
+    }
+    if (query.priority) {
+      values.push(query.priority);
+      where.push(`t.priority=$${values.length}`);
+    }
+    if (!query.includeArchived) {
+      where.push('t.archived_at is null');
+    }
+    const result = await client.query(
+      `${taskSelect} where ${where.join(' and ')} order by t.created_at desc`,
+      values,
+    );
+    return result.rows;
+  });
+  response.json({ data: tasks });
+});
+
+operationsRouter.post('/properties/:id/tasks', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = createTaskSchema.parse(request.body);
+  const task = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (
+        await client.query<{
+          organization_id: string;
+          project_id: string;
+          assigned_manager_id: string | null;
+          assigned_negotiator_id: string | null;
+        }>(
+          `select organization_id, project_id, assigned_manager_id, assigned_negotiator_id from public.properties where id=$1`,
+          [id],
+        )
+      ).rows,
+      'Property not found',
+    );
+    const role = await requireVisibleProperty(client, property.organization_id, user.id);
+    const manager = await isTaskManager(client, role, property.assigned_manager_id, property.project_id, user.id);
+    const assignedUserId = body.assignedUserId ?? null;
+
+    if (manager) {
+      // any assignee, or none, as provided
+    } else if (role === 'negotiator' && property.assigned_negotiator_id === user.id) {
+      if (assignedUserId !== user.id) {
+        throw httpError(403, 'Negotiators may only create tasks assigned to themselves');
+      }
+    } else if (TASK_SELF_ASSIGN_CREATE_ROLES.includes(role)) {
+      if (assignedUserId !== user.id) {
+        throw httpError(403, 'You may only create tasks assigned to yourself');
+      }
+    } else {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+
+    const inserted = await client.query<{ id: string }>(
+      `insert into public.tasks (
+          organization_id, property_id, title, description, priority, assigned_user_id, due_on, created_by_user_id
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8)
+        returning id`,
+      [
+        property.organization_id,
+        id,
+        body.title,
+        body.description ?? null,
+        body.priority,
+        assignedUserId,
+        body.dueOn ?? null,
+        user.id,
+      ],
+    );
+    const taskId = firstRow(inserted.rows, 'Task creation failed').id;
+    const result = await client.query(`${taskSelect} where t.id=$1`, [taskId]);
+    return firstRow(result.rows, 'Task creation failed');
+  });
+  response.status(201).json({ data: task });
+});
+
+operationsRouter.patch('/tasks/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = updateTaskSchema.parse(request.body);
+  const task = await withActorTransaction(user.id, async (client) => {
+    const existing = firstRow(
+      (await client.query(`select * from public.tasks where id=$1`, [id])).rows,
+      'Task not found',
+    );
+    const role = await requireVisibleProperty(client, existing.organization_id, user.id);
+    const property = firstRow(
+      (
+        await client.query<{ project_id: string; assigned_manager_id: string | null }>(
+          `select project_id, assigned_manager_id from public.properties where id=$1`,
+          [existing.property_id],
+        )
+      ).rows,
+      'Property not found',
+    );
+    const manager = await isTaskManager(client, role, property.assigned_manager_id, property.project_id, user.id);
+    const isSelfAssignee = role !== 'viewer' && existing.assigned_user_id === user.id;
+    if (!manager && !isSelfAssignee) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+
+    const requested = Object.keys(body).filter((key) => body[key as keyof typeof body] !== undefined);
+    if (!manager && requested.includes('assignedUserId')) {
+      throw httpError(403, 'Only elevated task managers may reassign a task');
+    }
+
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    const add = (column: string, value: unknown) => {
+      values.push(value);
+      sets.push(`${column}=$${values.length}`);
+    };
+    if (body.title !== undefined) add(taskPatchColumns.title, body.title);
+    if (body.description !== undefined) add(taskPatchColumns.description, body.description);
+    if (body.status !== undefined) add(taskPatchColumns.status, body.status);
+    if (body.priority !== undefined) add(taskPatchColumns.priority, body.priority);
+    if (body.assignedUserId !== undefined) add(taskPatchColumns.assignedUserId, body.assignedUserId);
+    if (body.dueOn !== undefined) add(taskPatchColumns.dueOn, body.dueOn);
+    if (body.archived !== undefined) add('archived_at', body.archived ? new Date().toISOString() : null);
+
+    if (sets.length) {
+      values.push(id);
+      await client.query(`update public.tasks set ${sets.join(', ')} where id=$${values.length}`, values);
+    }
+    const result = await client.query(`${taskSelect} where t.id=$1`, [id]);
+    return firstRow(result.rows, 'Task update failed');
+  });
+  response.json({ data: task });
 });
