@@ -39,3 +39,49 @@ export const propertyOwnerParamsSchema = z.object({ id: z.uuid(), ownerId: z.uui
 
 export type AcquisitionStage = z.infer<typeof acquisitionStageSchema>;
 export type OwnerType = z.infer<typeof ownerTypeSchema>;
+
+export const negotiationStatusSchema = z.enum(['open', 'paused', 'accepted', 'rejected', 'withdrawn', 'closed']);
+export const negotiationEventTypeSchema = z.enum(['offer', 'counteroffer', 'meeting', 'call', 'message', 'note', 'other']);
+
+export const negotiationListQuerySchema = z.object({
+  organizationId: z.uuid(),
+  propertyId: z.uuid().optional(),
+  status: negotiationStatusSchema.optional(),
+});
+
+export const createNegotiationSchema = z.object({
+  organizationId: z.uuid(),
+  propertyId: z.uuid(),
+  assignedNegotiatorId: z.uuid().nullable().optional(),
+  openingAmount: z.number().nonnegative().nullable().optional(),
+  targetAmount: z.number().nonnegative().nullable().optional(),
+  currencyCode: z.string().trim().length(3).default('PHP'),
+  startedAt: z.string().datetime().optional(),
+});
+
+export const updateNegotiationSchema = z.object({
+  status: negotiationStatusSchema.optional(),
+  assignedNegotiatorId: z.uuid().nullable().optional(),
+  openingAmount: z.number().nonnegative().nullable().optional(),
+  targetAmount: z.number().nonnegative().nullable().optional(),
+  currencyCode: z.string().trim().length(3).optional(),
+  startedAt: z.string().datetime().optional(),
+  closedAt: z.string().datetime().nullable().optional(),
+  archivedAt: z.string().datetime().nullable().optional(),
+});
+
+export const createNegotiationEventSchema = z.object({
+  eventType: negotiationEventTypeSchema,
+  amount: z.number().nonnegative().nullable().optional(),
+  contextualNote: z.string().trim().max(4000).nullable().optional(),
+  occurredAt: z.string().datetime().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+}).superRefine((value, ctx) => {
+  if ((value.eventType === 'offer' || value.eventType === 'counteroffer') && (value.amount == null)) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Offer and counteroffer events require an amount',
+      path: ['amount'],
+    });
+  }
+});

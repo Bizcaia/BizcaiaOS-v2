@@ -5,6 +5,10 @@ import {
   DEMO_ORGANIZATION_ID,
   operationsApi,
   type AcquisitionStage,
+  type Negotiation,
+  type NegotiationEvent,
+  type NegotiationEventType,
+  type NegotiationStatus,
   type Owner,
   type OwnerType,
   type Project,
@@ -38,6 +42,27 @@ const ownerTypeLabels: Record<OwnerType, string> = {
   government: 'Government',
   other: 'Other',
 };
+
+const negotiationStatusLabels: Record<NegotiationStatus, string> = {
+  open: 'Open',
+  paused: 'Paused',
+  accepted: 'Accepted',
+  rejected: 'Rejected',
+  withdrawn: 'Withdrawn',
+  closed: 'Closed',
+};
+
+const eventTypeLabels: Record<NegotiationEventType, string> = {
+  offer: 'Offer',
+  counteroffer: 'Counteroffer',
+  meeting: 'Meeting',
+  call: 'Call',
+  message: 'Message',
+  note: 'Note',
+  other: 'Other',
+};
+
+const negotiationManagerRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 
 type OpsTab = 'dashboard' | 'projects' | 'properties' | 'team';
 
@@ -100,6 +125,7 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [organizationId, setOrganizationId] = useState<string | null>(null);
   const [role, setRole] = useState<OrganizationRole>('viewer');
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [orgContextError, setOrgContextError] = useState('');
   const isDemo = organizationApiMode === 'demo';
   const canManageProperties = propertyCreateRoles.includes(role);
@@ -117,6 +143,7 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
       .then((me) => {
         if (cancelled) return;
         const activeOrg = me.organizations[0];
+        setCurrentUserId(me.id);
         if (isDemo) {
           setRole(activeOrg?.role ?? 'system_admin');
           return;
@@ -376,6 +403,7 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
                 members={members}
                 owners={owners}
                 role={role}
+                currentUserId={currentUserId}
                 canManageOwners={canManageOwners}
                 onClose={() => setSelected(null)}
                 onSaved={async () => {
@@ -427,6 +455,7 @@ function PropertyDrawer({
   members,
   owners,
   role,
+  currentUserId,
   canManageOwners,
   onClose,
   onSaved,
@@ -435,6 +464,7 @@ function PropertyDrawer({
   members: Member[];
   owners: Owner[];
   role: OrganizationRole;
+  currentUserId: string | null;
   canManageOwners: boolean;
   onClose: () => void;
   onSaved: () => Promise<void>;
@@ -678,8 +708,224 @@ function PropertyDrawer({
             </>
           )}
         </section>
+        <NegotiationBlock
+          property={property}
+          members={members}
+          role={role}
+          currentUserId={currentUserId}
+        />
       </aside>
     </div>
+  );
+}
+
+function formatMoney(amount: number | null, currency: string) {
+  if (amount == null) return '—';
+  return `${currency} ${Number(amount).toLocaleString()}`;
+}
+
+function NegotiationBlock({
+  property,
+  members,
+  role,
+  currentUserId,
+}: {
+  property: Property;
+  members: Member[];
+  role: OrganizationRole;
+  currentUserId: string | null;
+}) {
+  const [negotiation, setNegotiation] = useState<Negotiation | null>(null);
+  const [events, setEvents] = useState<NegotiationEvent[]>([]);
+  const [openingAmount, setOpeningAmount] = useState('');
+  const [targetAmount, setTargetAmount] = useState('');
+  const [assignedNegotiatorId, setAssignedNegotiatorId] = useState(property.assigned_negotiator_id ?? '');
+  const [status, setStatus] = useState<NegotiationStatus>('open');
+  const [eventType, setEventType] = useState<NegotiationEventType>('offer');
+  const [eventAmount, setEventAmount] = useState('');
+  const [eventNote, setEventNote] = useState('');
+  const [error, setError] = useState('');
+  const isManager = negotiationManagerRoles.includes(role);
+  const active = negotiation && (negotiation.status === 'open' || negotiation.status === 'paused');
+  const canWrite =
+    isManager || (role === 'negotiator' && negotiation?.assigned_negotiator_id === currentUserId);
+  const canCreate =
+    !active &&
+    property.acquisition_stage === 'negotiation' &&
+    (isManager || (role === 'negotiator' && property.assigned_negotiator_id === currentUserId));
+
+  const refresh = async () => {
+    const listed = await operationsApi.listNegotiations(property.organization_id, { propertyId: property.id });
+    const current =
+      listed.find((entry) => entry.status === 'open' || entry.status === 'paused') ?? listed[0] ?? null;
+    setNegotiation(current);
+    setStatus(current?.status ?? 'open');
+    setAssignedNegotiatorId(current?.assigned_negotiator_id ?? property.assigned_negotiator_id ?? '');
+    setEvents(current ? await operationsApi.listNegotiationEvents(current.id) : []);
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) => setError(cause instanceof Error ? cause.message : 'Unable to load negotiation'));
+  }, [property.id]);
+
+  return (
+    <section className="owner-block">
+      <h3>Negotiation</h3>
+      {error && <p className="form-error">{error}</p>}
+      {negotiation ? (
+        <>
+          <div className="drawer-summary">
+            <span>Status <b>{negotiationStatusLabels[negotiation.status]}</b></span>
+            <span>Assigned negotiator <b>{negotiation.assigned_negotiator_name ?? 'Unassigned'}</b></span>
+            <span>Currency <b>{negotiation.currency_code}</b></span>
+            <span>Opening <b>{formatMoney(negotiation.opening_amount, negotiation.currency_code)}</b></span>
+            <span>Target <b>{formatMoney(negotiation.target_amount, negotiation.currency_code)}</b></span>
+            <span>Current <b>{formatMoney(negotiation.current_amount, negotiation.currency_code)}</b></span>
+            <span>Started <b>{new Date(negotiation.started_at).toLocaleString()}</b></span>
+            <span>Closed <b>{negotiation.closed_at ? new Date(negotiation.closed_at).toLocaleString() : '—'}</b></span>
+          </div>
+          {canWrite && (
+            <>
+              <label>
+                Status
+                <select value={status} onChange={(event) => setStatus(event.target.value as NegotiationStatus)}>
+                  {Object.entries(negotiationStatusLabels).map(([key, label]) => (
+                    <option key={key} value={key}>{label}</option>
+                  ))}
+                </select>
+              </label>
+              {isManager && (
+                <label>
+                  Negotiation negotiator
+                  <select value={assignedNegotiatorId} onChange={(event) => setAssignedNegotiatorId(event.target.value)}>
+                    <option value="">Unassigned</option>
+                    {assignmentChoices(members, negotiatorAssignmentRoles).map((member) => (
+                      <option key={member.user_id} value={member.user_id}>{member.display_name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <button
+                className="primary-button"
+                type="button"
+                onClick={async () => {
+                  setError('');
+                  await operationsApi.updateNegotiation(negotiation.id, {
+                    status,
+                    assignedNegotiatorId: isManager ? assignedNegotiatorId || null : undefined,
+                  });
+                  await refresh();
+                }}
+              >
+                Update negotiation
+              </button>
+            </>
+          )}
+        </>
+      ) : (
+        <p>No negotiation on this property yet.</p>
+      )}
+      {canCreate && (
+        <>
+          <h3>Create negotiation</h3>
+          <label>
+            Opening amount
+            <input value={openingAmount} onChange={(event) => setOpeningAmount(event.target.value)} type="number" min="0" />
+          </label>
+          <label>
+            Target amount
+            <input value={targetAmount} onChange={(event) => setTargetAmount(event.target.value)} type="number" min="0" />
+          </label>
+          {isManager && (
+            <label>
+              Assigned negotiator
+              <select value={assignedNegotiatorId} onChange={(event) => setAssignedNegotiatorId(event.target.value)}>
+                <option value="">Unassigned</option>
+                {assignmentChoices(members, negotiatorAssignmentRoles).map((member) => (
+                  <option key={member.user_id} value={member.user_id}>{member.display_name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            className="primary-button"
+            type="button"
+            onClick={async () => {
+              setError('');
+              await operationsApi.createNegotiation({
+                organizationId: property.organization_id,
+                propertyId: property.id,
+                assignedNegotiatorId: isManager ? assignedNegotiatorId || null : undefined,
+                openingAmount: openingAmount ? Number(openingAmount) : null,
+                targetAmount: targetAmount ? Number(targetAmount) : null,
+              });
+              await refresh();
+            }}
+          >
+            Create negotiation
+          </button>
+        </>
+      )}
+      {negotiation && (
+        <>
+          <h3>Negotiation history</h3>
+          {events.length === 0 ? (
+            <p>No events yet.</p>
+          ) : (
+            <ul className="owner-list">
+              {events.map((event) => (
+                <li key={event.id}>
+                  <strong>{eventTypeLabels[event.event_type]}</strong>
+                  <small>
+                    {event.actor_name ?? 'Unknown actor'}
+                    {event.amount != null ? ` · ${formatMoney(event.amount, negotiation.currency_code)}` : ''}
+                    {` · ${new Date(event.occurred_at).toLocaleString()}`}
+                  </small>
+                  {event.contextual_note && <small>{event.contextual_note}</small>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {canWrite && (
+            <>
+              <label>
+                Event type
+                <select value={eventType} onChange={(event) => setEventType(event.target.value as NegotiationEventType)}>
+                  {Object.entries(eventTypeLabels).map(([key, label]) => (
+                    <option key={key} value={key}>{label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Amount
+                <input value={eventAmount} onChange={(event) => setEventAmount(event.target.value)} type="number" min="0" />
+              </label>
+              <label>
+                Note
+                <input value={eventNote} onChange={(event) => setEventNote(event.target.value)} />
+              </label>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={async () => {
+                  setError('');
+                  await operationsApi.createNegotiationEvent(negotiation.id, {
+                    eventType,
+                    amount: eventAmount ? Number(eventAmount) : null,
+                    contextualNote: eventNote || null,
+                  });
+                  setEventAmount('');
+                  setEventNote('');
+                  await refresh();
+                }}
+              >
+                Record event
+              </button>
+            </>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 

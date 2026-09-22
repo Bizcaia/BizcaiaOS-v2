@@ -12,6 +12,7 @@ const MIGRATION_FILES = [
   '003_organization_onboarding.sql',
   '004_property_workflow_rls.sql',
   '005_projects_write_rls.sql',
+  '006_negotiations_rls.sql',
 ];
 
 function requiredEnv(name: string) {
@@ -37,6 +38,7 @@ export async function runMigrations() {
   const client = new Client({ connectionString: migrateUrl });
   await client.connect();
   try {
+    await client.query('select pg_advisory_lock(87236401)');
     await client.query('begin');
     await client.query(`
       create table if not exists public.schema_migrations (
@@ -73,6 +75,11 @@ export async function runMigrations() {
     await grantApplicationPrivileges(client, appRole);
     console.log('migrations complete');
   } finally {
+    try {
+      await client.query('select pg_advisory_unlock(87236401)');
+    } catch {
+      // connection may already be closed after a fatal error
+    }
     await client.end();
   }
 }

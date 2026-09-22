@@ -13,6 +13,10 @@ import {
   projectListQuerySchema,
   propertyListQuerySchema,
   propertyOwnerParamsSchema,
+  createNegotiationEventSchema,
+  createNegotiationSchema,
+  negotiationListQuerySchema,
+  updateNegotiationSchema,
   updatePropertySchema,
 } from './operationsSchemas.js';
 
@@ -20,6 +24,33 @@ export const operationsRouter = Router();
 
 const OWNER_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
 const PROPERTY_CREATE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
+const NEGOTIATION_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
+
+const negotiationPatchColumns: Record<string, string> = {
+  status: 'status',
+  assignedNegotiatorId: 'assigned_negotiator_id',
+  openingAmount: 'opening_amount',
+  targetAmount: 'target_amount',
+  currencyCode: 'currency_code',
+  startedAt: 'started_at',
+  closedAt: 'closed_at',
+  archivedAt: 'archived_at',
+};
+
+function allowedNegotiationPatchKeys(role: OrganizationRole): Set<string> {
+  if (NEGOTIATION_MANAGER_ROLES.includes(role)) {
+    return new Set(Object.keys(negotiationPatchColumns));
+  }
+  if (role === 'negotiator') {
+    return new Set(['status', 'openingAmount', 'targetAmount', 'currencyCode', 'startedAt', 'closedAt', 'archivedAt']);
+  }
+  return new Set();
+}
+
+function canWriteNegotiation(role: OrganizationRole, assignedNegotiatorId: string | null, userId: string) {
+  if (NEGOTIATION_MANAGER_ROLES.includes(role)) return true;
+  return role === 'negotiator' && assignedNegotiatorId === userId;
+}
 
 const propertyPatchColumns: Record<string, string> = {
   acquisitionStage: 'acquisition_stage',
@@ -372,4 +403,197 @@ operationsRouter.delete('/properties/:id/owners/:ownerId', async (request, respo
     if (result.rowCount === 0) throw httpError(404, 'Property owner link not found');
   });
   response.status(204).end();
+});
+
+const negotiationSelect = `
+  select n.*, u.display_name as assigned_negotiator_name
+    from public.negotiations n
+    left join public.app_users u on u.id = n.assigned_negotiator_id`;
+
+operationsRouter.get('/negotiations', async (request, response) => {
+  const user = requireUser(request);
+  const query = negotiationListQuerySchema.parse(request.query);
+  const negotiations = await withActorTransaction(user.id, async (client) => {
+    await requireMembership(client, query.organizationId, user.id);
+    const values: unknown[] = [query.organizationId];
+    const where = ['n.organization_id=$1'];
+    if (query.propertyId) {
+      values.push(query.propertyId);
+      where.push(`n.property_id=$${values.length}`);
+    }
+    if (query.status) {
+      values.push(query.status);
+      where.push(`n.status=$${values.length}`);
+    }
+    const result = await client.query(
+      `${negotiationSelect} where ${where.join(' and ')} order by n.updated_at desc`,
+      values,
+    );
+    return result.rows;
+  });
+  response.json({ data: negotiations });
+});
+
+operationsRouter.post('/negotiations', async (request, response) => {
+  const user = requireUser(request);
+  const body = createNegotiationSchema.parse(request.body);
+  const negotiation = await withActorTransaction(user.id, async (client) => {
+    const role = await requireMembership(client, body.organizationId, user.id);
+    const property = firstRow(
+      (
+        await client.query<{
+          organization_id: string;
+          acquisition_stage: string;
+          assigned_negotiator_id: string | null;
+        }>(`select organization_id, acquisition_stage, assigned_negotiator_id from public.properties where id=$1`, [
+          body.propertyId,
+        ])
+      ).rows,
+      'Property not found',
+    );
+    if (property.organization_id !== body.organizationId) {
+      throw httpError(422, 'Negotiation property must belong to the same organization');
+    }
+    if (property.acquisition_stage !== 'negotiation') {
+      throw httpError(422, 'Negotiation can only be opened when the property is in negotiation stage');
+    }
+    const assignedNegotiatorId =
+      body.assignedNegotiatorId === undefined ? property.assigned_negotiator_id : body.assignedNegotiatorId;
+    if (!canWriteNegotiation(role, assignedNegotiatorId, user.id)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+    const result = await client.query(
+      `insert into public.negotiations (
+          organization_id, property_id, assigned_negotiator_id, opening_amount, target_amount, currency_code, started_at
+        ) values ($1,$2,$3,$4,$5,$6,coalesce($7::timestamptz, timezone('utc', now())))
+        returning *`,
+      [
+        body.organizationId,
+        body.propertyId,
+        assignedNegotiatorId,
+        body.openingAmount ?? null,
+        body.targetAmount ?? null,
+        body.currencyCode.toUpperCase(),
+        body.startedAt ?? null,
+      ],
+    );
+    return firstRow(result.rows, 'Negotiation creation failed');
+  });
+  response.status(201).json({ data: negotiation });
+});
+
+operationsRouter.get('/negotiations/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const negotiation = await withActorTransaction(user.id, async (client) => {
+    const result = await client.query(`${negotiationSelect} where n.id=$1`, [id]);
+    const row = firstRow(result.rows, 'Negotiation not found');
+    if (!(await currentRole(client, row.organization_id, user.id))) {
+      throw httpError(404, 'Negotiation not found');
+    }
+    return row;
+  });
+  response.json({ data: negotiation });
+});
+
+operationsRouter.patch('/negotiations/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = updateNegotiationSchema.parse(request.body);
+  const negotiation = await withActorTransaction(user.id, async (client) => {
+    const existing = firstRow(
+      (await client.query(`select * from public.negotiations where id=$1`, [id])).rows,
+      'Negotiation not found',
+    );
+    const role = await requireVisibleProperty(client, existing.organization_id, user.id);
+    if (!canWriteNegotiation(role, existing.assigned_negotiator_id, user.id)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+    const allowed = allowedNegotiationPatchKeys(role);
+    const requested = Object.keys(body).filter((key) => body[key as keyof typeof body] !== undefined);
+    if (requested.some((key) => !allowed.has(key))) {
+      throw httpError(403, 'You do not have permission to update one or more negotiation fields');
+    }
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    for (const key of requested) {
+      const column = negotiationPatchColumns[key];
+      if (!column) continue;
+      const value = body[key as keyof typeof body];
+      values.push(key === 'currencyCode' && typeof value === 'string' ? value.toUpperCase() : value);
+      sets.push(`${column}=$${values.length}`);
+    }
+    if (!sets.length) return existing;
+    values.push(id);
+    const result = await client.query(
+      `update public.negotiations set ${sets.join(', ')} where id=$${values.length} returning *`,
+      values,
+    );
+    return firstRow(result.rows, 'Negotiation update failed');
+  });
+  response.json({ data: negotiation });
+});
+
+operationsRouter.get('/negotiations/:id/events', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const events = await withActorTransaction(user.id, async (client) => {
+    const negotiation = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.negotiations where id=$1`, [id])).rows,
+      'Negotiation not found',
+    );
+    if (!(await currentRole(client, negotiation.organization_id, user.id))) {
+      throw httpError(404, 'Negotiation not found');
+    }
+    return (
+      await client.query(
+        `select e.*, u.display_name as actor_name
+           from public.negotiation_events e
+           join public.app_users u on u.id = e.actor_user_id
+          where e.negotiation_id=$1
+          order by e.occurred_at desc, e.created_at desc`,
+        [id],
+      )
+    ).rows;
+  });
+  response.json({ data: events });
+});
+
+operationsRouter.post('/negotiations/:id/events', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = createNegotiationEventSchema.parse(request.body);
+  const event = await withActorTransaction(user.id, async (client) => {
+    const negotiation = firstRow(
+      (
+        await client.query<{ organization_id: string; assigned_negotiator_id: string | null }>(
+          `select organization_id, assigned_negotiator_id from public.negotiations where id=$1`,
+          [id],
+        )
+      ).rows,
+      'Negotiation not found',
+    );
+    const role = await requireVisibleProperty(client, negotiation.organization_id, user.id);
+    if (!canWriteNegotiation(role, negotiation.assigned_negotiator_id, user.id)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+    const result = await client.query(
+      `insert into public.negotiation_events (
+          organization_id, negotiation_id, event_type, amount, actor_user_id, contextual_note, occurred_at, metadata
+        ) values ($1,$2,$3,$4,$5,$6,coalesce($7::timestamptz, timezone('utc', now())),$8::jsonb)
+        returning *`,
+      [
+        negotiation.organization_id,
+        id,
+        body.eventType,
+        body.amount ?? null,
+        user.id,
+        body.contextualNote ?? null,
+        body.occurredAt ?? null,
+        JSON.stringify(body.metadata ?? {}),
+      ],
+    );
+    return firstRow(result.rows, 'Negotiation event creation failed');
+  });
+  response.status(201).json({ data: event });
 });

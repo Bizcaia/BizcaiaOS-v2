@@ -125,4 +125,26 @@ describe('OpsApp property workflow', () => {
     );
     expect(managerOptions).toEqual(['Unassigned', 'Alex Villanueva', 'Maria Santos', 'Ramon Fernandez']);
   });
+
+  it('shows negotiation state and history on a negotiation-stage property', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Negotiation' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Negotiation history' })).toBeVisible();
+    expect(screen.getByText(/Opening offer recorded/)).toBeVisible();
+    expect(screen.getAllByText(/12,?500,?000/).length).toBeGreaterThan(0);
+
+    await user.selectOptions(screen.getByLabelText('Event type'), 'Counteroffer');
+    await user.type(screen.getByLabelText('Amount'), '13100000');
+    await user.type(screen.getByLabelText('Note'), 'Owner counter');
+    await user.click(screen.getByRole('button', { name: 'Record event' }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/13,?100,?000/).length).toBeGreaterThan(0);
+      expect(screen.getByText(/Owner counter/)).toBeVisible();
+    });
+  });
 });

@@ -79,6 +79,41 @@ export type Owner = {
   updated_at: string;
 };
 
+export type NegotiationStatus = 'open' | 'paused' | 'accepted' | 'rejected' | 'withdrawn' | 'closed';
+export type NegotiationEventType = 'offer' | 'counteroffer' | 'meeting' | 'call' | 'message' | 'note' | 'other';
+
+export type Negotiation = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  status: NegotiationStatus;
+  assigned_negotiator_id: string | null;
+  assigned_negotiator_name?: string | null;
+  opening_amount: number | null;
+  target_amount: number | null;
+  current_amount: number | null;
+  currency_code: string;
+  started_at: string;
+  closed_at: string | null;
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type NegotiationEvent = {
+  id: string;
+  organization_id: string;
+  negotiation_id: string;
+  event_type: NegotiationEventType;
+  amount: number | null;
+  actor_user_id: string;
+  actor_name?: string | null;
+  contextual_note: string | null;
+  occurred_at: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const operationsApiMode = apiBase ? 'live' : 'demo';
@@ -179,6 +214,9 @@ const propertyPatchColumns: Record<string, string> = {
   metadata: 'metadata',
 };
 
+const DEMO_ACTOR_ID = '758d5718-53d9-4ea2-b9d5-02828fcc0e2c';
+const negotiationManagerRoles = new Set(['system_admin', 'land_acquisition_manager']);
+
 let demoProjects: Project[] = [];
 let demoProperties: Property[] = [];
 let demoOwners: Owner[] = [];
@@ -188,6 +226,33 @@ let demoPropertyOwners: Array<{
   ownership_percent: number | null;
   is_primary: boolean;
 }> = [];
+let demoNegotiations: Negotiation[] = [];
+let demoNegotiationEvents: NegotiationEvent[] = [];
+
+function decorateNegotiation(negotiation: Negotiation): Negotiation {
+  return {
+    ...negotiation,
+    assigned_negotiator_name: negotiation.assigned_negotiator_id
+      ? demoUsers[negotiation.assigned_negotiator_id] ?? null
+      : null,
+  };
+}
+
+function decorateEvent(event: NegotiationEvent): NegotiationEvent {
+  return { ...event, actor_name: demoUsers[event.actor_user_id] ?? null };
+}
+
+function assertNegotiatorAssignment(organizationId: string, assignedNegotiatorId: string | null) {
+  if (!assignedNegotiatorId) return;
+  assertAssignmentRoles(organizationId, assignedNegotiatorId, null);
+}
+
+function demoCanWriteNegotiation(assignedNegotiatorId: string | null) {
+  const member = demoMemberships.find((entry) => entry.user_id === DEMO_ACTOR_ID && entry.is_active);
+  if (!member) return false;
+  if (negotiationManagerRoles.has(member.role)) return true;
+  return member.role === 'negotiator' && assignedNegotiatorId === DEMO_ACTOR_ID;
+}
 
 function now() {
   return new Date().toISOString();
@@ -327,6 +392,38 @@ export function resetOperationsDemoState() {
       ownership_percent: 100,
       is_primary: true,
     },
+  ];
+  demoNegotiations = [
+    decorateNegotiation({
+      id: '90000000-0000-4000-8000-000000000001',
+      organization_id: demoOrg,
+      property_id: '70000000-0000-4000-8000-000000000001',
+      status: 'open',
+      assigned_negotiator_id: '5517eab7-57db-412f-b381-33844d31a64f',
+      opening_amount: 12000000,
+      target_amount: 15000000,
+      current_amount: 12500000,
+      currency_code: 'PHP',
+      started_at: '2026-08-01T00:00:00.000Z',
+      closed_at: null,
+      archived_at: null,
+      created_at: '2026-08-01T00:00:00.000Z',
+      updated_at: '2026-08-12T00:00:00.000Z',
+    }),
+  ];
+  demoNegotiationEvents = [
+    decorateEvent({
+      id: '91000000-0000-4000-8000-000000000001',
+      organization_id: demoOrg,
+      negotiation_id: '90000000-0000-4000-8000-000000000001',
+      event_type: 'offer',
+      amount: 12500000,
+      actor_user_id: DEMO_ACTOR_ID,
+      contextual_note: 'Opening offer recorded',
+      occurred_at: '2026-08-12T00:00:00.000Z',
+      metadata: {},
+      created_at: '2026-08-12T00:00:00.000Z',
+    }),
   ];
 }
 
@@ -542,6 +639,193 @@ export const operationsApi = {
       (link) => !(link.property_id === propertyId && link.owner_id === ownerId),
     );
     if (demoPropertyOwners.length === before) throw new Error('Property owner link not found');
+  },
+
+  async listNegotiations(orgId: string, filters?: { propertyId?: string; status?: NegotiationStatus }) {
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams({ organizationId: orgId });
+      if (filters?.propertyId) query.set('propertyId', filters.propertyId);
+      if (filters?.status) query.set('status', filters.status);
+      return request<Negotiation[]>(`/ops/negotiations?${query}`);
+    }
+    return demoNegotiations
+      .filter((negotiation) => negotiation.organization_id === orgId)
+      .filter((negotiation) => !filters?.propertyId || negotiation.property_id === filters.propertyId)
+      .filter((negotiation) => !filters?.status || negotiation.status === filters.status)
+      .map(decorateNegotiation);
+  },
+
+  async createNegotiation(input: {
+    organizationId: string;
+    propertyId: string;
+    assignedNegotiatorId?: string | null;
+    openingAmount?: number | null;
+    targetAmount?: number | null;
+    currencyCode?: string;
+    startedAt?: string;
+  }) {
+    if (operationsApiMode === 'live') {
+      return request<Negotiation>('/ops/negotiations', { method: 'POST', body: JSON.stringify(input) });
+    }
+    const property = demoProperties.find((entry) => entry.id === input.propertyId);
+    if (!property) throw new Error('Property not found');
+    if (property.organization_id !== input.organizationId) {
+      throw new Error('Negotiation property must belong to the same organization');
+    }
+    if (property.acquisition_stage !== 'negotiation') {
+      throw new Error('Negotiation can only be opened when the property is in negotiation stage');
+    }
+    const assignedNegotiatorId =
+      input.assignedNegotiatorId === undefined ? property.assigned_negotiator_id : input.assignedNegotiatorId;
+    assertNegotiatorAssignment(input.organizationId, assignedNegotiatorId);
+    if (!demoCanWriteNegotiation(assignedNegotiatorId)) {
+      throw new Error('You do not have permission for this operation');
+    }
+    if (demoNegotiations.some((entry) => entry.property_id === input.propertyId && (entry.status === 'open' || entry.status === 'paused'))) {
+      throw new Error('A property may have only one open or paused negotiation');
+    }
+    const timestamp = now();
+    const negotiation = decorateNegotiation({
+      id: crypto.randomUUID(),
+      organization_id: input.organizationId,
+      property_id: input.propertyId,
+      status: 'open',
+      assigned_negotiator_id: assignedNegotiatorId ?? null,
+      opening_amount: input.openingAmount ?? null,
+      target_amount: input.targetAmount ?? null,
+      current_amount: null,
+      currency_code: (input.currencyCode ?? 'PHP').toUpperCase(),
+      started_at: input.startedAt ?? timestamp,
+      closed_at: null,
+      archived_at: null,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
+    demoNegotiations = [negotiation, ...demoNegotiations];
+    return negotiation;
+  },
+
+  async getNegotiation(id: string) {
+    if (operationsApiMode === 'live') return request<Negotiation>(`/ops/negotiations/${id}`);
+    const negotiation = demoNegotiations.find((entry) => entry.id === id);
+    if (!negotiation) throw new Error('Negotiation not found');
+    return decorateNegotiation(negotiation);
+  },
+
+  async updateNegotiation(
+    id: string,
+    input: {
+      status?: NegotiationStatus;
+      assignedNegotiatorId?: string | null;
+      openingAmount?: number | null;
+      targetAmount?: number | null;
+      currencyCode?: string;
+      startedAt?: string;
+      closedAt?: string | null;
+      archivedAt?: string | null;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<Negotiation>(`/ops/negotiations/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+    }
+    const index = demoNegotiations.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('Negotiation not found');
+    const existing = demoNegotiations[index];
+    if (!demoCanWriteNegotiation(existing.assigned_negotiator_id)) {
+      throw new Error('You do not have permission for this operation');
+    }
+    const assignedNegotiatorId =
+      input.assignedNegotiatorId === undefined ? existing.assigned_negotiator_id : input.assignedNegotiatorId;
+    assertNegotiatorAssignment(existing.organization_id, assignedNegotiatorId);
+    const nextStatus = input.status ?? existing.status;
+    if (nextStatus === 'open' || nextStatus === 'paused') {
+      const property = demoProperties.find((entry) => entry.id === existing.property_id);
+      if (!property || property.acquisition_stage !== 'negotiation') {
+        throw new Error('Negotiation can only be opened when the property is in negotiation stage');
+      }
+      if (
+        demoNegotiations.some(
+          (entry) =>
+            entry.id !== id &&
+            entry.property_id === existing.property_id &&
+            (entry.status === 'open' || entry.status === 'paused'),
+        )
+      ) {
+        throw new Error('A property may have only one open or paused negotiation');
+      }
+    }
+    const next = decorateNegotiation({
+      ...existing,
+      status: nextStatus,
+      assigned_negotiator_id: assignedNegotiatorId,
+      opening_amount: input.openingAmount === undefined ? existing.opening_amount : input.openingAmount,
+      target_amount: input.targetAmount === undefined ? existing.target_amount : input.targetAmount,
+      currency_code: input.currencyCode ? input.currencyCode.toUpperCase() : existing.currency_code,
+      started_at: input.startedAt ?? existing.started_at,
+      closed_at: input.closedAt === undefined ? existing.closed_at : input.closedAt,
+      archived_at: input.archivedAt === undefined ? existing.archived_at : input.archivedAt,
+      updated_at: now(),
+    });
+    demoNegotiations[index] = next;
+    return next;
+  },
+
+  async listNegotiationEvents(negotiationId: string) {
+    if (operationsApiMode === 'live') return request<NegotiationEvent[]>(`/ops/negotiations/${negotiationId}/events`);
+    if (!demoNegotiations.some((entry) => entry.id === negotiationId)) throw new Error('Negotiation not found');
+    return demoNegotiationEvents
+      .filter((event) => event.negotiation_id === negotiationId)
+      .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at))
+      .map(decorateEvent);
+  },
+
+  async createNegotiationEvent(
+    negotiationId: string,
+    input: {
+      eventType: NegotiationEventType;
+      amount?: number | null;
+      contextualNote?: string | null;
+      occurredAt?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<NegotiationEvent>(`/ops/negotiations/${negotiationId}/events`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    }
+    const negotiation = demoNegotiations.find((entry) => entry.id === negotiationId);
+    if (!negotiation) throw new Error('Negotiation not found');
+    if (!demoCanWriteNegotiation(negotiation.assigned_negotiator_id)) {
+      throw new Error('You do not have permission for this operation');
+    }
+    if ((input.eventType === 'offer' || input.eventType === 'counteroffer') && input.amount == null) {
+      throw new Error('Offer and counteroffer events require an amount');
+    }
+    const timestamp = now();
+    const event = decorateEvent({
+      id: crypto.randomUUID(),
+      organization_id: negotiation.organization_id,
+      negotiation_id: negotiationId,
+      event_type: input.eventType,
+      amount: input.amount ?? null,
+      actor_user_id: DEMO_ACTOR_ID,
+      contextual_note: input.contextualNote ?? null,
+      occurred_at: input.occurredAt ?? timestamp,
+      metadata: input.metadata ?? {},
+      created_at: timestamp,
+    });
+    demoNegotiationEvents = [event, ...demoNegotiationEvents];
+    if (input.eventType === 'offer' || input.eventType === 'counteroffer') {
+      const index = demoNegotiations.findIndex((entry) => entry.id === negotiationId);
+      demoNegotiations[index] = decorateNegotiation({
+        ...demoNegotiations[index],
+        current_amount: input.amount ?? null,
+        updated_at: timestamp,
+      });
+    }
+    return event;
   },
 
   async dashboard(orgId: string) {
