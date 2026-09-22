@@ -85,3 +85,49 @@ export const createNegotiationEventSchema = z.object({
     });
   }
 });
+
+export const documentCategorySchema = z.enum([
+  'ownership_evidence',
+  'title_deed',
+  'tax_declaration',
+  'legal_opinion',
+  'survey_plan',
+  'agreement_draft',
+  'agreement_executed',
+  'payment_proof',
+  'other',
+]);
+export const documentStatusSchema = z.enum([
+  'draft',
+  'submitted',
+  'under_review',
+  'verified',
+  'rejected',
+  'superseded',
+]);
+
+export const documentListQuerySchema = z.object({
+  category: documentCategorySchema.optional(),
+  status: documentStatusSchema.optional(),
+  includeArchived: z.coerce.boolean().default(false),
+});
+
+// Non-file multipart fields for POST /properties/:id/documents. storage_key,
+// storage_provider, content_type, size_bytes, and original_filename are never
+// accepted from the client -- they are derived server-side from the upload.
+export const createDocumentFieldsSchema = z.object({
+  category: documentCategorySchema,
+  title: z.string().trim().min(1).max(200),
+  negotiationId: z.uuid().optional(),
+});
+
+export const updateDocumentSchema = z.object({
+  category: documentCategorySchema.optional(),
+  status: documentStatusSchema.optional(),
+  title: z.string().trim().min(1).max(200).optional(),
+  negotiationId: z.uuid().nullable().optional(),
+  archived: z.boolean().optional(),
+});
+
+export type DocumentCategory = z.infer<typeof documentCategorySchema>;
+export type DocumentStatus = z.infer<typeof documentStatusSchema>;

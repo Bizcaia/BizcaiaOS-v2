@@ -5,6 +5,8 @@ import {
   DEMO_ORGANIZATION_ID,
   operationsApi,
   type AcquisitionStage,
+  type DocumentCategory,
+  type DocumentStatus,
   type Negotiation,
   type NegotiationEvent,
   type NegotiationEventType,
@@ -13,6 +15,7 @@ import {
   type OwnerType,
   type Project,
   type Property,
+  type PropertyDocument,
   type PropertyOwner,
 } from '../api/operationsApi';
 import TeamManagement from './TeamManagement';
@@ -63,6 +66,29 @@ const eventTypeLabels: Record<NegotiationEventType, string> = {
 };
 
 const negotiationManagerRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager'];
+
+const documentCategoryLabels: Record<DocumentCategory, string> = {
+  ownership_evidence: 'Ownership evidence',
+  title_deed: 'Title deed',
+  tax_declaration: 'Tax declaration',
+  legal_opinion: 'Legal opinion',
+  survey_plan: 'Survey plan',
+  agreement_draft: 'Agreement draft',
+  agreement_executed: 'Agreement executed',
+  payment_proof: 'Payment proof',
+  other: 'Other',
+};
+
+const documentStatusLabels: Record<DocumentStatus, string> = {
+  draft: 'Draft',
+  submitted: 'Submitted',
+  under_review: 'Under review',
+  verified: 'Verified',
+  rejected: 'Rejected',
+  superseded: 'Superseded',
+};
+
+const documentWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
 
 type OpsTab = 'dashboard' | 'projects' | 'properties' | 'team';
 
@@ -714,6 +740,7 @@ function PropertyDrawer({
           role={role}
           currentUserId={currentUserId}
         />
+        <DocumentBlock property={property} role={role} />
       </aside>
     </div>
   );
@@ -923,6 +950,134 @@ function NegotiationBlock({
               </button>
             </>
           )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function DocumentBlock({ property, role }: { property: Property; role: OrganizationRole }) {
+  const [documents, setDocuments] = useState<PropertyDocument[]>([]);
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const [category, setCategory] = useState<DocumentCategory>('other');
+  const [title, setTitle] = useState('');
+  const [file, setFile] = useState<File | null>(null);
+  const [error, setError] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const canWrite = documentWriteRoles.includes(role);
+
+  const refresh = async () => {
+    setDocuments(await operationsApi.listDocuments(property.id, { includeArchived }));
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) => setError(cause instanceof Error ? cause.message : 'Unable to load documents'));
+  }, [property.id, includeArchived]);
+
+  const download = async (id: string) => {
+    const { blob, filename } = await operationsApi.downloadDocument(id);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <section className="owner-block">
+      <h3>Documents</h3>
+      {error && <p className="form-error">{error}</p>}
+      <label className="checkbox-row">
+        <input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} />
+        Include archived
+      </label>
+      {documents.length === 0 ? (
+        <p>No documents uploaded yet.</p>
+      ) : (
+        <ul className="owner-list">
+          {documents.map((doc) => (
+            <li key={doc.id}>
+              <strong>{doc.title}</strong>
+              <small>
+                {documentCategoryLabels[doc.category]} · {documentStatusLabels[doc.status]}
+                {doc.uploaded_by_name ? ` · ${doc.uploaded_by_name}` : ''}
+                {` · ${new Date(doc.created_at).toLocaleString()}`}
+                {doc.archived_at ? ' · Archived' : ''}
+              </small>
+              <button type="button" onClick={() => void download(doc.id)}>
+                Download
+              </button>
+              {canWrite && (
+                <>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await operationsApi.updateDocument(doc.id, { archived: !doc.archived_at });
+                      await refresh();
+                    }}
+                  >
+                    {doc.archived_at ? 'Unarchive' : 'Archive'}
+                  </button>
+                  <select
+                    aria-label={`Status for ${doc.title}`}
+                    value={doc.status}
+                    onChange={async (event) => {
+                      await operationsApi.updateDocument(doc.id, { status: event.target.value as DocumentStatus });
+                      await refresh();
+                    }}
+                  >
+                    {Object.entries(documentStatusLabels).map(([key, label]) => (
+                      <option key={key} value={key}>{label}</option>
+                    ))}
+                  </select>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {canWrite && (
+        <>
+          <h3>Upload document</h3>
+          <label>
+            Document title
+            <input value={title} onChange={(event) => setTitle(event.target.value)} />
+          </label>
+          <label>
+            Document category
+            <select value={category} onChange={(event) => setCategory(event.target.value as DocumentCategory)}>
+              {Object.entries(documentCategoryLabels).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            File
+            <input type="file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+          </label>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={!title || !file || uploading}
+            onClick={async () => {
+              if (!file) return;
+              setUploading(true);
+              setError('');
+              try {
+                await operationsApi.uploadDocument(property.id, { category, title, file });
+                setTitle('');
+                setFile(null);
+                await refresh();
+              } catch (cause) {
+                setError(cause instanceof Error ? cause.message : 'Upload failed');
+              } finally {
+                setUploading(false);
+              }
+            }}
+          >
+            Upload document
+          </button>
         </>
       )}
     </section>
