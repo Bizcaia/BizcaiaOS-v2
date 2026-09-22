@@ -141,6 +141,44 @@ describe('Express against real PostgreSQL', () => {
       expect(detail.status).toBe(200);
       expect(detailBody.data.owners[0].display_name).toBe('HTTP Owner');
       expect(detailBody.data.assigned_manager_id).toBe(adminUserId);
+
+      const stage = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}`, {
+        method: 'PATCH',
+        headers: auth,
+        body: JSON.stringify({ acquisitionStage: 'negotiation' }),
+      });
+      expect(stage.status).toBe(200);
+
+      const negotiation = await fetch(`${baseUrl}/api/v1/ops/negotiations`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({
+          organizationId,
+          propertyId,
+          openingAmount: 9000000,
+          targetAmount: 12000000,
+        }),
+      });
+      const negotiationBody = await negotiation.json();
+      expect(negotiation.status).toBe(201);
+      expect(negotiationBody.data.status).toBe('open');
+      expect(negotiationBody.data.current_amount).toBeNull();
+
+      const event = await fetch(`${baseUrl}/api/v1/ops/negotiations/${negotiationBody.data.id}/events`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ eventType: 'offer', amount: 9500000, contextualNote: 'HTTP offer' }),
+      });
+      const eventBody = await event.json();
+      expect(event.status).toBe(201);
+      expect(Number(eventBody.data.amount)).toBe(9500000);
+
+      const negotiationDetail = await fetch(`${baseUrl}/api/v1/ops/negotiations/${negotiationBody.data.id}`, {
+        headers: auth,
+      });
+      const negotiationDetailBody = await negotiationDetail.json();
+      expect(negotiationDetail.status).toBe(200);
+      expect(Number(negotiationDetailBody.data.current_amount)).toBe(9500000);
     });
   });
 });

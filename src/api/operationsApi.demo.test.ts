@@ -107,4 +107,44 @@ describe('operationsApi demo adapter', () => {
       manager_name: 'Maria Santos',
     });
   });
+
+  it('enforces negotiation stage, open uniqueness, offer amounts, and current_amount sync', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const negotiationProperty = '70000000-0000-4000-8000-000000000001';
+    const documentationProperty = '70000000-0000-4000-8000-000000000003';
+
+    await expect(
+      operationsApi.createNegotiation({
+        organizationId: DEMO_ORGANIZATION_ID,
+        propertyId: documentationProperty,
+      }),
+    ).rejects.toThrow(/negotiation stage/i);
+
+    await expect(
+      operationsApi.createNegotiation({
+        organizationId: DEMO_ORGANIZATION_ID,
+        propertyId: negotiationProperty,
+      }),
+    ).rejects.toThrow(/only one open or paused/i);
+
+    const existing = await operationsApi.getNegotiation('90000000-0000-4000-8000-000000000001');
+    expect(existing.current_amount).toBe(12500000);
+
+    await expect(
+      operationsApi.createNegotiationEvent(existing.id, { eventType: 'offer' }),
+    ).rejects.toThrow(/amount/i);
+
+    const offer = await operationsApi.createNegotiationEvent(existing.id, {
+      eventType: 'counteroffer',
+      amount: 13000000,
+      contextualNote: 'Revised offer',
+    });
+    expect(offer.amount).toBe(13000000);
+    const updated = await operationsApi.getNegotiation(existing.id);
+    expect(updated.current_amount).toBe(13000000);
+
+    const events = await operationsApi.listNegotiationEvents(existing.id);
+    expect(events.some((event) => event.contextual_note === 'Opening offer recorded')).toBe(true);
+    expect(events[0].amount).toBe(13000000);
+  });
 });

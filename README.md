@@ -32,7 +32,7 @@ This starts Postgres 16 on `POSTGRES_PORT` (default 5432) with a persistent Dock
 ```bash
 npm run db:migrate
 ```
-Applies `database/001` through `database/005` in order, records them in `public.schema_migrations`, creates the application role, and grants table/function privileges.
+Applies `database/001` through `database/006` in order, records them in `public.schema_migrations`, creates the application role, and grants table/function privileges.
 
 Re-running the command is safe. Failure stops the process and does not record the failed file.
 
@@ -116,4 +116,6 @@ API: `API_PORT`, `CORS_ORIGIN`, `DATABASE_URL`, `DATABASE_MIGRATE_URL`, `DATABAS
 
 Analytics is optional. The Umami script is injected only when both `VITE_ANALYTICS_ENDPOINT` and `VITE_ANALYTICS_WEBSITE_ID` are set. An empty or missing pair is omitted from the production build.
 
-Apply SQL in order: `database/001_core_schema.sql`, `002_rbac_rls.sql`, `003_organization_onboarding.sql`, `004_property_workflow_rls.sql`, `005_projects_write_rls.sql`. Use `npm run db:migrate` for the recorded runner. Do not connect the API as the table owner if you want RLS to apply.
+Apply SQL in order: `database/001_core_schema.sql`, `002_rbac_rls.sql`, `003_organization_onboarding.sql`, `004_property_workflow_rls.sql`, `005_projects_write_rls.sql`, `006_negotiations_rls.sql`. Use `npm run db:migrate` for the recorded runner. Do not connect the API as the table owner if you want RLS to apply.
+
+The dashboard “Active negotiations” metric continues to count properties whose `acquisition_stage = negotiation`, not open/paused rows in `negotiations`.

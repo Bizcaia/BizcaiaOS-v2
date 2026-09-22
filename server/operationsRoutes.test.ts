@@ -22,6 +22,8 @@ const PROPERTY_A = '66666666-6666-4666-8666-666666666666';
 const PROPERTY_B = '99999999-9999-4999-8999-999999999999';
 const OWNER_A = '77777777-7777-4777-8777-777777777777';
 const OWNER_B = '88888888-8888-4888-8888-888888888888';
+const NEGOTIATOR_ID = '22222222-2222-4222-8222-222222222222';
+const NEGOTIATION_A = '33333333-3333-4333-8333-333333333333';
 const AUTH = { Authorization: 'Bearer valid-test-token', 'Content-Type': 'application/json' };
 
 type Store = {
@@ -30,6 +32,8 @@ type Store = {
   properties: Array<Record<string, unknown>>;
   owners: Array<Record<string, unknown>>;
   links: Array<{ property_id: string; owner_id: string; ownership_percent: number | null; is_primary: boolean; created_at: string }>;
+  negotiations: Array<Record<string, unknown>>;
+  negotiationEvents: Array<Record<string, unknown>>;
 };
 
 let store: Store;
@@ -81,6 +85,8 @@ function seedStore(role: Role = 'system_admin'): Store {
       { id: OWNER_B, organization_id: ORG_B, owner_type: 'individual', display_name: 'Foreign Owner', contact_details: {} },
     ],
     links: [],
+    negotiations: [],
+    negotiationEvents: [],
   };
 }
 
@@ -260,6 +266,81 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
   if (normalized.includes('from public.properties where id=$1')) {
     const property = store.properties.find((entry) => entry.id === params[0]);
     return { rows: property ? [property] : [], rowCount: property ? 1 : 0 };
+  }
+  if (normalized.startsWith('insert into public.negotiations')) {
+    const row = {
+      id: crypto.randomUUID(),
+      organization_id: params[0],
+      property_id: params[1],
+      status: 'open',
+      assigned_negotiator_id: params[2],
+      opening_amount: params[3],
+      target_amount: params[4],
+      current_amount: null,
+      currency_code: params[5],
+      started_at: params[6] ?? new Date().toISOString(),
+      closed_at: null,
+      archived_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      assigned_negotiator_name: null,
+    };
+    store.negotiations.push(row);
+    return { rows: [row], rowCount: 1 };
+  }
+  if (normalized.startsWith('update public.negotiations')) {
+    const id = params[params.length - 1];
+    const index = store.negotiations.findIndex((entry) => entry.id === id);
+    if (index < 0) return { rows: [], rowCount: 0 };
+    if (normalized.includes('status')) store.negotiations[index].status = params[0];
+    if (normalized.includes('assigned_negotiator_id')) {
+      store.negotiations[index].assigned_negotiator_id = params[normalized.includes('status') ? 1 : 0];
+    }
+    if (normalized.includes('current_amount')) store.negotiations[index].current_amount = params[0];
+    return { rows: [store.negotiations[index]], rowCount: 1 };
+  }
+  if (normalized.startsWith('insert into public.negotiation_events')) {
+    const row = {
+      id: crypto.randomUUID(),
+      organization_id: params[0],
+      negotiation_id: params[1],
+      event_type: params[2],
+      amount: params[3],
+      actor_user_id: params[4],
+      contextual_note: params[5],
+      occurred_at: params[6] ?? new Date().toISOString(),
+      metadata: params[7],
+      created_at: new Date().toISOString(),
+      actor_name: 'Test User',
+    };
+    store.negotiationEvents.push(row);
+    const negotiation = store.negotiations.find((entry) => entry.id === params[1]);
+    if (negotiation && (params[2] === 'offer' || params[2] === 'counteroffer')) {
+      negotiation.current_amount = params[3];
+    }
+    return { rows: [row], rowCount: 1 };
+  }
+  if (normalized.includes('from public.negotiations n')) {
+    let rows = store.negotiations.map((entry) => ({ ...entry }));
+    if (normalized.includes('where n.id=$1')) {
+      rows = rows.filter((entry) => entry.id === params[0]);
+    } else if (normalized.includes('n.organization_id=$1')) {
+      rows = rows.filter((entry) => entry.organization_id === params[0]);
+      if (normalized.includes('n.property_id=')) {
+        rows = rows.filter((entry) => entry.property_id === params[1]);
+      }
+    }
+    return { rows, rowCount: rows.length };
+  }
+  if (normalized.includes('from public.negotiations where id=$1')) {
+    const negotiation = store.negotiations.find((entry) => entry.id === params[0]);
+    return { rows: negotiation ? [negotiation] : [], rowCount: negotiation ? 1 : 0 };
+  }
+  if (normalized.includes('from public.negotiation_events e')) {
+    const rows = store.negotiationEvents
+      .filter((entry) => entry.negotiation_id === params[0])
+      .map((entry) => ({ ...entry, actor_name: 'Test User' }));
+    return { rows, rowCount: rows.length };
   }
   return { rows: [], rowCount: 0 };
 }
@@ -503,6 +584,105 @@ describe('property workflow API', () => {
       const body = await response.json();
       expect(response.status).toBe(404);
       expect(body.error.message).toBe('Property not found');
+    });
+  });
+
+  it('creates a negotiation only when the property is in negotiation stage', async () => {
+    await withApi(async (baseUrl) => {
+      const rejected = await fetch(`${baseUrl}/api/v1/ops/negotiations`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({
+          organizationId: ORG_A,
+          propertyId: PROPERTY_A,
+          openingAmount: 10000000,
+        }),
+      });
+      expect(rejected.status).toBe(422);
+
+      store.properties[0].acquisition_stage = 'negotiation';
+      store.properties[0].assigned_negotiator_id = NEGOTIATOR_ID;
+      const created = await fetch(`${baseUrl}/api/v1/ops/negotiations`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({
+          organizationId: ORG_A,
+          propertyId: PROPERTY_A,
+          openingAmount: 10000000,
+          targetAmount: 14000000,
+        }),
+      });
+      const body = await created.json();
+      expect(created.status).toBe(201);
+      expect(body.data).toMatchObject({
+        organization_id: ORG_A,
+        property_id: PROPERTY_A,
+        status: 'open',
+        assigned_negotiator_id: NEGOTIATOR_ID,
+        opening_amount: 10000000,
+        current_amount: null,
+      });
+    });
+  });
+
+  it('appends offer events and updates current_amount', async () => {
+    store.properties[0].acquisition_stage = 'negotiation';
+    store.negotiations.push({
+      id: NEGOTIATION_A,
+      organization_id: ORG_A,
+      property_id: PROPERTY_A,
+      status: 'open',
+      assigned_negotiator_id: NEGOTIATOR_ID,
+      opening_amount: 10000000,
+      target_amount: 14000000,
+      current_amount: null,
+      currency_code: 'PHP',
+      started_at: '2026-01-01T00:00:00.000Z',
+      closed_at: null,
+      archived_at: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+    });
+    await withApi(async (baseUrl) => {
+      const missingAmount = await fetch(`${baseUrl}/api/v1/ops/negotiations/${NEGOTIATION_A}/events`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ eventType: 'offer' }),
+      });
+      expect(missingAmount.status).toBe(400);
+
+      const offer = await fetch(`${baseUrl}/api/v1/ops/negotiations/${NEGOTIATION_A}/events`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ eventType: 'offer', amount: 11000000, contextualNote: 'Opening offer' }),
+      });
+      const offerBody = await offer.json();
+      expect(offer.status).toBe(201);
+      expect(offerBody.data).toMatchObject({
+        negotiation_id: NEGOTIATION_A,
+        event_type: 'offer',
+        amount: 11000000,
+        actor_user_id: USER_ID,
+      });
+      expect(store.negotiations[0].current_amount).toBe(11000000);
+
+      const events = await fetch(`${baseUrl}/api/v1/ops/negotiations/${NEGOTIATION_A}/events`, { headers: AUTH });
+      const eventsBody = await events.json();
+      expect(events.status).toBe(200);
+      expect(eventsBody.data).toHaveLength(1);
+    });
+  });
+
+  it('rejects negotiation writes for unauthorized roles', async () => {
+    store.role = 'viewer';
+    store.properties[0].acquisition_stage = 'negotiation';
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/ops/negotiations`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ organizationId: ORG_A, propertyId: PROPERTY_A }),
+      });
+      expect(response.status).toBe(403);
     });
   });
 });
