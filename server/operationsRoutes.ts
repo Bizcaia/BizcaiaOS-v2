@@ -32,6 +32,7 @@ import {
   agreementSignatureListQuerySchema,
   archiveAgreementSignatureSchema,
   createAgreementSignatureSchema,
+  propertyTimelineQuerySchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 
@@ -1258,4 +1259,239 @@ operationsRouter.patch('/agreement-signatures/:id', async (request, response) =>
     return firstRow(result.rows, 'Agreement signature update failed');
   });
   response.json({ data: signature });
+});
+
+/**
+ * Property Timeline: a read-only feed built at request time from records
+ * that already exist. It is not an audit log -- it only shows what those
+ * records can prove, so planned dates (due_on, scheduled_on), editable
+ * negotiation dates (started_at, closed_at), free-text notes, owner links,
+ * and property field changes never appear. Nothing here writes.
+ */
+export type TimelineKind =
+  | 'negotiation_event'
+  | 'negotiation_recorded'
+  | 'document_uploaded'
+  | 'task_created'
+  | 'payment_recorded'
+  | 'payment_paid'
+  | 'agreement_signed';
+
+export type TimelineEntry = {
+  id: string;
+  kind: TimelineKind;
+  source_type: 'negotiation_event' | 'negotiation' | 'document' | 'task' | 'payment' | 'agreement_signature';
+  source_id: string;
+  occurred_at: string;
+  precision: 'timestamp' | 'date';
+  basis: 'occurrence' | 'recorded';
+  actor: { id: string; display_name: string | null } | null;
+  summary: string;
+  archived: boolean;
+};
+
+type TimelineRow = {
+  source_type: TimelineEntry['source_type'];
+  source_id: string;
+  kind: TimelineKind;
+  basis: TimelineEntry['basis'];
+  actor_id: string | null;
+  actor_name: string | null;
+  code: string | null;
+  status: string | null;
+  amount: string | null;
+  currency: string | null;
+  title: string | null;
+  secondary: string | null;
+  event_ts: Date | null;
+  event_date: string | null;
+};
+
+// Summary labels mirror the frontend's display labels.
+const timelineEventTypeLabels: Record<string, string> = {
+  offer: 'Offer',
+  counteroffer: 'Counteroffer',
+  meeting: 'Meeting',
+  call: 'Call',
+  message: 'Message',
+  note: 'Note',
+  other: 'Other activity',
+};
+
+const timelineDocumentCategoryLabels: Record<string, string> = {
+  ownership_evidence: 'Ownership evidence',
+  title_deed: 'Title deed',
+  tax_declaration: 'Tax declaration',
+  legal_opinion: 'Legal opinion',
+  survey_plan: 'Survey plan',
+  agreement_draft: 'Agreement draft',
+  agreement_executed: 'Agreement executed',
+  payment_proof: 'Payment proof',
+  other: 'Other',
+};
+
+const timelinePaymentTypeLabels: Record<string, string> = {
+  deposit: 'Deposit',
+  installment: 'Installment',
+  final_payment: 'Final payment',
+};
+
+const timelinePaymentStatusLabels: Record<string, string> = {
+  pending: 'Pending',
+  scheduled: 'Scheduled',
+  paid: 'Paid',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
+
+function timelineMoney(amount: string | number, currency: string | null) {
+  return `${currency ?? ''} ${Number(amount).toLocaleString('en-US')}`.trim();
+}
+
+function timelineSummary(row: TimelineRow): string {
+  switch (row.kind) {
+    case 'negotiation_event': {
+      const label = timelineEventTypeLabels[row.code ?? ''] ?? 'Negotiation activity';
+      return row.amount != null && (row.code === 'offer' || row.code === 'counteroffer')
+        ? `${label}: ${timelineMoney(row.amount, row.currency)}`
+        : `${label} logged`;
+    }
+    case 'negotiation_recorded':
+      return row.amount != null
+        ? `Negotiation recorded · opening ${timelineMoney(row.amount, row.currency)}`
+        : 'Negotiation recorded';
+    case 'document_uploaded':
+      return `${timelineDocumentCategoryLabels[row.code ?? ''] ?? 'Document'}: ${row.title ?? ''}`;
+    case 'task_created':
+      return `Task created: ${row.title ?? ''}`;
+    case 'payment_recorded':
+      return `${timelinePaymentTypeLabels[row.code ?? ''] ?? 'Payment'} recorded: ${timelineMoney(row.amount ?? 0, row.currency)} · ${
+        timelinePaymentStatusLabels[row.status ?? ''] ?? row.status ?? ''
+      }`;
+    case 'payment_paid':
+      return `${timelinePaymentTypeLabels[row.code ?? ''] ?? 'Payment'} paid: ${timelineMoney(row.amount ?? 0, row.currency)}`;
+    case 'agreement_signed':
+      return `${row.title ?? 'Unknown owner'} signed ${row.secondary ?? 'an agreement'}`;
+  }
+}
+
+export function toTimelineEntry(row: TimelineRow): TimelineEntry {
+  const precision = row.event_date ? 'date' : 'timestamp';
+  return {
+    id: `${row.source_type}:${row.source_id}:${row.kind}`,
+    kind: row.kind,
+    source_type: row.source_type,
+    source_id: row.source_id,
+    occurred_at: row.event_date ?? new Date(row.event_ts as Date).toISOString(),
+    precision,
+    basis: row.basis,
+    actor: row.actor_id ? { id: row.actor_id, display_name: row.actor_name ?? null } : null,
+    summary: timelineSummary(row),
+    archived: false,
+  };
+}
+
+// One branch per entry kind. Tie ranks: negotiation_event 1, negotiation 2,
+// document 3, task 4, payment 5, agreement_signature 6. Timestamps are
+// eligible once reached; dates once reached in the organization's timezone
+// ($3). Date-only entries sort at the end of their calendar day and are never
+// given a time. Each table's own RLS still applies to every branch.
+const timelineSql = `
+  with entries as (
+    select 'negotiation_event'::text as source_type, 1 as source_rank, e.id::text as source_id,
+           'negotiation_event'::text as kind, e.occurred_at as event_ts, null::date as event_date,
+           'occurrence'::text as basis, e.actor_user_id as actor_id,
+           e.event_type::text as code, null::text as status, e.amount::text as amount,
+           n.currency_code::text as currency, null::text as title, null::text as secondary
+      from public.negotiation_events e
+      join public.negotiations n on n.id = e.negotiation_id
+     where n.property_id = $1 and n.archived_at is null and e.occurred_at <= now()
+    union all
+    select 'negotiation', 2, n.id::text, 'negotiation_recorded', n.created_at, null, 'recorded', null,
+           null, null, n.opening_amount::text, n.currency_code::text, null, null
+      from public.negotiations n
+     where n.property_id = $1 and n.archived_at is null and n.created_at <= now()
+    union all
+    select 'document', 3, d.id::text, 'document_uploaded', d.created_at, null, 'recorded', d.uploaded_by_user_id,
+           d.category::text, null, null, null, d.title, null
+      from public.documents d
+     where d.property_id = $1 and d.archived_at is null and d.created_at <= now()
+    union all
+    select 'task', 4, t.id::text, 'task_created', t.created_at, null, 'recorded', t.created_by_user_id,
+           null, null, null, null, t.title, null
+      from public.tasks t
+     where t.property_id = $1 and t.archived_at is null and t.created_at <= now()
+    union all
+    select 'payment', 5, p.id::text, 'payment_recorded', p.created_at, null, 'recorded', p.recorded_by_user_id,
+           p.payment_type::text, p.status::text, p.amount::text, p.currency_code::text, null, null
+      from public.payments p
+     where p.property_id = $1 and p.archived_at is null and p.created_at <= now()
+    union all
+    select 'payment', 5, p.id::text, 'payment_paid', null, p.paid_on, 'occurrence', null,
+           p.payment_type::text, p.status::text, p.amount::text, p.currency_code::text, null, null
+      from public.payments p
+     where p.property_id = $1 and p.archived_at is null and p.status = 'paid'
+       and p.paid_on is not null and p.paid_on <= $3::date
+    union all
+    select 'agreement_signature', 6, s.id::text, 'agreement_signed', null, s.signed_on, 'occurrence', s.recorded_by_user_id,
+           null, null, null, null, o.display_name, sd.title
+      from public.agreement_signatures s
+      left join public.owners o on o.id = s.owner_id
+      left join public.documents sd on sd.id = s.document_id
+     where s.property_id = $1 and s.archived_at is null and s.signed_on <= $3::date
+  )
+  select x.source_type, x.source_id, x.kind, x.basis, x.actor_id, u.display_name as actor_name,
+         x.code, x.status, x.amount, x.currency, x.title, x.secondary, x.event_ts,
+         to_char(x.event_date, 'YYYY-MM-DD') as event_date
+    from entries x
+    left join public.app_users u on u.id = x.actor_id
+   order by coalesce(x.event_date, (x.event_ts at time zone $2)::date) desc,
+            case when x.event_date is null then 0 else 1 end desc,
+            x.event_ts desc nulls last,
+            x.source_rank asc,
+            x.source_id collate "C" asc
+   limit $4 offset $5`;
+
+/**
+ * Property visibility is the Timeline's boundary: the properties select
+ * policy is exactly can_read_property, so a property the caller cannot see
+ * is a 404 before any source row is read. Assignee-only access to tasks or
+ * negotiations therefore never widens the Timeline. An organization timezone
+ * PostgreSQL does not recognize fails with 22023 (422) rather than falling
+ * back to an invented zone.
+ */
+export async function loadPropertyTimeline(
+  client: PoolClient,
+  userId: string,
+  propertyId: string,
+  page: { limit: number; offset: number },
+): Promise<TimelineEntry[]> {
+  const property = firstRow(
+    (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [propertyId])).rows,
+    'Property not found',
+  );
+  if (!(await currentRole(client, property.organization_id, userId))) {
+    throw httpError(404, 'Property not found');
+  }
+  const zone = firstRow(
+    (
+      await client.query<{ timezone: string; today: string }>(
+        `select o.timezone, to_char((now() at time zone o.timezone)::date, 'YYYY-MM-DD') as today
+           from public.organizations o
+          where o.id=$1`,
+        [property.organization_id],
+      )
+    ).rows,
+    'Property not found',
+  );
+  const result = await client.query<TimelineRow>(timelineSql, [propertyId, zone.timezone, zone.today, page.limit, page.offset]);
+  return result.rows.map(toTimelineEntry);
+}
+
+operationsRouter.get('/properties/:id/timeline', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const page = propertyTimelineQuerySchema.parse(request.query);
+  const entries = await withActorTransaction(user.id, (client) => loadPropertyTimeline(client, user.id, id, page));
+  response.json({ data: entries });
 });

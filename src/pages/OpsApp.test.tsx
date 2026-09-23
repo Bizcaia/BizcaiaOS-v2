@@ -2,7 +2,7 @@ import React from 'react';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEMO_ORGANIZATION_ID, operationsApi, resetOperationsDemoState } from '../api/operationsApi';
+import { DEMO_ORGANIZATION_ID, operationsApi, resetOperationsDemoState, type TimelineEntry } from '../api/operationsApi';
 import type { Member, Organization } from '../api/organizationApi';
 
 const organization: Organization = {
@@ -426,5 +426,104 @@ describe('OpsApp property workflow', () => {
     expect(screen.queryByRole('button', { name: /Record signature for/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Archive signature for/ })).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/Signed date for/)).not.toBeInTheDocument();
+  });
+
+  async function openProperty(reference: RegExp) {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: reference }));
+    const heading = await screen.findByRole('heading', { name: 'Timeline' });
+    return { user, section: heading.closest('section')! };
+  }
+
+  function timelineEntry(overrides: Partial<TimelineEntry> & { source_id: string }): TimelineEntry {
+    return {
+      id: `task:${overrides.source_id}:task_created`,
+      kind: 'task_created',
+      source_type: 'task',
+      occurred_at: '2026-09-01T00:00:00.000Z',
+      precision: 'timestamp',
+      basis: 'recorded',
+      actor: null,
+      summary: `Task created: ${overrides.source_id}`,
+      archived: false,
+      ...overrides,
+    };
+  }
+
+  it('shows a read-only timeline after the signatures block with date precision and Recorded by labels', async () => {
+    const { section } = await openProperty(/NCP-00102/);
+    const signatures = screen.getByRole('heading', { name: 'Agreement signatures' }).closest('section')!;
+    expect(signatures.compareDocumentPosition(section) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    const paid = (await within(section).findByText('Deposit paid: PHP 500,000')).closest('li')!;
+    expect(within(paid).getByText('2026-08-15')).toBeVisible();
+    expect(within(paid).queryByText(/Recorded by/)).not.toBeInTheDocument();
+
+    const recorded = within(section).getByText('Deposit recorded: PHP 500,000 · Paid').closest('li')!;
+    expect(within(recorded).getByText(/^Recorded (?!by )\S/)).toBeVisible();
+    expect(within(recorded).getByText('Recorded by Maria Santos')).toBeVisible();
+
+    const negotiation = within(section).getByText('Negotiation recorded · opening PHP 12,000,000').closest('li')!;
+    expect(within(negotiation).queryByText(/Recorded by/)).not.toBeInTheDocument();
+    expect(within(section).queryByText(/Opening offer recorded/)).not.toBeInTheDocument();
+
+    expect(within(section).getAllByRole('button').map((button) => button.getAttribute('aria-label'))).toEqual(['Refresh timeline']);
+    expect(within(section).queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(within(section).queryByRole('textbox')).not.toBeInTheDocument();
+  });
+
+  it('shows the empty state for a property with no recorded activity', async () => {
+    const { section } = await openProperty(/NCP-00131/);
+    expect(await within(section).findByText('No recorded activity yet.')).toBeVisible();
+  });
+
+  it('shows load errors and recovers on Refresh', async () => {
+    const spy = vi.spyOn(operationsApi, 'getPropertyTimeline').mockRejectedValueOnce(new Error('Timeline unavailable'));
+    const { user, section } = await openProperty(/NCP-00102/);
+    expect(await within(section).findByText('Timeline unavailable')).toHaveClass('form-error');
+
+    await operationsApi.createTask('70000000-0000-4000-8000-000000000001', { title: 'Timeline refresh check' });
+    await user.click(within(section).getByRole('button', { name: 'Refresh timeline' }));
+    expect(await within(section).findByText('Task created: Timeline refresh check')).toBeVisible();
+    expect(within(section).queryByText('Timeline unavailable')).not.toBeInTheDocument();
+    spy.mockRestore();
+  });
+
+  it('loads the next page with Load more and labels unnamed actors as former members', async () => {
+    const firstPage = Array.from({ length: 50 }, (_, index) => timelineEntry({ source_id: `page-one-${index}` }));
+    const secondPage = [
+      timelineEntry({ source_id: 'former', actor: { id: 'gone-user', display_name: null }, summary: 'Task created: former' }),
+      timelineEntry({
+        source_id: 'signed',
+        id: 'agreement_signature:signed:agreement_signed',
+        kind: 'agreement_signed',
+        source_type: 'agreement_signature',
+        occurred_at: '2026-08-01',
+        precision: 'date',
+        basis: 'occurrence',
+        summary: 'Rosa Mendoza signed Deed of Sale',
+      }),
+    ];
+    const spy = vi
+      .spyOn(operationsApi, 'getPropertyTimeline')
+      .mockResolvedValueOnce(firstPage)
+      .mockResolvedValueOnce(secondPage);
+    const { user, section } = await openProperty(/NCP-00102/);
+
+    expect(await within(section).findByText('Task created: page-one-49')).toBeVisible();
+    await user.click(within(section).getByRole('button', { name: 'Load more timeline entries' }));
+
+    expect(await within(section).findByText('Recorded by a former member')).toBeVisible();
+    const signed = within(section).getByText('Rosa Mendoza signed Deed of Sale').closest('li')!;
+    expect(within(signed).getByText('2026-08-01')).toBeVisible();
+    expect(within(section).getAllByRole('listitem')).toHaveLength(52);
+    expect(within(section).queryByRole('button', { name: 'Load more timeline entries' })).not.toBeInTheDocument();
+    expect(spy.mock.calls.map(([, page]) => page)).toEqual([
+      { limit: 50, offset: 0 },
+      { limit: 50, offset: 50 },
+    ]);
+    spy.mockRestore();
   });
 });

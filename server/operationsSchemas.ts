@@ -213,3 +213,10 @@ export const createAgreementSignatureSchema = z.object({
 export const archiveAgreementSignatureSchema = z.object({
   archived: z.literal(true),
 });
+
+// Same limit/offset convention as propertyListQuerySchema. There is
+// deliberately no includeArchived: archived records never appear.
+export const propertyTimelineQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});

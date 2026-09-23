@@ -40,6 +40,8 @@ type Store = {
   tasks: Array<Record<string, unknown>>;
   payments: Array<Record<string, unknown>>;
   agreementSignatures: Array<Record<string, unknown>>;
+  timezone: string;
+  timelineRows: Array<Record<string, unknown>>;
 };
 
 const EXECUTED_DOC_A = 'e0000000-0000-4000-8000-00000000000a';
@@ -149,6 +151,8 @@ function seedStore(role: Role = 'system_admin'): Store {
     tasks: [],
     payments: [],
     agreementSignatures: [],
+    timezone: 'Asia/Manila',
+    timelineRows: [],
   };
 }
 
@@ -239,6 +243,21 @@ async function withApi(run: (baseUrl: string) => Promise<void>) {
 
 function handleActorQuery(sql: string, params: unknown[] = []) {
   const normalized = sql.replace(/\s+/g, ' ').trim().toLowerCase();
+  // Timeline branches come first: the UNION ALL text would otherwise match
+  // the per-table branches below.
+  if (normalized.startsWith('with entries as')) {
+    // Timeline semantics are proven against real PostgreSQL; here the rows
+    // are supplied directly so the route's gate, validation, and mapping can
+    // be exercised.
+    return { rows: store.timelineRows, rowCount: store.timelineRows.length };
+  }
+  if (normalized.startsWith('select o.timezone')) {
+    // Simulates PostgreSQL rejecting an unrecognized time zone name.
+    if (!store.timezone.includes('/') && store.timezone !== 'UTC') {
+      throw sqlError('22023', `time zone "${store.timezone}" not recognized`);
+    }
+    return { rows: [{ timezone: store.timezone, today: '2026-09-23' }], rowCount: 1 };
+  }
   if (normalized.includes('from public.organization_memberships')) {
     const orgId = params[0];
     if (orgId === ORG_A) return { rows: [{ role: store.role }], rowCount: 1 };
@@ -2118,5 +2137,178 @@ describe('property workflow API', () => {
     expect(store.payments).toHaveLength(0);
     const statements = actorQuery.mock.calls.map(([sql]) => String(sql).toLowerCase());
     expect(statements.some((sql) => /update public\.(properties|tasks|negotiations|payments)/.test(sql))).toBe(false);
+  });
+
+  const TIMELINE_ROW_BASE = {
+    actor_id: null,
+    actor_name: null,
+    code: null,
+    status: null,
+    amount: null,
+    currency: null,
+    title: null,
+    secondary: null,
+    event_ts: null,
+    event_date: null,
+  };
+
+  function seedTimelineRows() {
+    store.timelineRows = [
+      { ...TIMELINE_ROW_BASE, source_type: 'agreement_signature', source_id: 'sig-1', kind: 'agreement_signed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', title: 'Rosa Mendoza', secondary: 'Deed of Sale', event_date: '2026-09-20' },
+      { ...TIMELINE_ROW_BASE, source_type: 'payment', source_id: 'pay-1', kind: 'payment_paid', basis: 'occurrence', code: 'deposit', status: 'paid', amount: '500000.00', currency: 'PHP', event_date: '2026-09-19' },
+      { ...TIMELINE_ROW_BASE, source_type: 'payment', source_id: 'pay-1', kind: 'payment_recorded', basis: 'recorded', actor_id: USER_ID, actor_name: 'Test User', code: 'deposit', status: 'paid', amount: '500000.00', currency: 'PHP', event_ts: new Date('2026-09-19T02:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'task', source_id: 'task-1', kind: 'task_created', basis: 'recorded', actor_id: NEGOTIATOR_ID, actor_name: null, title: 'Collect signatures', event_ts: new Date('2026-09-18T02:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'document', source_id: 'doc-1', kind: 'document_uploaded', basis: 'recorded', actor_id: USER_ID, actor_name: 'Test User', code: 'title_deed', title: 'Transfer Certificate', event_ts: new Date('2026-09-17T02:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'negotiation_event', source_id: 'event-1', kind: 'negotiation_event', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'counteroffer', amount: '1250000.50', currency: 'PHP', event_ts: new Date('2026-09-16T02:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'negotiation_event', source_id: 'event-2', kind: 'negotiation_event', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'meeting', currency: 'PHP', event_ts: new Date('2026-09-15T02:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'negotiation', source_id: 'neg-1', kind: 'negotiation_recorded', basis: 'recorded', amount: '1000000.00', currency: 'PHP', event_ts: new Date('2026-09-14T02:00:00Z') },
+    ];
+  }
+
+  function getTimeline(baseUrl: string, query = '', propertyId = PROPERTY_A) {
+    return fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/timeline${query}`, { headers: AUTH });
+  }
+
+  function timelineQueryCalls() {
+    return actorQuery.mock.calls.filter(([sql]) => String(sql).replace(/\s+/g, ' ').trim().toLowerCase().startsWith('with entries as'));
+  }
+
+  it('returns the normalized timeline with locked summaries, precision, basis, and actors', async () => {
+    seedTimelineRows();
+    await withApi(async (baseUrl) => {
+      const response = await getTimeline(baseUrl);
+      const body = await response.json();
+      expect(response.status).toBe(200);
+      expect(body.data).toEqual([
+        {
+          id: 'agreement_signature:sig-1:agreement_signed',
+          kind: 'agreement_signed',
+          source_type: 'agreement_signature',
+          source_id: 'sig-1',
+          occurred_at: '2026-09-20',
+          precision: 'date',
+          basis: 'occurrence',
+          actor: { id: USER_ID, display_name: 'Test User' },
+          summary: 'Rosa Mendoza signed Deed of Sale',
+          archived: false,
+        },
+        {
+          id: 'payment:pay-1:payment_paid',
+          kind: 'payment_paid',
+          source_type: 'payment',
+          source_id: 'pay-1',
+          occurred_at: '2026-09-19',
+          precision: 'date',
+          basis: 'occurrence',
+          actor: null,
+          summary: 'Deposit paid: PHP 500,000',
+          archived: false,
+        },
+        expect.objectContaining({
+          id: 'payment:pay-1:payment_recorded',
+          occurred_at: '2026-09-19T02:00:00.000Z',
+          precision: 'timestamp',
+          basis: 'recorded',
+          actor: { id: USER_ID, display_name: 'Test User' },
+          summary: 'Deposit recorded: PHP 500,000 · Paid',
+        }),
+        expect.objectContaining({
+          kind: 'task_created',
+          actor: { id: NEGOTIATOR_ID, display_name: null },
+          summary: 'Task created: Collect signatures',
+        }),
+        expect.objectContaining({ kind: 'document_uploaded', summary: 'Title deed: Transfer Certificate' }),
+        expect.objectContaining({ kind: 'negotiation_event', summary: 'Counteroffer: PHP 1,250,000.5' }),
+        expect.objectContaining({ kind: 'negotiation_event', summary: 'Meeting logged' }),
+        expect.objectContaining({
+          kind: 'negotiation_recorded',
+          source_type: 'negotiation',
+          basis: 'recorded',
+          actor: null,
+          summary: 'Negotiation recorded · opening PHP 1,000,000',
+        }),
+      ]);
+    });
+  });
+
+  it('pages with limit 50 and offset 0 by default, passes limit/offset through, and ignores includeArchived', async () => {
+    await withApi(async (baseUrl) => {
+      expect((await getTimeline(baseUrl)).status).toBe(200);
+      expect((await getTimeline(baseUrl, '?limit=200&offset=40')).status).toBe(200);
+      expect((await getTimeline(baseUrl, '?includeArchived=true')).status).toBe(200);
+    });
+    const params = timelineQueryCalls().map(([, values]) => values);
+    expect(params).toEqual([
+      [PROPERTY_A, 'Asia/Manila', '2026-09-23', 50, 0],
+      [PROPERTY_A, 'Asia/Manila', '2026-09-23', 200, 40],
+      [PROPERTY_A, 'Asia/Manila', '2026-09-23', 50, 0],
+    ]);
+  });
+
+  it.each(['?limit=0', '?limit=201', '?limit=abc', '?limit=2.5', '?offset=-1', '?offset=abc'])(
+    'rejects invalid paging %s with 400',
+    async (query) => {
+      await withApi(async (baseUrl) => {
+        expect((await getTimeline(baseUrl, query)).status).toBe(400);
+      });
+      expect(timelineQueryCalls()).toHaveLength(0);
+    },
+  );
+
+  it('rejects a malformed property id with 400 and an unauthenticated request with 401', async () => {
+    await withApi(async (baseUrl) => {
+      expect((await getTimeline(baseUrl, '', 'not-a-uuid')).status).toBe(400);
+      const anonymous = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/timeline`);
+      expect(anonymous.status).toBe(401);
+    });
+  });
+
+  it('returns 404 for a foreign or unknown property before reading any timeline source', async () => {
+    seedTimelineRows();
+    await withApi(async (baseUrl) => {
+      expect((await getTimeline(baseUrl, '', PROPERTY_B)).status).toBe(404);
+      expect((await getTimeline(baseUrl, '', crypto.randomUUID())).status).toBe(404);
+    });
+    expect(timelineQueryCalls()).toHaveLength(0);
+  });
+
+  it('returns 422 when the organization timezone is not recognized', async () => {
+    store.timezone = 'Not a zone';
+    await withApi(async (baseUrl) => {
+      const response = await getTimeline(baseUrl);
+      expect(response.status).toBe(422);
+      expect((await response.json()).error.message).toMatch(/time zone/);
+    });
+    expect(timelineQueryCalls()).toHaveLength(0);
+  });
+
+  it.each(['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator', 'legal_documentation', 'finance', 'viewer'] as const)(
+    'lets %s read the timeline of a visible property',
+    async (role) => {
+      store.role = role;
+      seedTimelineRows();
+      await withApi(async (baseUrl) => {
+        const response = await getTimeline(baseUrl);
+        expect(response.status).toBe(200);
+        expect((await response.json()).data).toHaveLength(8);
+      });
+    },
+  );
+
+  it('exposes no write routes and issues no writes', async () => {
+    seedTimelineRows();
+    await withApi(async (baseUrl) => {
+      await getTimeline(baseUrl);
+      for (const method of ['POST', 'PATCH', 'PUT', 'DELETE']) {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/timeline`, {
+          method,
+          headers: AUTH,
+          body: method === 'DELETE' ? undefined : JSON.stringify({}),
+        });
+        expect(response.status).toBe(404);
+      }
+    });
+    const statements = actorQuery.mock.calls.map(([sql]) => String(sql));
+    expect(statements.some((sql) => /\b(insert|update|delete)\b/i.test(sql))).toBe(false);
   });
 });
