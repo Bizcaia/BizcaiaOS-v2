@@ -1,3 +1,5 @@
+import { organizationApi } from './organizationApi';
+
 export type AcquisitionStage =
   | 'identified'
   | 'initial_contact'
@@ -210,6 +212,32 @@ export type AgreementSignature = {
   created_at: string;
   updated_at: string;
   archived_at: string | null;
+};
+
+export type TimelineKind =
+  | 'negotiation_event'
+  | 'negotiation_recorded'
+  | 'document_uploaded'
+  | 'task_created'
+  | 'payment_recorded'
+  | 'payment_paid'
+  | 'agreement_signed';
+
+export type TimelineSourceType = 'negotiation_event' | 'negotiation' | 'document' | 'task' | 'payment' | 'agreement_signature';
+
+/** A read-model entry built from an existing record; never stored. */
+export type TimelineEntry = {
+  id: string;
+  kind: TimelineKind;
+  source_type: TimelineSourceType;
+  source_id: string;
+  /** ISO timestamp when precision is 'timestamp'; YYYY-MM-DD when 'date'. */
+  occurred_at: string;
+  precision: 'timestamp' | 'date';
+  basis: 'occurrence' | 'recorded';
+  actor: { id: string; display_name: string | null } | null;
+  summary: string;
+  archived: boolean;
 };
 
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
@@ -521,6 +549,216 @@ function demoCanWriteNegotiation(assignedNegotiatorId: string | null) {
 
 function now() {
   return new Date().toISOString();
+}
+
+// Mirrors the server's Timeline summary labels and tie ranks exactly.
+const timelineEventTypeLabels: Record<NegotiationEventType, string> = {
+  offer: 'Offer',
+  counteroffer: 'Counteroffer',
+  meeting: 'Meeting',
+  call: 'Call',
+  message: 'Message',
+  note: 'Note',
+  other: 'Other activity',
+};
+
+const timelineDocumentCategoryLabels: Record<DocumentCategory, string> = {
+  ownership_evidence: 'Ownership evidence',
+  title_deed: 'Title deed',
+  tax_declaration: 'Tax declaration',
+  legal_opinion: 'Legal opinion',
+  survey_plan: 'Survey plan',
+  agreement_draft: 'Agreement draft',
+  agreement_executed: 'Agreement executed',
+  payment_proof: 'Payment proof',
+  other: 'Other',
+};
+
+const timelinePaymentTypeLabels: Record<PaymentType, string> = {
+  deposit: 'Deposit',
+  installment: 'Installment',
+  final_payment: 'Final payment',
+};
+
+const timelinePaymentStatusLabels: Record<PaymentStatus, string> = {
+  pending: 'Pending',
+  scheduled: 'Scheduled',
+  paid: 'Paid',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
+
+const timelineSourceRank: Record<TimelineSourceType, number> = {
+  negotiation_event: 1,
+  negotiation: 2,
+  document: 3,
+  task: 4,
+  payment: 5,
+  agreement_signature: 6,
+};
+
+function timelineMoney(amount: number | string, currency: string | null) {
+  return `${currency ?? ''} ${Number(amount).toLocaleString('en-US')}`.trim();
+}
+
+/** YYYY-MM-DD for an instant in the given IANA zone; unrecognized zones fail like PostgreSQL's 22023. */
+function calendarDay(instant: Date, timeZone: string) {
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(instant);
+  } catch {
+    throw new Error(`time zone "${timeZone}" not recognized`);
+  }
+  const part = (type: string) => parts.find((entry) => entry.type === type)?.value ?? '';
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
+/** Mirrors the app_users read rule: a name is visible only while that user is an active member. */
+function demoTimelineActor(userId: string | null): TimelineEntry['actor'] {
+  if (!userId) return null;
+  const active = demoMemberships.some((member) => member.user_id === userId && member.is_active);
+  return { id: userId, display_name: active ? demoUsers[userId] ?? null : null };
+}
+
+function demoPropertyTimeline(property: Property, timeZone: string, page: { limit: number; offset: number }): TimelineEntry[] {
+  const nowInstant = new Date();
+  const today = calendarDay(nowInstant, timeZone);
+  const reached = (timestamp: string) => new Date(timestamp).getTime() <= nowInstant.getTime();
+  const candidates: TimelineEntry[] = [];
+  const add = (entry: Omit<TimelineEntry, 'id' | 'archived'>) =>
+    candidates.push({ ...entry, id: `${entry.source_type}:${entry.source_id}:${entry.kind}`, archived: false });
+
+  const negotiations = demoNegotiations.filter((negotiation) => negotiation.property_id === property.id && !negotiation.archived_at);
+  for (const negotiation of negotiations) {
+    for (const event of demoNegotiationEvents.filter((entry) => entry.negotiation_id === negotiation.id)) {
+      if (!reached(event.occurred_at)) continue;
+      const label = timelineEventTypeLabels[event.event_type] ?? 'Negotiation activity';
+      add({
+        kind: 'negotiation_event',
+        source_type: 'negotiation_event',
+        source_id: event.id,
+        occurred_at: new Date(event.occurred_at).toISOString(),
+        precision: 'timestamp',
+        basis: 'occurrence',
+        actor: demoTimelineActor(event.actor_user_id),
+        summary:
+          event.amount != null && (event.event_type === 'offer' || event.event_type === 'counteroffer')
+            ? `${label}: ${timelineMoney(event.amount, negotiation.currency_code)}`
+            : `${label} logged`,
+      });
+    }
+    if (reached(negotiation.created_at)) {
+      add({
+        kind: 'negotiation_recorded',
+        source_type: 'negotiation',
+        source_id: negotiation.id,
+        occurred_at: new Date(negotiation.created_at).toISOString(),
+        precision: 'timestamp',
+        basis: 'recorded',
+        actor: null,
+        summary:
+          negotiation.opening_amount != null
+            ? `Negotiation recorded · opening ${timelineMoney(negotiation.opening_amount, negotiation.currency_code)}`
+            : 'Negotiation recorded',
+      });
+    }
+  }
+  for (const document of demoDocuments) {
+    if (document.property_id !== property.id || document.archived_at || !reached(document.created_at)) continue;
+    add({
+      kind: 'document_uploaded',
+      source_type: 'document',
+      source_id: document.id,
+      occurred_at: new Date(document.created_at).toISOString(),
+      precision: 'timestamp',
+      basis: 'recorded',
+      actor: demoTimelineActor(document.uploaded_by_user_id),
+      summary: `${timelineDocumentCategoryLabels[document.category] ?? 'Document'}: ${document.title}`,
+    });
+  }
+  for (const task of demoTasks) {
+    if (task.property_id !== property.id || task.archived_at || !reached(task.created_at)) continue;
+    add({
+      kind: 'task_created',
+      source_type: 'task',
+      source_id: task.id,
+      occurred_at: new Date(task.created_at).toISOString(),
+      precision: 'timestamp',
+      basis: 'recorded',
+      actor: demoTimelineActor(task.created_by_user_id),
+      summary: `Task created: ${task.title}`,
+    });
+  }
+  for (const payment of demoPayments) {
+    if (payment.property_id !== property.id || payment.archived_at) continue;
+    const typeLabel = timelinePaymentTypeLabels[payment.payment_type] ?? 'Payment';
+    const money = timelineMoney(payment.amount, payment.currency_code);
+    if (reached(payment.created_at)) {
+      add({
+        kind: 'payment_recorded',
+        source_type: 'payment',
+        source_id: payment.id,
+        occurred_at: new Date(payment.created_at).toISOString(),
+        precision: 'timestamp',
+        basis: 'recorded',
+        actor: demoTimelineActor(payment.recorded_by_user_id),
+        summary: `${typeLabel} recorded: ${money} · ${timelinePaymentStatusLabels[payment.status] ?? payment.status}`,
+      });
+    }
+    // B1-a: only a payment currently marked paid with a reached paid_on date.
+    if (payment.status === 'paid' && payment.paid_on && payment.paid_on <= today) {
+      add({
+        kind: 'payment_paid',
+        source_type: 'payment',
+        source_id: payment.id,
+        occurred_at: payment.paid_on,
+        precision: 'date',
+        basis: 'occurrence',
+        actor: null,
+        summary: `${typeLabel} paid: ${money}`,
+      });
+    }
+  }
+  for (const signature of demoAgreementSignatures) {
+    if (signature.property_id !== property.id || signature.archived_at || signature.signed_on > today) continue;
+    const ownerName = demoOwners.find((owner) => owner.id === signature.owner_id)?.display_name;
+    const documentTitle = demoDocuments.find((document) => document.id === signature.document_id)?.title;
+    add({
+      kind: 'agreement_signed',
+      source_type: 'agreement_signature',
+      source_id: signature.id,
+      occurred_at: signature.signed_on,
+      precision: 'date',
+      basis: 'occurrence',
+      actor: demoTimelineActor(signature.recorded_by_user_id),
+      summary: `${ownerName ?? 'Unknown owner'} signed ${documentTitle ?? 'an agreement'}`,
+    });
+  }
+
+  // Same keys as the server: calendar day (organization timezone) desc,
+  // date-only after that day's timestamps (desc), timestamp desc, tie rank,
+  // then source id in code-unit order.
+  const sortKey = (entry: TimelineEntry) => ({
+    day: entry.precision === 'date' ? entry.occurred_at : calendarDay(new Date(entry.occurred_at), timeZone),
+    dateOnly: entry.precision === 'date' ? 1 : 0,
+    time: entry.precision === 'date' ? null : new Date(entry.occurred_at).getTime(),
+  });
+  return candidates
+    .map((entry) => ({ entry, key: sortKey(entry) }))
+    .sort((a, b) => {
+      if (a.key.day !== b.key.day) return a.key.day < b.key.day ? 1 : -1;
+      if (a.key.dateOnly !== b.key.dateOnly) return b.key.dateOnly - a.key.dateOnly;
+      if (a.key.time !== b.key.time) {
+        if (a.key.time == null) return 1;
+        if (b.key.time == null) return -1;
+        return b.key.time - a.key.time;
+      }
+      const rank = timelineSourceRank[a.entry.source_type] - timelineSourceRank[b.entry.source_type];
+      if (rank !== 0) return rank;
+      return a.entry.source_id < b.entry.source_id ? -1 : a.entry.source_id > b.entry.source_id ? 1 : 0;
+    })
+    .map(({ entry }) => entry)
+    .slice(page.offset, page.offset + page.limit);
 }
 
 function decorateProperty(property: Property): Property {
@@ -1640,6 +1878,23 @@ export const operationsApi = {
     });
     demoAgreementSignatures[index] = next;
     return next;
+  },
+
+  /** Read-only; the demo builds the same entries the server derives from its records. */
+  async getPropertyTimeline(propertyId: string, page: { limit?: number; offset?: number } = {}) {
+    const limit = page.limit ?? 50;
+    const offset = page.offset ?? 0;
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+      return request<TimelineEntry[]>(`/ops/properties/${propertyId}/timeline?${query.toString()}`);
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200 || !Number.isInteger(offset) || offset < 0) {
+      throw new Error('Request validation failed');
+    }
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property) throw new Error('Property not found');
+    const organization = await organizationApi.getOrganization(property.organization_id);
+    return demoPropertyTimeline(property, organization.timezone, { limit, offset });
   },
 
   async dashboard(orgId: string) {

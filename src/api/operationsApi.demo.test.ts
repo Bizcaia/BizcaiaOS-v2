@@ -602,4 +602,199 @@ describe('operationsApi demo adapter', () => {
     await operationsApi.createAgreementSignature(signatureProperty, { documentId: executed.id, ownerId: rosa, signedOn: '2026-09-20' });
     expect(await snapshot()).toEqual(before);
   });
+
+  // Property Timeline: the demo must produce the same entries the server
+  // derives, so these mirror the real-PostgreSQL timeline suite.
+  const emptyProperty = '70000000-0000-4000-8000-000000000003';
+  const alex = '758d5718-53d9-4ea2-b9d5-02828fcc0e2c';
+
+  function dayIn(timeZone: string, offsetDays = 0) {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(
+      new Date(Date.now() + offsetDays * 86_400_000),
+    );
+    const part = (type: string) => parts.find((entry) => entry.type === type)?.value;
+    return `${part('year')}-${part('month')}-${part('day')}`;
+  }
+
+  it('maps the seeded records to the locked kinds, summaries, actors, and newest-first order', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const entries = await operationsApi.getPropertyTimeline(signatureProperty);
+    expect(entries.map((entry) => [entry.kind, entry.source_id, entry.summary, entry.actor?.display_name ?? null])).toEqual([
+      ['task_created', 'a1000000-0000-4000-8000-000000000001', 'Task created: Follow up on survey plan', 'Alex Villanueva'],
+      ['payment_recorded', 'b1000000-0000-4000-8000-000000000002', 'Installment recorded: PHP 1,200,000 · Scheduled', 'Maria Santos'],
+      ['task_created', 'a1000000-0000-4000-8000-000000000002', 'Task created: Review title deed for encumbrances', 'Celina Cruz'],
+      ['payment_paid', 'b1000000-0000-4000-8000-000000000001', 'Deposit paid: PHP 500,000', null],
+      ['payment_recorded', 'b1000000-0000-4000-8000-000000000001', 'Deposit recorded: PHP 500,000 · Paid', 'Maria Santos'],
+      ['negotiation_event', '91000000-0000-4000-8000-000000000001', 'Offer: PHP 12,500,000', 'Alex Villanueva'],
+      ['document_uploaded', '92000000-0000-4000-8000-000000000001', 'Title deed: Transfer Certificate of Title', 'Celina Cruz'],
+      ['negotiation_recorded', '90000000-0000-4000-8000-000000000001', 'Negotiation recorded · opening PHP 12,000,000', null],
+    ]);
+    expect(entries.find((entry) => entry.kind === 'payment_paid')).toEqual({
+      id: 'payment:b1000000-0000-4000-8000-000000000001:payment_paid',
+      kind: 'payment_paid',
+      source_type: 'payment',
+      source_id: 'b1000000-0000-4000-8000-000000000001',
+      occurred_at: '2026-08-15',
+      precision: 'date',
+      basis: 'occurrence',
+      actor: null,
+      summary: 'Deposit paid: PHP 500,000',
+      archived: false,
+    });
+    expect(entries.find((entry) => entry.kind === 'negotiation_event')).toMatchObject({
+      occurred_at: '2026-08-12T00:00:00.000Z',
+      precision: 'timestamp',
+      basis: 'occurrence',
+      actor: { id: alex, display_name: 'Alex Villanueva' },
+    });
+    expect(entries.find((entry) => entry.kind === 'negotiation_recorded')).toMatchObject({ basis: 'recorded', actor: null });
+    expect(entries.every((entry) => entry.archived === false)).toBe(true);
+  });
+
+  it('never exposes notes, planned dates, or owner links', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const serialized = JSON.stringify(await operationsApi.getPropertyTimeline(signatureProperty));
+    expect(serialized).not.toContain('Opening offer recorded');
+    expect(serialized).not.toContain('2026-09-26');
+    expect(serialized).not.toContain('2026-10-01');
+    expect(serialized).not.toContain(rosa);
+  });
+
+  it('emits payment_paid only for status paid with a reached paid_on date (B1-a)', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const make = async (status: 'paid' | 'pending', paidOn: string | null, archive = false) => {
+      const payment = await operationsApi.createPayment(emptyProperty, { amount: 1000, paymentType: 'deposit', paidOn });
+      await operationsApi.updatePayment(payment.id, { status, ...(archive ? { archived: true } : {}) });
+      return payment.id;
+    };
+    const paidWithDate = await make('paid', '2026-03-01');
+    const paidNoDate = await make('paid', null);
+    const pendingWithDate = await make('pending', '2026-03-02');
+    const pendingNoDate = await make('pending', null);
+    const paidTomorrow = await make('paid', dayIn('Asia/Manila', 1));
+    const paidToday = await make('paid', dayIn('Asia/Manila'));
+    const paidArchived = await make('paid', '2026-03-03', true);
+
+    const entries = await operationsApi.getPropertyTimeline(emptyProperty);
+    const kinds = (id: string) => entries.filter((entry) => entry.source_id === id).map((entry) => entry.kind).sort();
+    expect(kinds(paidWithDate)).toEqual(['payment_paid', 'payment_recorded']);
+    expect(kinds(paidNoDate)).toEqual(['payment_recorded']);
+    expect(kinds(pendingWithDate)).toEqual(['payment_recorded']);
+    expect(kinds(pendingNoDate)).toEqual(['payment_recorded']);
+    expect(kinds(paidTomorrow)).toEqual(['payment_recorded']);
+    expect(kinds(paidToday)).toEqual(['payment_paid', 'payment_recorded']);
+    expect(kinds(paidArchived)).toEqual([]);
+    expect(entries.filter((entry) => entry.kind === 'payment_paid').every((entry) => entry.actor === null)).toBe(true);
+  });
+
+  it('excludes future occurrences and sorts date-only entries at the end of their day', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    await operationsApi.createNegotiationEvent('90000000-0000-4000-8000-000000000001', {
+      eventType: 'meeting',
+      occurredAt: '2999-01-01T00:00:00.000Z',
+    });
+    const deed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const coOwner = await operationsApi.createOwner({ organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', ownerType: 'individual', displayName: 'Co-owner' });
+    const lateOwner = await operationsApi.createOwner({ organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', ownerType: 'individual', displayName: 'Late owner' });
+    await operationsApi.linkPropertyOwner(signatureProperty, { ownerId: coOwner.id });
+    await operationsApi.linkPropertyOwner(signatureProperty, { ownerId: lateOwner.id });
+    // Same Manila day as the seeded task created at 2026-09-20T00:00Z (08:00 in Manila).
+    const sameDay = await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: rosa, signedOn: '2026-09-20' });
+    const today = await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: coOwner.id, signedOn: dayIn('Asia/Manila') });
+    const tomorrow = await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: lateOwner.id, signedOn: dayIn('Asia/Manila', 1) });
+
+    const entries = await operationsApi.getPropertyTimeline(signatureProperty);
+    const order = entries.map((entry) => entry.source_id);
+    expect(order).not.toContain(tomorrow.id);
+    expect(entries.some((entry) => entry.summary === 'Meeting logged')).toBe(false);
+    expect(order).toContain(today.id);
+    expect(order.indexOf(sameDay.id)).toBe(order.indexOf('a1000000-0000-4000-8000-000000000001') - 1);
+    expect(entries.find((entry) => entry.source_id === sameDay.id)).toMatchObject({
+      kind: 'agreement_signed',
+      occurred_at: '2026-09-20',
+      precision: 'date',
+      basis: 'occurrence',
+      actor: { id: alex, display_name: 'Alex Villanueva' },
+      summary: 'Rosa Mendoza signed Deed of Sale',
+    });
+  });
+
+  it('uses the organization timezone for date eligibility and rejects an unrecognized zone', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const { organizationApi } = await import('./organizationApi');
+    const deed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const signature = await operationsApi.createAgreementSignature(signatureProperty, {
+      documentId: deed.id,
+      ownerId: rosa,
+      signedOn: dayIn('Pacific/Kiritimati'),
+    });
+    await organizationApi.updateOrganization('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { timezone: 'Pacific/Kiritimati' });
+    expect((await operationsApi.getPropertyTimeline(signatureProperty)).map((entry) => entry.source_id)).toContain(signature.id);
+    await organizationApi.updateOrganization('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { timezone: 'Pacific/Pago_Pago' });
+    expect((await operationsApi.getPropertyTimeline(signatureProperty)).map((entry) => entry.source_id)).not.toContain(signature.id);
+    await organizationApi.updateOrganization('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { timezone: 'Not/AZone' });
+    await expect(operationsApi.getPropertyTimeline(signatureProperty)).rejects.toThrow(/time zone/);
+  });
+
+  it('excludes archived records, follows negotiation archiving for events, and keeps signatures on archived documents', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const deed = await uploadExecuted(signatureProperty, 'Deed later archived');
+    const other = await operationsApi.createOwner({ organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', ownerType: 'individual', displayName: 'Other owner' });
+    await operationsApi.linkPropertyOwner(signatureProperty, { ownerId: other.id });
+    const kept = await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: rosa, signedOn: '2026-09-01' });
+    const dropped = await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: other.id, signedOn: '2026-09-01' });
+    await operationsApi.archiveAgreementSignature(dropped.id);
+    await operationsApi.updateDocument(deed.id, { archived: true });
+    await operationsApi.updateTask('a1000000-0000-4000-8000-000000000002', { archived: true });
+    await operationsApi.updateNegotiation('90000000-0000-4000-8000-000000000001', { archivedAt: new Date().toISOString() });
+
+    const order = (await operationsApi.getPropertyTimeline(signatureProperty)).map((entry) => entry.source_id);
+    expect(order).toContain(kept.id);
+    expect(order).not.toContain(dropped.id);
+    expect(order).not.toContain(deed.id);
+    expect(order).not.toContain('a1000000-0000-4000-8000-000000000002');
+    expect(order).not.toContain('90000000-0000-4000-8000-000000000001');
+    expect(order).not.toContain('91000000-0000-4000-8000-000000000001');
+  });
+
+  it('pages by limit and offset with a default of 50, a maximum of 200, and stable boundaries', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    for (let index = 0; index < 55; index += 1) {
+      await operationsApi.createTask(emptyProperty, { title: `Page task ${index}` });
+    }
+    expect(await operationsApi.getPropertyTimeline(emptyProperty)).toHaveLength(50);
+    expect(await operationsApi.getPropertyTimeline(emptyProperty, { limit: 200 })).toHaveLength(55);
+    expect(await operationsApi.getPropertyTimeline(emptyProperty, { offset: 50 })).toHaveLength(5);
+
+    const all = (await operationsApi.getPropertyTimeline(signatureProperty)).map((entry) => entry.id);
+    const pages = [
+      ...(await operationsApi.getPropertyTimeline(signatureProperty, { limit: 3 })),
+      ...(await operationsApi.getPropertyTimeline(signatureProperty, { limit: 3, offset: 3 })),
+      ...(await operationsApi.getPropertyTimeline(signatureProperty, { limit: 3, offset: 6 })),
+    ].map((entry) => entry.id);
+    expect(pages).toEqual(all);
+
+    for (const page of [{ limit: 0 }, { limit: 201 }, { limit: 2.5 }, { offset: -1 }]) {
+      await expect(operationsApi.getPropertyTimeline(signatureProperty, page)).rejects.toThrow(/validation/);
+    }
+    await expect(operationsApi.getPropertyTimeline('70000000-0000-4000-8000-00000000dead')).rejects.toThrow(/Property not found/);
+  });
+
+  it('reads without changing any source record', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const snapshot = async () =>
+      JSON.stringify([
+        await operationsApi.listNegotiations('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { propertyId: signatureProperty }),
+        await operationsApi.listNegotiationEvents('90000000-0000-4000-8000-000000000001'),
+        await operationsApi.listDocuments(signatureProperty, { includeArchived: true }),
+        await operationsApi.listTasks(signatureProperty, { includeArchived: true }),
+        await operationsApi.listPayments(signatureProperty, { includeArchived: true }),
+        await operationsApi.listAgreementSignatures(signatureProperty, { includeArchived: true }),
+        await operationsApi.getProperty(signatureProperty),
+      ]);
+    const before = await snapshot();
+    await operationsApi.getPropertyTimeline(signatureProperty);
+    await operationsApi.getPropertyTimeline(signatureProperty, { limit: 2, offset: 1 });
+    expect(await snapshot()).toBe(before);
+  });
 });

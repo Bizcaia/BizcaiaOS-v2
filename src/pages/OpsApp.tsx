@@ -24,6 +24,7 @@ import {
   type PropertyTask,
   type TaskPriority,
   type TaskStatus,
+  type TimelineEntry,
 } from '../api/operationsApi';
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
@@ -796,6 +797,7 @@ function PropertyDrawer({
         <TaskBlock property={property} role={role} members={members} projects={projects} currentUserId={currentUserId} />
         <PaymentBlock property={property} role={role} />
         <AgreementSignaturesBlock property={property} role={role} />
+        <PropertyTimelineBlock property={property} />
       </aside>
     </div>
   );
@@ -1644,6 +1646,82 @@ function AgreementSignaturesBlock({ property, role }: { property: Property; role
             </div>
           );
         })
+      )}
+    </section>
+  );
+}
+
+const TIMELINE_PAGE_SIZE = 50;
+
+/** Date-only entries stay date-only; recorded-basis entries say so. */
+function timelineWhen(entry: TimelineEntry) {
+  const when = entry.precision === 'date' ? entry.occurred_at : new Date(entry.occurred_at).toLocaleString();
+  return entry.basis === 'recorded' ? `Recorded ${when}` : when;
+}
+
+/**
+ * Read-only feed of facts the property's existing records can prove. It
+ * complements the blocks above rather than replacing them, and has no write,
+ * archive, or lifecycle controls.
+ */
+function PropertyTimelineBlock({ property }: { property: Property }) {
+  const [entries, setEntries] = useState<TimelineEntry[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = async (offset: number) => {
+    setError('');
+    setLoading(true);
+    try {
+      const page = await operationsApi.getPropertyTimeline(property.id, { limit: TIMELINE_PAGE_SIZE, offset });
+      setEntries((current) => (offset === 0 ? page : [...current, ...page]));
+      setHasMore(page.length === TIMELINE_PAGE_SIZE);
+      setLoaded(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to load the timeline');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    setEntries([]);
+    setHasMore(false);
+    setLoaded(false);
+    void load(0);
+  }, [property.id]);
+
+  return (
+    <section className="owner-block">
+      <h3>Timeline</h3>
+      {error && <p className="form-error">{error}</p>}
+      <button type="button" aria-label="Refresh timeline" disabled={loading} onClick={() => void load(0)}>
+        Refresh
+      </button>
+      {loaded && entries.length === 0 ? (
+        <p>No recorded activity yet.</p>
+      ) : (
+        <ul className="owner-list" aria-label="Timeline entries">
+          {entries.map((entry) => (
+            <li key={entry.id}>
+              <strong>{entry.summary}</strong>
+              <small>{timelineWhen(entry)}</small>
+              {entry.actor && <small>Recorded by {entry.actor.display_name ?? 'a former member'}</small>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {hasMore && (
+        <button
+          type="button"
+          aria-label="Load more timeline entries"
+          disabled={loading}
+          onClick={() => void load(entries.length)}
+        >
+          Load more
+        </button>
       )}
     </section>
   );
