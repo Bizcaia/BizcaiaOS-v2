@@ -421,4 +421,185 @@ describe('operationsApi demo adapter', () => {
     const withArchived = await operationsApi.listPayments(negotiationProperty, { includeArchived: true });
     expect(withArchived.some((payment) => payment.id === seeded.id)).toBe(true);
   });
+
+  // As with the other verticals, the demo actor is fixed as system_admin, so
+  // the read-only-role denials are exercised in the mocked route and
+  // real-Postgres suites; everything else is mirrored here.
+  const signatureProperty = '70000000-0000-4000-8000-000000000001';
+  const otherProperty = '70000000-0000-4000-8000-000000000002';
+  const rosa = '80000000-0000-4000-8000-000000000001';
+
+  async function uploadExecuted(propertyId: string, title: string) {
+    const { operationsApi } = await import('./operationsApi');
+    return operationsApi.uploadDocument(propertyId, {
+      category: 'agreement_executed',
+      title,
+      file: new File(['signed'], `${title}.pdf`, { type: 'application/pdf' }),
+    });
+  }
+
+  it('records a signature for an existing owner on an executed agreement', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const executed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+
+    const signature = await operationsApi.createAgreementSignature(signatureProperty, {
+      documentId: executed.id,
+      ownerId: rosa,
+      signedOn: '2026-09-20',
+    });
+    expect(signature).toMatchObject({
+      property_id: signatureProperty,
+      document_id: executed.id,
+      owner_id: rosa,
+      signed_on: '2026-09-20',
+      owner_name: 'Rosa Mendoza',
+      document_title: 'Deed of Sale',
+      recorded_by_name: 'Alex Villanueva',
+      archived_at: null,
+    });
+  });
+
+  it('rejects non-executed documents, other-property documents, and non-owner signatories', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const seededTitleDeed = '92000000-0000-4000-8000-000000000001';
+    await expect(
+      operationsApi.createAgreementSignature(signatureProperty, { documentId: seededTitleDeed, ownerId: rosa, signedOn: '2026-09-20' }),
+    ).rejects.toThrow(/agreement_executed/);
+
+    const elsewhere = await uploadExecuted(otherProperty, 'Other deed');
+    await expect(
+      operationsApi.createAgreementSignature(signatureProperty, { documentId: elsewhere.id, ownerId: rosa, signedOn: '2026-09-20' }),
+    ).rejects.toThrow(/same property/);
+
+    const executed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const stranger = await operationsApi.createOwner({
+      organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f',
+      ownerType: 'individual',
+      displayName: 'Not An Owner Here',
+    });
+    await expect(
+      operationsApi.createAgreementSignature(signatureProperty, { documentId: executed.id, ownerId: stranger.id, signedOn: '2026-09-20' }),
+    ).rejects.toThrow(/existing owner/);
+  });
+
+  it('rejects a duplicate active signature and allows a replacement after archiving', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const executed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const first = await operationsApi.createAgreementSignature(signatureProperty, {
+      documentId: executed.id,
+      ownerId: rosa,
+      signedOn: '2026-09-20',
+    });
+    await expect(
+      operationsApi.createAgreementSignature(signatureProperty, { documentId: executed.id, ownerId: rosa, signedOn: '2026-09-21' }),
+    ).rejects.toThrow(/already has an active signature/);
+
+    const archived = await operationsApi.archiveAgreementSignature(first.id);
+    expect(archived.archived_at).not.toBeNull();
+    // Archiving changes nothing else about the record.
+    expect(archived).toMatchObject({ document_id: executed.id, owner_id: rosa, signed_on: '2026-09-20' });
+    const archivedAgain = await operationsApi.archiveAgreementSignature(first.id);
+    expect(archivedAgain.archived_at).toBe(archived.archived_at);
+
+    const replacement = await operationsApi.createAgreementSignature(signatureProperty, {
+      documentId: executed.id,
+      ownerId: rosa,
+      signedOn: '2026-09-21',
+    });
+    expect(replacement.id).not.toBe(first.id);
+
+    const active = await operationsApi.listAgreementSignatures(signatureProperty);
+    expect(active.map((signature) => signature.id)).toEqual([replacement.id]);
+    const all = await operationsApi.listAgreementSignatures(signatureProperty, { includeArchived: true });
+    expect(all).toHaveLength(2);
+  });
+
+  it('supports multiple owners and multiple executed agreements, keyed per document', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const secondOwner = await operationsApi.createOwner({
+      organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f',
+      ownerType: 'individual',
+      displayName: 'Co-owner Luz',
+    });
+    await operationsApi.linkPropertyOwner(signatureProperty, { ownerId: secondOwner.id, ownershipPercent: 50 });
+    const deed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const supplement = await uploadExecuted(signatureProperty, 'Deed Supplement');
+
+    await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: rosa, signedOn: '2026-09-20' });
+    await operationsApi.createAgreementSignature(signatureProperty, { documentId: deed.id, ownerId: secondOwner.id, signedOn: '2026-09-20' });
+    await operationsApi.createAgreementSignature(signatureProperty, { documentId: supplement.id, ownerId: rosa, signedOn: '2026-09-21' });
+
+    expect(await operationsApi.listAgreementSignatures(signatureProperty, { documentId: deed.id })).toHaveLength(2);
+    const supplementSignatures = await operationsApi.listAgreementSignatures(signatureProperty, { documentId: supplement.id });
+    expect(supplementSignatures.map((signature) => signature.owner_id)).toEqual([rosa]);
+  });
+
+  it('blocks unlinking an owner with an active signature until it is archived; unsigned owners unlink freely', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const unsignedOwner = await operationsApi.createOwner({
+      organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f',
+      ownerType: 'individual',
+      displayName: 'Unsigned Co-owner',
+    });
+    await operationsApi.linkPropertyOwner(signatureProperty, { ownerId: unsignedOwner.id, ownershipPercent: 10 });
+    const executed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const signature = await operationsApi.createAgreementSignature(signatureProperty, {
+      documentId: executed.id,
+      ownerId: rosa,
+      signedOn: '2026-09-20',
+    });
+
+    await expect(operationsApi.unlinkPropertyOwner(signatureProperty, rosa)).rejects.toThrow(/active agreement signatures/);
+    expect((await operationsApi.listPropertyOwners(signatureProperty)).some((owner) => owner.owner_id === rosa)).toBe(true);
+
+    await operationsApi.unlinkPropertyOwner(signatureProperty, unsignedOwner.id);
+
+    await operationsApi.archiveAgreementSignature(signature.id);
+    await operationsApi.unlinkPropertyOwner(signatureProperty, rosa);
+    expect((await operationsApi.listPropertyOwners(signatureProperty)).some((owner) => owner.owner_id === rosa)).toBe(false);
+  });
+
+  it('blocks recategorizing a signed executed document until signatures are archived; other edits stay allowed', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const signed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    const unsigned = await uploadExecuted(signatureProperty, 'Deed Supplement');
+    const signature = await operationsApi.createAgreementSignature(signatureProperty, {
+      documentId: signed.id,
+      ownerId: rosa,
+      signedOn: '2026-09-20',
+    });
+
+    await expect(operationsApi.updateDocument(signed.id, { category: 'other' })).rejects.toThrow(/active agreement signatures/);
+
+    const retitled = await operationsApi.updateDocument(signed.id, { title: 'Deed of Sale (final)', status: 'verified' });
+    expect(retitled).toMatchObject({ title: 'Deed of Sale (final)', category: 'agreement_executed' });
+
+    const recategorizedUnsigned = await operationsApi.updateDocument(unsigned.id, { category: 'agreement_draft' });
+    expect(recategorizedUnsigned.category).toBe('agreement_draft');
+
+    await operationsApi.archiveAgreementSignature(signature.id);
+    const recategorized = await operationsApi.updateDocument(signed.id, { category: 'other' });
+    expect(recategorized.category).toBe('other');
+  });
+
+  it('leaves lifecycle fields and other verticals unchanged when every owner signs', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const snapshot = async () => {
+      const property = await operationsApi.getProperty(signatureProperty);
+      return {
+        stage: property.acquisition_stage,
+        status: property.acquisition_status,
+        legal: property.legal_status,
+        documentation: property.documentation_status,
+        payment: property.payment_status,
+        tasks: (await operationsApi.listTasks(signatureProperty, { includeArchived: true })).length,
+        payments: (await operationsApi.listPayments(signatureProperty, { includeArchived: true })).length,
+        negotiations: (await operationsApi.listNegotiations('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { propertyId: signatureProperty })).length,
+      };
+    };
+    const before = await snapshot();
+    const executed = await uploadExecuted(signatureProperty, 'Deed of Sale');
+    await operationsApi.createAgreementSignature(signatureProperty, { documentId: executed.id, ownerId: rosa, signedOn: '2026-09-20' });
+    expect(await snapshot()).toEqual(before);
+  });
 });

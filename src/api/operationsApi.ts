@@ -195,6 +195,23 @@ export type PropertyPayment = {
   archived_at: string | null;
 };
 
+/** A row is the signing event itself; unsigned owners are derived, never stored. */
+export type AgreementSignature = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  document_id: string;
+  owner_id: string;
+  signed_on: string;
+  recorded_by_user_id: string;
+  owner_name?: string | null;
+  document_title?: string | null;
+  recorded_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const operationsApiMode = apiBase ? 'live' : 'demo';
@@ -444,6 +461,37 @@ function demoCanWritePayment(): boolean {
 
 function decoratePayment(payment: PropertyPayment): PropertyPayment {
   return { ...payment, recorded_by_name: demoUsers[payment.recorded_by_user_id] ?? null };
+}
+
+let demoAgreementSignatures: AgreementSignature[] = [];
+
+const agreementSignatureWriteRoles = new Set(['system_admin', 'land_acquisition_manager', 'legal_documentation']);
+
+/** Same fixed role set as documents; no property scoping, no assignee model. */
+function demoCanWriteAgreementSignature(): boolean {
+  const member = demoActorMembership();
+  return !!member && agreementSignatureWriteRoles.has(member.role);
+}
+
+/** Mirror guard_property_owner_agreement_signatures(): an active signature pins its owner link. */
+function demoHasActiveOwnerSignature(propertyId: string, ownerId: string): boolean {
+  return demoAgreementSignatures.some(
+    (signature) => signature.property_id === propertyId && signature.owner_id === ownerId && !signature.archived_at,
+  );
+}
+
+/** Mirror guard_document_agreement_signatures(): an active signature pins its document's category. */
+function demoHasActiveDocumentSignature(documentId: string): boolean {
+  return demoAgreementSignatures.some((signature) => signature.document_id === documentId && !signature.archived_at);
+}
+
+function decorateAgreementSignature(signature: AgreementSignature): AgreementSignature {
+  return {
+    ...signature,
+    owner_name: demoOwners.find((owner) => owner.id === signature.owner_id)?.display_name ?? null,
+    document_title: demoDocuments.find((document) => document.id === signature.document_id)?.title ?? null,
+    recorded_by_name: demoUsers[signature.recorded_by_user_id] ?? null,
+  };
 }
 
 function decorateNegotiation(negotiation: Negotiation): Negotiation {
@@ -732,6 +780,9 @@ export function resetOperationsDemoState() {
       archived_at: null,
     }),
   ];
+  // No seeded signatures: the demo seed has no agreement_executed document,
+  // and adding one would change the Documents seed other tests rely on.
+  demoAgreementSignatures = [];
 }
 
 resetOperationsDemoState();
@@ -940,6 +991,11 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       await request(`/ops/properties/${propertyId}/owners/${ownerId}`, { method: 'DELETE' });
       return;
+    }
+    if (demoHasActiveOwnerSignature(propertyId, ownerId)) {
+      throw new Error(
+        'This property owner has active agreement signatures; archive them before unlinking or changing the owner link',
+      );
     }
     const before = demoPropertyOwners.length;
     demoPropertyOwners = demoPropertyOwners.filter(
@@ -1243,6 +1299,14 @@ export const operationsApi = {
         throw new Error('Document negotiation must belong to the same property');
       }
     }
+    if (
+      existing.category === 'agreement_executed' &&
+      input.category !== undefined &&
+      input.category !== existing.category &&
+      demoHasActiveDocumentSignature(id)
+    ) {
+      throw new Error('This document has active agreement signatures; archive them before changing its category');
+    }
     const next = decorateDocument({
       ...existing,
       category: input.category ?? existing.category,
@@ -1490,6 +1554,91 @@ export const operationsApi = {
       updated_at: now(),
     });
     demoPayments[index] = next;
+    return next;
+  },
+
+  async listAgreementSignatures(propertyId: string, filters?: { documentId?: string; includeArchived?: boolean }) {
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams();
+      if (filters?.documentId) query.set('documentId', filters.documentId);
+      if (filters?.includeArchived) query.set('includeArchived', 'true');
+      const qs = query.toString();
+      return request<AgreementSignature[]>(`/ops/properties/${propertyId}/agreement-signatures${qs ? `?${qs}` : ''}`);
+    }
+    return demoAgreementSignatures
+      .filter((signature) => signature.property_id === propertyId)
+      .filter((signature) => !filters?.documentId || signature.document_id === filters.documentId)
+      .filter((signature) => filters?.includeArchived || !signature.archived_at)
+      .map(decorateAgreementSignature)
+      .sort((a, b) => b.signed_on.localeCompare(a.signed_on) || b.created_at.localeCompare(a.created_at));
+  },
+
+  async createAgreementSignature(
+    propertyId: string,
+    input: { documentId: string; ownerId: string; signedOn: string },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<AgreementSignature>(`/ops/properties/${propertyId}/agreement-signatures`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    }
+    if (!demoCanWriteAgreementSignature()) throw new Error('You do not have permission for this operation');
+    if (!input.signedOn) throw new Error('A signed date is required');
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property) throw new Error('Property not found');
+    const document = demoDocuments.find((entry) => entry.id === input.documentId);
+    if (!document) throw new Error('Document not found for agreement signature');
+    if (document.property_id !== propertyId) {
+      throw new Error('Agreement signature document must belong to the same property');
+    }
+    if (document.category !== 'agreement_executed') {
+      throw new Error('Agreement signatures may only reference an agreement_executed document');
+    }
+    const linked = demoPropertyOwners.some(
+      (link) => link.property_id === propertyId && link.owner_id === input.ownerId,
+    );
+    if (!linked) throw new Error('Signatory must be an existing owner of the property');
+    const duplicate = demoAgreementSignatures.some(
+      (signature) =>
+        signature.document_id === input.documentId && signature.owner_id === input.ownerId && !signature.archived_at,
+    );
+    if (duplicate) throw new Error('This owner already has an active signature on this document');
+    const timestamp = now();
+    const signature = decorateAgreementSignature({
+      id: crypto.randomUUID(),
+      organization_id: property.organization_id,
+      property_id: propertyId,
+      document_id: input.documentId,
+      owner_id: input.ownerId,
+      signed_on: input.signedOn,
+      recorded_by_user_id: DEMO_ACTOR_ID,
+      created_at: timestamp,
+      updated_at: timestamp,
+      archived_at: null,
+    });
+    demoAgreementSignatures = [signature, ...demoAgreementSignatures];
+    return signature;
+  },
+
+  /** Signatures are immutable; archiving is the only permitted change. */
+  async archiveAgreementSignature(id: string) {
+    if (operationsApiMode === 'live') {
+      return request<AgreementSignature>(`/ops/agreement-signatures/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ archived: true }),
+      });
+    }
+    if (!demoCanWriteAgreementSignature()) throw new Error('You do not have permission for this operation');
+    const index = demoAgreementSignatures.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('Agreement signature not found');
+    const existing = demoAgreementSignatures[index];
+    const next = decorateAgreementSignature({
+      ...existing,
+      archived_at: existing.archived_at ?? now(),
+      updated_at: now(),
+    });
+    demoAgreementSignatures[index] = next;
     return next;
   },
 
