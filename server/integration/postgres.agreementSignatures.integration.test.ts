@@ -27,6 +27,7 @@ describe('PostgreSQL agreement signatures security', () => {
   let legalA: string;
   let financeA: string;
   let supervisorA: string;
+  let supervisorScoped: string;
   let negotiatorAssigned: string;
   let negotiatorUnassigned: string;
   let viewerA: string;
@@ -144,6 +145,7 @@ describe('PostgreSQL agreement signatures security', () => {
     legalA = await syncUser(pool, `auth0|sig-legal-${suffix}`, 'Sig Legal', `sig-legal-${suffix}@example.com`);
     financeA = await syncUser(pool, `auth0|sig-finance-${suffix}`, 'Sig Finance', `sig-finance-${suffix}@example.com`);
     supervisorA = await syncUser(pool, `auth0|sig-sup-${suffix}`, 'Sig Supervisor', `sig-sup-${suffix}@example.com`);
+    supervisorScoped = await syncUser(pool, `auth0|sig-sup-2-${suffix}`, 'Sig Supervisor Scoped', `sig-sup-2-${suffix}@example.com`);
     negotiatorAssigned = await syncUser(pool, `auth0|sig-neg-1-${suffix}`, 'Sig Neg 1', `sig-neg-1-${suffix}@example.com`);
     negotiatorUnassigned = await syncUser(pool, `auth0|sig-neg-2-${suffix}`, 'Sig Neg 2', `sig-neg-2-${suffix}@example.com`);
     viewerA = await syncUser(pool, `auth0|sig-view-${suffix}`, 'Sig Viewer', `sig-view-${suffix}@example.com`);
@@ -151,6 +153,7 @@ describe('PostgreSQL agreement signatures security', () => {
     await addMember(pool, adminA, orgA, legalA, 'legal_documentation');
     await addMember(pool, adminA, orgA, financeA, 'finance');
     await addMember(pool, adminA, orgA, supervisorA, 'supervisor');
+    await addMember(pool, adminA, orgA, supervisorScoped, 'supervisor');
     await addMember(pool, adminA, orgA, negotiatorAssigned, 'negotiator');
     await addMember(pool, adminA, orgA, negotiatorUnassigned, 'negotiator');
     await addMember(pool, adminA, orgA, viewerA, 'viewer');
@@ -171,9 +174,10 @@ describe('PostgreSQL agreement signatures security', () => {
     });
     propertyA = await asUser(pool, lamA, async (client) => {
       const result = await client.query<{ id: string }>(
-        `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id)
-         values ($1, $2, 'SIG-001', 'signing', $3) returning id`,
-        [orgA, projectA, negotiatorAssigned],
+        `insert into public.properties (
+            organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id, assigned_manager_id
+          ) values ($1, $2, 'SIG-001', 'signing', $3, $4) returning id`,
+        [orgA, projectA, negotiatorAssigned, supervisorScoped],
       );
       return result.rows[0].id;
     });
@@ -290,6 +294,31 @@ describe('PostgreSQL agreement signatures security', () => {
     expect(await countFor(financeA)).toBe(1);
     expect(await countFor(supervisorA)).toBe(0);
     expect(await countFor(adminB)).toBe(0);
+  });
+
+  it('lets an in-scope supervisor read a signature but not record or archive one', async () => {
+    const visible = await asUser(pool, supervisorScoped, async (client) => {
+      const result = await client.query(`select id from public.agreement_signatures where id = $1`, [firstSignature]);
+      return result.rowCount;
+    });
+    expect(visible).toBe(1);
+
+    await expectSqlError(
+      () =>
+        asUser(pool, supervisorScoped, (client) =>
+          insertSignature(client, orgA, propertyA, executedTwo, ownerTwo, supervisorScoped),
+        ),
+      '42501',
+    );
+
+    const archived = await asUser(pool, supervisorScoped, async (client) => {
+      const result = await client.query(
+        `update public.agreement_signatures set archived_at = timezone('utc', now()) where id = $1`,
+        [firstSignature],
+      );
+      return result.rowCount;
+    });
+    expect(archived).toBe(0);
   });
 
   it('isolates signatures across tenants', async () => {
@@ -416,30 +445,191 @@ describe('PostgreSQL agreement signatures security', () => {
     expect(unchanged).toEqual({ signed_on: '2026-09-20', owner_id: ownerTwo, document_id: executedTwo });
   });
 
-  it('keeps archiving possible after the owner link is removed or the document is recategorized', async () => {
-    const ownerTemp = await insertOwner(lamA, orgA, 'Owner Temporary');
-    await linkOwner(lamA, propertyA, ownerTemp);
-    const executedTemp = await insertDocument(lamA, orgA, propertyA, 'agreement_executed', 'Deed of Sale Temp');
-    const [forUnlinked, forRecategorized] = await asUser(pool, lamA, async (client) => [
-      (await insertSignature(client, orgA, propertyA, executedTemp, ownerTemp, lamA)).rows[0].id,
-      (await insertSignature(client, orgA, propertyA, executedTemp, ownerOne, lamA)).rows[0].id,
-    ]);
-
-    await asUser(pool, lamA, (client) =>
-      client.query(`delete from public.property_owners where property_id = $1 and owner_id = $2`, [propertyA, ownerTemp]),
-    );
+  async function archiveSignature(signatureId: string) {
     await asUser(pool, legalA, (client) =>
-      client.query(`update public.documents set category = 'other' where id = $1`, [executedTemp]),
+      client.query(`update public.agreement_signatures set archived_at = timezone('utc', now()) where id = $1`, [
+        signatureId,
+      ]),
+    );
+  }
+
+  function reactivateSignature(signatureId: string) {
+    return asUser(pool, legalA, (client) =>
+      client.query(`update public.agreement_signatures set archived_at = null where id = $1`, [signatureId]),
+    );
+  }
+
+  function unlink(propertyId: string, ownerId: string) {
+    return asUser(pool, lamA, async (client) => {
+      const result = await client.query(`delete from public.property_owners where property_id = $1 and owner_id = $2`, [
+        propertyId,
+        ownerId,
+      ]);
+      return result.rowCount;
+    });
+  }
+
+  function recategorize(documentId: string, category: string) {
+    return asUser(pool, legalA, async (client) => {
+      const result = await client.query(`update public.documents set category = $2 where id = $1`, [documentId, category]);
+      return result.rowCount;
+    });
+  }
+
+  it('blocks unlinking an owner with an active signature, allows it after archiving, and refuses re-activation afterwards', async () => {
+    const owner = await insertOwner(lamA, orgA, 'Owner Guard Unlink');
+    await linkOwner(lamA, propertyA, owner);
+    const document = await insertDocument(lamA, orgA, propertyA, 'agreement_executed', 'Deed Guard Unlink');
+    const signature = await asUser(pool, lamA, async (client) =>
+      (await insertSignature(client, orgA, propertyA, document, owner, lamA)).rows[0].id,
     );
 
-    const archived = await asUser(pool, legalA, async (client) => {
+    await expectSqlError(() => unlink(propertyA, owner), '23514');
+
+    await archiveSignature(signature);
+    expect(await unlink(propertyA, owner)).toBe(1);
+
+    // Re-activating would create an active signature for a non-owner.
+    await expectSqlError(() => reactivateSignature(signature), '23514');
+  });
+
+  it('blocks re-pointing owner_id or property_id of a link with an active signature, but allows unrelated link edits', async () => {
+    const owner = await insertOwner(lamA, orgA, 'Owner Guard Repoint');
+    const replacementOwner = await insertOwner(lamA, orgA, 'Owner Guard Replacement');
+    await linkOwner(lamA, propertyA, owner);
+    const document = await insertDocument(lamA, orgA, propertyA, 'agreement_executed', 'Deed Guard Repoint');
+    await asUser(pool, lamA, (client) => insertSignature(client, orgA, propertyA, document, owner, lamA));
+
+    await expectSqlError(
+      () =>
+        asUser(pool, lamA, (client) =>
+          client.query(`update public.property_owners set owner_id = $3 where property_id = $1 and owner_id = $2`, [
+            propertyA,
+            owner,
+            replacementOwner,
+          ]),
+        ),
+      '23514',
+    );
+    await expectSqlError(
+      () =>
+        asUser(pool, lamA, (client) =>
+          client.query(`update public.property_owners set property_id = $3 where property_id = $1 and owner_id = $2`, [
+            propertyA,
+            owner,
+            propertyOther,
+          ]),
+        ),
+      '23514',
+    );
+
+    const unrelatedEdit = await asUser(pool, lamA, async (client) => {
       const result = await client.query(
-        `update public.agreement_signatures set archived_at = timezone('utc', now()) where id = any($1::uuid[])`,
-        [[forUnlinked, forRecategorized]],
+        `update public.property_owners set ownership_percent = 40 where property_id = $1 and owner_id = $2`,
+        [propertyA, owner],
       );
       return result.rowCount;
     });
-    expect(archived).toBe(2);
+    expect(unrelatedEdit).toBe(1);
+  });
+
+  it('blocks recategorizing an executed document with active signatures, allows unrelated edits, and allows it after archiving', async () => {
+    const document = await insertDocument(lamA, orgA, propertyA, 'agreement_executed', 'Deed Guard Category');
+    const signature = await asUser(pool, lamA, async (client) =>
+      (await insertSignature(client, orgA, propertyA, document, ownerOne, lamA)).rows[0].id,
+    );
+
+    await expectSqlError(() => recategorize(document, 'other'), '23514');
+
+    const unrelatedEdit = await asUser(pool, legalA, async (client) => {
+      const result = await client.query(
+        `update public.documents set title = 'Deed Guard Category (renamed)', status = 'verified' where id = $1`,
+        [document],
+      );
+      return result.rowCount;
+    });
+    expect(unrelatedEdit).toBe(1);
+
+    // Re-activation is allowed while the signature would still be valid.
+    await archiveSignature(signature);
+    expect((await reactivateSignature(signature)).rowCount).toBe(1);
+
+    await archiveSignature(signature);
+    expect(await recategorize(document, 'other')).toBe(1);
+
+    // Re-activating now would reference a document that is not agreement_executed.
+    await expectSqlError(() => reactivateSignature(signature), '23514');
+  });
+
+  it('leaves owner unlink and document recategorization unaffected when no active signature depends on them', async () => {
+    const owner = await insertOwner(lamA, orgA, 'Owner Guard Free');
+    await linkOwner(lamA, propertyA, owner);
+    expect(await unlink(propertyA, owner)).toBe(1);
+
+    const unsignedExecuted = await insertDocument(lamA, orgA, propertyA, 'agreement_executed', 'Deed Guard Unsigned');
+    expect(await recategorize(unsignedExecuted, 'agreement_draft')).toBe(1);
+
+    const otherDocument = await insertDocument(lamA, orgA, propertyA, 'survey_plan', 'Survey Guard');
+    expect(await recategorize(otherDocument, 'agreement_executed')).toBe(1);
+  });
+
+  it('leaves existing task, negotiation, and payment records unchanged when signatures are recorded', async () => {
+    const propertyLife = await asUser(pool, lamA, async (client) => {
+      const project = await client.query<{ project_id: string }>(`select project_id from public.properties where id = $1`, [
+        propertyA,
+      ]);
+      const result = await client.query<{ id: string }>(
+        `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
+         values ($1, $2, 'SIG-LIFE', 'negotiation') returning id`,
+        [orgA, project.rows[0].project_id],
+      );
+      return result.rows[0].id;
+    });
+    await linkOwner(lamA, propertyLife, ownerOne);
+    await linkOwner(lamA, propertyLife, ownerTwo);
+    const document = await insertDocument(lamA, orgA, propertyLife, 'agreement_executed', 'Deed Life');
+
+    const { negotiationId, taskId, paymentId } = await asUser(pool, lamA, async (client) => {
+      const negotiation = await client.query<{ id: string }>(
+        `insert into public.negotiations (organization_id, property_id, opening_amount) values ($1, $2, 1000000) returning id`,
+        [orgA, propertyLife],
+      );
+      const task = await client.query<{ id: string }>(
+        `insert into public.tasks (organization_id, property_id, title, created_by_user_id)
+         values ($1, $2, 'Collect signatures', $3) returning id`,
+        [orgA, propertyLife, lamA],
+      );
+      const payment = await client.query<{ id: string }>(
+        `insert into public.payments (organization_id, property_id, negotiation_id, amount, payment_type, recorded_by_user_id)
+         values ($1, $2, $3, 250000, 'deposit', $4) returning id`,
+        [orgA, propertyLife, negotiation.rows[0].id, lamA],
+      );
+      return { negotiationId: negotiation.rows[0].id, taskId: task.rows[0].id, paymentId: payment.rows[0].id };
+    });
+
+    const snapshot = () =>
+      asUser(pool, lamA, async (client) => {
+        const rows = await client.query<{ property: unknown; negotiation: unknown; task: unknown; payment: unknown }>(
+          `select (select to_jsonb(p) from public.properties p where p.id = $1) as property,
+                  (select to_jsonb(n) from public.negotiations n where n.id = $2) as negotiation,
+                  (select to_jsonb(t) from public.tasks t where t.id = $3) as task,
+                  (select to_jsonb(pm) from public.payments pm where pm.id = $4) as payment`,
+          [propertyLife, negotiationId, taskId, paymentId],
+        );
+        return rows.rows[0];
+      });
+
+    const before = await snapshot();
+    expect(before.negotiation).not.toBeNull();
+    expect(before.task).not.toBeNull();
+    expect(before.payment).not.toBeNull();
+
+    await asUser(pool, legalA, async (client) => {
+      await insertSignature(client, orgA, propertyLife, document, ownerOne, legalA);
+      await insertSignature(client, orgA, propertyLife, document, ownerTwo, legalA);
+    });
+
+    expect(await snapshot()).toEqual(before);
   });
 
   it('has no DELETE policy: a delete matches zero rows even for system_admin', async () => {

@@ -11,6 +11,12 @@
 -- one active (non-archived) signature may exist per (document_id, owner_id);
 -- archiving a signature permits a replacement for the same pair.
 --
+-- For every ACTIVE signature these hold continuously: the owner is linked to
+-- the property through property_owners, and the document is an
+-- agreement_executed document on the same property. They are checked on
+-- insert and on re-activation, and parent-side guards refuse the owner-link
+-- and document-category changes that would break them.
+--
 -- Authorization mirrors Documents exactly: system_admin,
 -- land_acquisition_manager, and legal_documentation write; everyone else
 -- reads through normal property visibility. No assignee model.
@@ -102,9 +108,7 @@ declare
 begin
   if tg_op = 'UPDATE' then
     -- Only archived_at may change (updated_at is maintained by its own
-    -- trigger). Relationships are validated at insert time only: owner links
-    -- can later be removed and document categories can later be edited, and
-    -- neither must make an existing signature impossible to archive.
+    -- trigger).
     if row(new.id, new.organization_id, new.property_id, new.document_id, new.owner_id,
            new.signed_on, new.recorded_by_user_id, new.created_at)
        is distinct from
@@ -113,7 +117,13 @@ begin
       raise exception 'Agreement signatures are immutable; only archived_at may change'
         using errcode = '42501';
     end if;
-    return new;
+    -- The relationship rules are continuous invariants of ACTIVE signatures.
+    -- While a signature is active, the parent-side guards below keep them
+    -- true; archiving needs no re-check. Re-activating an archived signature
+    -- makes it active again, so it must pass the same checks as an insert.
+    if not (old.archived_at is not null and new.archived_at is null) then
+      return new;
+    end if;
   end if;
 
   select p.organization_id into property_org
@@ -168,6 +178,76 @@ create trigger agreement_signatures_scope_guard
 before insert or update on public.agreement_signatures
 for each row execute function public.enforce_agreement_signature_scope();
 
+-- Parent-side guards. An active signature's owner must remain an owner of
+-- the property and its document must remain agreement_executed, so the
+-- parent mutations that would break either are refused while an active
+-- signature depends on them. Signatures are never archived automatically;
+-- archive them first, then the parent change is allowed. These fire only
+-- when an active signature exists, so owner and document behavior is
+-- otherwise unchanged.
+create or replace function public.guard_property_owner_agreement_signatures()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  if tg_op = 'UPDATE'
+     and new.property_id is not distinct from old.property_id
+     and new.owner_id is not distinct from old.owner_id then
+    return new;
+  end if;
+
+  if exists (
+    select 1
+    from public.agreement_signatures s
+    where s.property_id = old.property_id
+      and s.owner_id = old.owner_id
+      and s.archived_at is null
+  ) then
+    raise exception 'This property owner has active agreement signatures; archive them before unlinking or changing the owner link'
+      using errcode = '23514';
+  end if;
+
+  if tg_op = 'DELETE' then
+    return old;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists property_owners_agreement_signature_guard on public.property_owners;
+create trigger property_owners_agreement_signature_guard
+before update or delete on public.property_owners
+for each row execute function public.guard_property_owner_agreement_signatures();
+
+create or replace function public.guard_document_agreement_signatures()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  if old.category = 'agreement_executed'
+     and new.category is distinct from old.category
+     and exists (
+       select 1
+       from public.agreement_signatures s
+       where s.document_id = old.id
+         and s.archived_at is null
+     ) then
+    raise exception 'This document has active agreement signatures; archive them before changing its category'
+      using errcode = '23514';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists documents_agreement_signature_guard on public.documents;
+create trigger documents_agreement_signature_guard
+before update of category on public.documents
+for each row execute function public.guard_document_agreement_signatures();
+
 alter table public.agreement_signatures enable row level security;
 
 drop policy if exists agreement_signatures_select_visible on public.agreement_signatures;
@@ -197,4 +277,8 @@ comment on function public.can_read_agreement_signature(uuid) is
 comment on function public.can_write_agreement_signature(uuid) is
   'System Administrators, Land Acquisition Managers, and Legal/Documentation record and archive agreement signatures (same roles as documents).';
 comment on function public.enforce_agreement_signature_scope() is
-  'On insert: tenant match, same-property agreement_executed document, and an existing property_owners link. On update: every column except archived_at/updated_at is immutable.';
+  'On insert and on re-activation: tenant match, same-property agreement_executed document, and an existing property_owners link. On update: every column except archived_at/updated_at is immutable.';
+comment on function public.guard_property_owner_agreement_signatures() is
+  'Refuses deleting or re-pointing a property_owners link while an active agreement signature depends on it.';
+comment on function public.guard_document_agreement_signatures() is
+  'Refuses changing an agreement_executed document''s category while active agreement signatures reference it.';

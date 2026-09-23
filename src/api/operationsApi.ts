@@ -473,6 +473,18 @@ function demoCanWriteAgreementSignature(): boolean {
   return !!member && agreementSignatureWriteRoles.has(member.role);
 }
 
+/** Mirror guard_property_owner_agreement_signatures(): an active signature pins its owner link. */
+function demoHasActiveOwnerSignature(propertyId: string, ownerId: string): boolean {
+  return demoAgreementSignatures.some(
+    (signature) => signature.property_id === propertyId && signature.owner_id === ownerId && !signature.archived_at,
+  );
+}
+
+/** Mirror guard_document_agreement_signatures(): an active signature pins its document's category. */
+function demoHasActiveDocumentSignature(documentId: string): boolean {
+  return demoAgreementSignatures.some((signature) => signature.document_id === documentId && !signature.archived_at);
+}
+
 function decorateAgreementSignature(signature: AgreementSignature): AgreementSignature {
   return {
     ...signature,
@@ -980,6 +992,11 @@ export const operationsApi = {
       await request(`/ops/properties/${propertyId}/owners/${ownerId}`, { method: 'DELETE' });
       return;
     }
+    if (demoHasActiveOwnerSignature(propertyId, ownerId)) {
+      throw new Error(
+        'This property owner has active agreement signatures; archive them before unlinking or changing the owner link',
+      );
+    }
     const before = demoPropertyOwners.length;
     demoPropertyOwners = demoPropertyOwners.filter(
       (link) => !(link.property_id === propertyId && link.owner_id === ownerId),
@@ -1281,6 +1298,14 @@ export const operationsApi = {
       if (!negotiation || negotiation.property_id !== existing.property_id) {
         throw new Error('Document negotiation must belong to the same property');
       }
+    }
+    if (
+      existing.category === 'agreement_executed' &&
+      input.category !== undefined &&
+      input.category !== existing.category &&
+      demoHasActiveDocumentSignature(id)
+    ) {
+      throw new Error('This document has active agreement signatures; archive them before changing its category');
     }
     const next = decorateDocument({
       ...existing,

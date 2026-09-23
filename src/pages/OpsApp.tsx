@@ -557,6 +557,7 @@ function PropertyDrawer({
   const [newOwnerContact, setNewOwnerContact] = useState('');
   const [ownershipPercent, setOwnershipPercent] = useState('');
   const [isPrimary, setIsPrimary] = useState(false);
+  const [ownerError, setOwnerError] = useState('');
   const [saving, setSaving] = useState(false);
   const canSave = allowed.size > 0;
 
@@ -672,6 +673,7 @@ function PropertyDrawer({
         )}
         <section className="owner-block">
           <h3>Owners</h3>
+          {ownerError && <p className="form-error">{ownerError}</p>}
           {linkedOwners.length === 0 ? (
             <p>No owners linked yet.</p>
           ) : (
@@ -688,8 +690,13 @@ function PropertyDrawer({
                     <button
                       type="button"
                       onClick={async () => {
-                        await operationsApi.unlinkPropertyOwner(property.id, owner.owner_id);
-                        await refreshOwners();
+                        setOwnerError('');
+                        try {
+                          await operationsApi.unlinkPropertyOwner(property.id, owner.owner_id);
+                          await refreshOwners();
+                        } catch (cause) {
+                          setOwnerError(cause instanceof Error ? cause.message : 'Unable to unlink owner');
+                        }
                       }}
                     >
                       Unlink

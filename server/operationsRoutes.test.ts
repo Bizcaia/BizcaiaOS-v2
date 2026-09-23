@@ -301,6 +301,17 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
     return { rows: [], rowCount: 1 };
   }
   if (normalized.startsWith('delete from public.property_owners')) {
+    // Simulates property_owners_agreement_signature_guard.
+    if (
+      store.agreementSignatures.some(
+        (signature) => signature.property_id === params[0] && signature.owner_id === params[1] && !signature.archived_at,
+      )
+    ) {
+      throw sqlError(
+        '23514',
+        'This property owner has active agreement signatures; archive them before unlinking or changing the owner link',
+      );
+    }
     const before = store.links.length;
     store.links = store.links.filter((link) => !(link.property_id === params[0] && link.owner_id === params[1]));
     return { rows: [], rowCount: before === store.links.length ? 0 : 1 };
@@ -491,6 +502,14 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
     if (index < 0) return { rows: [], rowCount: 0 };
     let paramIndex = 0;
     if (normalized.includes('category=$')) {
+      // Simulates documents_agreement_signature_guard.
+      if (
+        store.documents[index].category === 'agreement_executed' &&
+        params[paramIndex] !== 'agreement_executed' &&
+        store.agreementSignatures.some((signature) => signature.document_id === id && !signature.archived_at)
+      ) {
+        throw sqlError('23514', 'This document has active agreement signatures; archive them before changing its category');
+      }
       store.documents[index].category = params[paramIndex];
       paramIndex += 1;
     }
@@ -2011,6 +2030,78 @@ describe('property workflow API', () => {
       });
       expect(response.status).toBe(404);
       expect(store.agreementSignatures).toHaveLength(1);
+    });
+  });
+
+  function archiveSignatureRequest(baseUrl: string, id: string) {
+    return fetch(`${baseUrl}/api/v1/ops/agreement-signatures/${id}`, {
+      method: 'PATCH',
+      headers: AUTH,
+      body: JSON.stringify({ archived: true }),
+    });
+  }
+
+  function patchDocument(baseUrl: string, id: string, body: Record<string, unknown>) {
+    return fetch(`${baseUrl}/api/v1/ops/documents/${id}`, { method: 'PATCH', headers: AUTH, body: JSON.stringify(body) });
+  }
+
+  it('returns 422 when unlinking an owner with an active signature, and 204 once it is archived', async () => {
+    seedSignatureFixtures();
+    await withApi(async (baseUrl) => {
+      const created = await (
+        await postSignature(baseUrl, { documentId: EXECUTED_DOC_A, ownerId: OWNER_A2, signedOn: '2026-09-20' })
+      ).json();
+      const unlinkUrl = `${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/owners/${OWNER_A2}`;
+
+      const blocked = await fetch(unlinkUrl, { method: 'DELETE', headers: AUTH });
+      expect(blocked.status).toBe(422);
+      expect((await blocked.json()).error.message).toMatch(/active agreement signatures/);
+      expect(store.links.some((link) => link.owner_id === OWNER_A2)).toBe(true);
+
+      expect((await archiveSignatureRequest(baseUrl, created.data.id)).status).toBe(200);
+      expect((await fetch(unlinkUrl, { method: 'DELETE', headers: AUTH })).status).toBe(204);
+    });
+  });
+
+  it('allows unlinking an owner who has no active signature', async () => {
+    seedSignatureFixtures();
+    await withApi(async (baseUrl) => {
+      await postSignature(baseUrl, { documentId: EXECUTED_DOC_A, ownerId: OWNER_A, signedOn: '2026-09-20' });
+      const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/owners/${OWNER_A2}`, {
+        method: 'DELETE',
+        headers: AUTH,
+      });
+      expect(response.status).toBe(204);
+    });
+  });
+
+  it('returns 422 when recategorizing a signed executed document, and 200 once signatures are archived', async () => {
+    seedSignatureFixtures();
+    await withApi(async (baseUrl) => {
+      const created = await (
+        await postSignature(baseUrl, { documentId: EXECUTED_DOC_A, ownerId: OWNER_A, signedOn: '2026-09-20' })
+      ).json();
+
+      const blocked = await patchDocument(baseUrl, EXECUTED_DOC_A, { category: 'other' });
+      expect(blocked.status).toBe(422);
+      expect((await blocked.json()).error.message).toMatch(/active agreement signatures/);
+      expect(store.documents.find((doc) => doc.id === EXECUTED_DOC_A)?.category).toBe('agreement_executed');
+
+      const retitled = await patchDocument(baseUrl, EXECUTED_DOC_A, { title: 'Deed of Sale (final)', status: 'verified' });
+      expect(retitled.status).toBe(200);
+
+      expect((await archiveSignatureRequest(baseUrl, created.data.id)).status).toBe(200);
+      const allowed = await patchDocument(baseUrl, EXECUTED_DOC_A, { category: 'other' });
+      expect(allowed.status).toBe(200);
+      expect((await allowed.json()).data.category).toBe('other');
+    });
+  });
+
+  it('allows recategorizing an executed document with no active signatures', async () => {
+    seedSignatureFixtures();
+    await withApi(async (baseUrl) => {
+      const response = await patchDocument(baseUrl, EXECUTED_DOC_A2, { category: 'agreement_draft' });
+      expect(response.status).toBe(200);
     });
   });
 

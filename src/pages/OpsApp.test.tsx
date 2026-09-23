@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEMO_ORGANIZATION_ID, operationsApi, resetOperationsDemoState } from '../api/operationsApi';
@@ -350,6 +350,57 @@ describe('OpsApp property workflow', () => {
     await waitFor(() => {
       expect(screen.getAllByText('0 of 1 owners signed')).toHaveLength(2);
     });
+  });
+
+  it('derives signed and not-signed per owner when several owners share one executed agreement', async () => {
+    const propertyId = '70000000-0000-4000-8000-000000000001';
+    const coOwner = await operationsApi.createOwner({
+      organizationId: DEMO_ORGANIZATION_ID,
+      ownerType: 'individual',
+      displayName: 'Co-owner Luz',
+    });
+    await operationsApi.linkPropertyOwner(propertyId, { ownerId: coOwner.id, ownershipPercent: 50 });
+    const executed = await seedExecutedAgreement('Deed of Sale');
+    await operationsApi.createAgreementSignature(propertyId, {
+      documentId: executed.id,
+      ownerId: '80000000-0000-4000-8000-000000000001',
+      signedOn: '2026-09-20',
+    });
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    expect(await screen.findByText('1 of 2 owners signed')).toBeVisible();
+    const rosaRow = screen.getByRole('button', { name: 'Archive signature for Rosa Mendoza on Deed of Sale' }).closest('li')!;
+    expect(within(rosaRow).getByText('Signed 2026-09-20 · recorded by Alex Villanueva')).toBeVisible();
+    const luzRow = screen.getByRole('button', { name: 'Record signature for Co-owner Luz on Deed of Sale' }).closest('li')!;
+    expect(within(luzRow).getByText('Not signed')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Record signature for Rosa Mendoza on Deed of Sale' })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Signed date for Co-owner Luz on Deed of Sale'), {
+      target: { value: '2026-09-21' },
+    });
+    await user.click(screen.getByRole('button', { name: 'Record signature for Co-owner Luz on Deed of Sale' }));
+    expect(await screen.findByText('2 of 2 owners signed')).toBeVisible();
+  });
+
+  it('shows why an owner with an active signature cannot be unlinked', async () => {
+    const executed = await seedExecutedAgreement('Deed of Sale');
+    await operationsApi.createAgreementSignature('70000000-0000-4000-8000-000000000001', {
+      documentId: executed.id,
+      ownerId: '80000000-0000-4000-8000-000000000001',
+      signedOn: '2026-09-20',
+    });
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+
+    const ownersSection = (await screen.findByRole('heading', { name: 'Owners' })).closest('section')!;
+    await user.click(await within(ownersSection).findByRole('button', { name: 'Unlink' }));
+    expect(await within(ownersSection).findByText(/active agreement signatures/)).toBeVisible();
+    expect(within(ownersSection).getByText('Rosa Mendoza', { selector: 'strong' })).toBeVisible();
   });
 
   it('shows signatures read-only to a role without signature write access', async () => {
