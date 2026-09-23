@@ -5,6 +5,7 @@ import {
   DEMO_ORGANIZATION_ID,
   operationsApi,
   type AcquisitionStage,
+  type AgreementSignature,
   type DocumentCategory,
   type DocumentStatus,
   type Negotiation,
@@ -128,6 +129,8 @@ const paymentStatusLabels: Record<PaymentStatus, string> = {
 };
 
 const paymentWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'finance'];
+
+const agreementSignatureWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
 
 type OpsTab = 'dashboard' | 'projects' | 'properties' | 'team';
 
@@ -785,6 +788,7 @@ function PropertyDrawer({
         <DocumentBlock property={property} role={role} />
         <TaskBlock property={property} role={role} members={members} projects={projects} currentUserId={currentUserId} />
         <PaymentBlock property={property} role={role} />
+        <AgreementSignaturesBlock property={property} role={role} />
       </aside>
     </div>
   );
@@ -1481,6 +1485,158 @@ function PaymentBlock({ property, role }: { property: Property; role: Organizati
             Record payment
           </button>
         </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Document-specific: a property may carry several agreement_executed
+ * documents. "Not signed" is derived from property owners minus active
+ * signature rows for that document -- nothing is persisted as pending.
+ */
+function AgreementSignaturesBlock({ property, role }: { property: Property; role: OrganizationRole }) {
+  const [documents, setDocuments] = useState<PropertyDocument[]>([]);
+  const [owners, setOwners] = useState<PropertyOwner[]>([]);
+  const [signatures, setSignatures] = useState<AgreementSignature[]>([]);
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const [signedDates, setSignedDates] = useState<Record<string, string>>({});
+  const [error, setError] = useState('');
+  const canWrite = agreementSignatureWriteRoles.includes(role);
+
+  const refresh = async () => {
+    const [listedDocuments, listedOwners, listedSignatures] = await Promise.all([
+      operationsApi.listDocuments(property.id, { category: 'agreement_executed' }),
+      operationsApi.listPropertyOwners(property.id),
+      operationsApi.listAgreementSignatures(property.id, { includeArchived }),
+    ]);
+    setDocuments(listedDocuments);
+    setOwners(listedOwners);
+    setSignatures(listedSignatures);
+  };
+
+  const run = async (action: () => Promise<unknown>) => {
+    setError('');
+    try {
+      await action();
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to update agreement signatures');
+    }
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) =>
+      setError(cause instanceof Error ? cause.message : 'Unable to load agreement signatures'),
+    );
+  }, [property.id, includeArchived]);
+
+  return (
+    <section className="owner-block">
+      <h3>Agreement signatures</h3>
+      {error && <p className="form-error">{error}</p>}
+      <button type="button" onClick={() => void run(async () => undefined)}>
+        Refresh signatures
+      </button>
+      <label className="checkbox-row">
+        <input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} />
+        Include archived signatures
+      </label>
+      {documents.length === 0 ? (
+        <p>No executed agreement documents on this property.</p>
+      ) : (
+        documents.map((document) => {
+          const forDocument = signatures.filter((signature) => signature.document_id === document.id);
+          const active = forDocument.filter((signature) => !signature.archived_at);
+          const archived = forDocument.filter((signature) => signature.archived_at);
+          const ownerIds = new Set(owners.map((owner) => owner.owner_id));
+          const signedCount = owners.filter((owner) => active.some((signature) => signature.owner_id === owner.owner_id)).length;
+          const unlinkedActive = active.filter((signature) => !ownerIds.has(signature.owner_id));
+          return (
+            <div key={document.id}>
+              <h4>{document.title}</h4>
+              <small>{signedCount} of {owners.length} owners signed</small>
+              {owners.length === 0 && <p>No owners linked to this property.</p>}
+              <ul className="owner-list">
+                {owners.map((owner) => {
+                  const signature = active.find((entry) => entry.owner_id === owner.owner_id);
+                  const key = `${document.id}:${owner.owner_id}`;
+                  const context = `${owner.display_name} on ${document.title}`;
+                  return (
+                    <li key={key}>
+                      <strong>{owner.display_name}</strong>
+                      <small>
+                        {signature
+                          ? `Signed ${signature.signed_on}${signature.recorded_by_name ? ` · recorded by ${signature.recorded_by_name}` : ''}`
+                          : 'Not signed'}
+                      </small>
+                      {canWrite && signature && (
+                        <button
+                          type="button"
+                          aria-label={`Archive signature for ${context}`}
+                          onClick={() => void run(() => operationsApi.archiveAgreementSignature(signature.id))}
+                        >
+                          Archive signature
+                        </button>
+                      )}
+                      {canWrite && !signature && (
+                        <>
+                          <label>
+                            Signed date for {context}
+                            <input
+                              type="date"
+                              value={signedDates[key] ?? ''}
+                              onChange={(event) => setSignedDates((current) => ({ ...current, [key]: event.target.value }))}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            aria-label={`Record signature for ${context}`}
+                            disabled={!signedDates[key]}
+                            onClick={() =>
+                              void run(async () => {
+                                await operationsApi.createAgreementSignature(property.id, {
+                                  documentId: document.id,
+                                  ownerId: owner.owner_id,
+                                  signedOn: signedDates[key],
+                                });
+                                setSignedDates((current) => ({ ...current, [key]: '' }));
+                              })
+                            }
+                          >
+                            Record signature
+                          </button>
+                        </>
+                      )}
+                    </li>
+                  );
+                })}
+                {unlinkedActive.map((signature) => (
+                  <li key={signature.id}>
+                    <strong>{signature.owner_name ?? 'Unknown owner'}</strong>
+                    <small>Signed {signature.signed_on} · no longer linked as an owner</small>
+                    {canWrite && (
+                      <button
+                        type="button"
+                        aria-label={`Archive signature for ${signature.owner_name ?? 'unknown owner'} on ${document.title}`}
+                        onClick={() => void run(() => operationsApi.archiveAgreementSignature(signature.id))}
+                      >
+                        Archive signature
+                      </button>
+                    )}
+                  </li>
+                ))}
+                {includeArchived &&
+                  archived.map((signature) => (
+                    <li key={signature.id}>
+                      <strong>{signature.owner_name ?? 'Unknown owner'}</strong>
+                      <small>Signed {signature.signed_on} · Archived</small>
+                    </li>
+                  ))}
+              </ul>
+            </div>
+          );
+        })
       )}
     </section>
   );

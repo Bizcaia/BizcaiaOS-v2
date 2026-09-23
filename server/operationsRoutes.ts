@@ -29,6 +29,9 @@ import {
   createPaymentSchema,
   paymentListQuerySchema,
   updatePaymentSchema,
+  agreementSignatureListQuerySchema,
+  archiveAgreementSignatureSchema,
+  createAgreementSignatureSchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 
@@ -40,6 +43,7 @@ const NEGOTIATION_MANAGER_ROLES: OrganizationRole[] = ['system_admin', 'land_acq
 const DOCUMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
 const TASK_SELF_ASSIGN_CREATE_ROLES: OrganizationRole[] = ['legal_documentation', 'finance'];
 const PAYMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'finance'];
+const AGREEMENT_SIGNATURE_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
 
 const negotiationPatchColumns: Record<string, string> = {
   status: 'status',
@@ -1154,4 +1158,104 @@ operationsRouter.patch('/payments/:id', async (request, response) => {
     return firstRow(result.rows, 'Payment update failed');
   });
   response.json({ data: payment });
+});
+
+// Left joins so a visible signature is never dropped by a join target's own
+// RLS; owner/document names are display-only.
+const agreementSignatureSelect = `
+  select s.*, o.display_name as owner_name, d.title as document_title, u.display_name as recorded_by_name
+    from public.agreement_signatures s
+    left join public.owners o on o.id = s.owner_id
+    left join public.documents d on d.id = s.document_id
+    left join public.app_users u on u.id = s.recorded_by_user_id`;
+
+operationsRouter.get('/properties/:id/agreement-signatures', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const query = agreementSignatureListQuerySchema.parse(request.query);
+  const signatures = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    if (!(await currentRole(client, property.organization_id, user.id))) {
+      throw httpError(404, 'Property not found');
+    }
+    const values: unknown[] = [id];
+    const where = ['s.property_id=$1'];
+    if (query.documentId) {
+      values.push(query.documentId);
+      where.push(`s.document_id=$${values.length}`);
+    }
+    if (!query.includeArchived) {
+      where.push('s.archived_at is null');
+    }
+    const result = await client.query(
+      `${agreementSignatureSelect} where ${where.join(' and ')} order by s.signed_on desc, s.created_at desc`,
+      values,
+    );
+    return result.rows;
+  });
+  response.json({ data: signatures });
+});
+
+operationsRouter.post('/properties/:id/agreement-signatures', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = createAgreementSignatureSchema.parse(request.body);
+  const signature = await withActorTransaction(user.id, async (client) => {
+    const property = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [id])).rows,
+      'Property not found',
+    );
+    const role = await requireVisibleProperty(client, property.organization_id, user.id);
+    if (!AGREEMENT_SIGNATURE_WRITE_ROLES.includes(role)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+
+    // Document category, same-property, and owner-link checks are enforced by
+    // the database scope trigger (surfaced as 422/404 by the error handler).
+    let inserted;
+    try {
+      inserted = await client.query<{ id: string }>(
+        `insert into public.agreement_signatures (
+            organization_id, property_id, document_id, owner_id, signed_on, recorded_by_user_id
+          ) values ($1,$2,$3,$4,$5,$6)
+          returning id`,
+        [property.organization_id, id, body.documentId, body.ownerId, body.signedOn, user.id],
+      );
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        throw httpError(409, 'This owner already has an active signature on this document');
+      }
+      throw error;
+    }
+    const signatureId = firstRow(inserted.rows, 'Agreement signature creation failed').id;
+    const result = await client.query(`${agreementSignatureSelect} where s.id=$1`, [signatureId]);
+    return firstRow(result.rows, 'Agreement signature creation failed');
+  });
+  response.status(201).json({ data: signature });
+});
+
+operationsRouter.patch('/agreement-signatures/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  archiveAgreementSignatureSchema.parse(request.body);
+  const signature = await withActorTransaction(user.id, async (client) => {
+    const existing = firstRow(
+      (await client.query<{ organization_id: string }>(`select organization_id from public.agreement_signatures where id=$1`, [id])).rows,
+      'Agreement signature not found',
+    );
+    const role = await requireVisibleProperty(client, existing.organization_id, user.id);
+    if (!AGREEMENT_SIGNATURE_WRITE_ROLES.includes(role)) {
+      throw httpError(403, 'You do not have permission for this operation');
+    }
+    await client.query(
+      `update public.agreement_signatures set archived_at = coalesce(archived_at, timezone('utc', now())) where id=$1`,
+      [id],
+    );
+    const result = await client.query(`${agreementSignatureSelect} where s.id=$1`, [id]);
+    return firstRow(result.rows, 'Agreement signature update failed');
+  });
+  response.json({ data: signature });
 });

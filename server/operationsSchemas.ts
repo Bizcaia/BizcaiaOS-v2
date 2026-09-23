@@ -195,3 +195,21 @@ export const updatePaymentSchema = z.object({
 
 export type PaymentType = z.infer<typeof paymentTypeSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
+
+export const agreementSignatureListQuerySchema = z.object({
+  documentId: z.uuid().optional(),
+  includeArchived: z.coerce.boolean().default(false),
+});
+
+// organization_id, property_id, and recorded_by_user_id are derived
+// server-side and never accepted from the client.
+export const createAgreementSignatureSchema = z.object({
+  documentId: z.uuid(),
+  ownerId: z.uuid(),
+  signedOn: z.string().date(),
+});
+
+// Signatures are immutable; the only permitted change is archiving.
+export const archiveAgreementSignatureSchema = z.object({
+  archived: z.literal(true),
+});

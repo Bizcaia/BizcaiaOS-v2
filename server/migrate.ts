@@ -16,6 +16,7 @@ const MIGRATION_FILES = [
   '007_documents.sql',
   '008_tasks.sql',
   '009_payments.sql',
+  '010_agreement_signatures.sql',
 ];
 
 function requiredEnv(name: string) {
