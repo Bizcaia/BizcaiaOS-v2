@@ -10,6 +10,7 @@ import {
   bootstrapOrg,
   createAppPool,
   expectSqlError,
+  insertPropertyFixture,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -114,24 +115,22 @@ describe('PostgreSQL payments security', () => {
       return result.rows[0].id;
     });
 
-    propertyA = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    propertyA = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id
           ) values ($1, $2, 'PAY-001', 'negotiation', $3) returning id`,
-        [orgA, projectA, negotiatorAssigned],
-      );
-      return result.rows[0].id;
-    });
-    propertyOther = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+      [orgA, projectA, negotiatorAssigned],
+    );
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    propertyOther = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage
           ) values ($1, $2, 'PAY-002', 'negotiation') returning id`,
-        [orgA, projectA],
-      );
-      return result.rows[0].id;
-    });
+      [orgA, projectA],
+    );
     propertyB = await asUser(pool, adminB, async (client) => {
       const result = await client.query<{ id: string }>(
         `insert into public.properties (

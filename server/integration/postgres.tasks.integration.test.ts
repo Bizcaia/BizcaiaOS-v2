@@ -10,6 +10,7 @@ import {
   bootstrapOrg,
   createAppPool,
   expectSqlError,
+  insertPropertyFixture,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -133,16 +134,15 @@ describe('PostgreSQL tasks security', () => {
       return result.rows[0].id;
     });
 
-    propertyA = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    propertyA = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage,
             assigned_negotiator_id, assigned_manager_id
           ) values ($1, $2, 'TSK-001', 'negotiation', $3, $4) returning id`,
-        [orgA, projectA, negotiatorAssigned, supervisorScoped],
-      );
-      return result.rows[0].id;
-    });
+      [orgA, projectA, negotiatorAssigned, supervisorScoped],
+    );
     // Belongs to a different project (managed by lamA, not supervisorScoped),
     // and carries no negotiator/manager assignment -- used to prove
     // supervisor out-of-scope denial and negotiator no-assignment denial,

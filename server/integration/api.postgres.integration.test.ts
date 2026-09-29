@@ -142,12 +142,67 @@ describe('Express against real PostgreSQL', () => {
       expect(detailBody.data.owners[0].display_name).toBe('HTTP Owner');
       expect(detailBody.data.assigned_manager_id).toBe(adminUserId);
 
-      const stage = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}`, {
+      // PATCH no longer changes the stage; the stage transition does (L-02).
+      const stagePatch = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}`, {
         method: 'PATCH',
         headers: auth,
         body: JSON.stringify({ acquisitionStage: 'negotiation' }),
       });
+      expect(stagePatch.status).toBe(400);
+      const stage = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/stage-transitions`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ targetStage: 'negotiation', expectedStage: 'identified' }),
+      });
       expect(stage.status).toBe(200);
+      expect((await stage.json()).data).toMatchObject({ acquisition_stage: 'negotiation', acquisition_status: 'active' });
+
+      // Q-L07-API = A: a lifecycle request without the value the screen showed
+      // is refused as invalid (400) before any change, for stage and status.
+      const timelineLength = async () =>
+        ((await (await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/timeline`, { headers: auth })).json()).data as unknown[]).length;
+      const timelineBefore = await timelineLength();
+      for (const [path, body] of [
+        ['stage-transitions', { targetStage: 'initial_contact' }],
+        ['status-transitions', { targetStatus: 'on_hold' }],
+      ] as const) {
+        const missing = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/${path}`, {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify(body),
+        });
+        expect(missing.status).toBe(400);
+        expect((await missing.json()).error.code).toBe('validation_error');
+      }
+
+      // L-07: a screen still showing identified is refused as a lifecycle
+      // conflict naming the field and both values; nothing changes.
+      const stale = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/stage-transitions`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ targetStage: 'initial_contact', expectedStage: 'identified' }),
+      });
+      expect(stale.status).toBe(409);
+      expect((await stale.json()).error).toMatchObject({
+        code: 'lifecycle_conflict',
+        details: { conflict: 'lifecycle', field: 'acquisition_stage', current: 'negotiation', expected: 'identified' },
+      });
+      const staleStatus = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/status-transitions`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ targetStatus: 'active', expectedStatus: 'on_hold' }),
+      });
+      expect(staleStatus.status).toBe(409);
+      expect((await staleStatus.json()).error.details).toEqual({
+        conflict: 'lifecycle',
+        field: 'acquisition_status',
+        current: 'active',
+        expected: 'on_hold',
+      });
+      const afterStale = await fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}`, { headers: auth });
+      expect((await afterStale.json()).data).toMatchObject({ acquisition_stage: 'negotiation', acquisition_status: 'active' });
+      // No lifecycle history from the refused requests.
+      expect(await timelineLength()).toBe(timelineBefore);
 
       const negotiation = await fetch(`${baseUrl}/api/v1/ops/negotiations`, {
         method: 'POST',

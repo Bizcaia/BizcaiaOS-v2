@@ -962,4 +962,418 @@ describe('operationsApi demo adapter', () => {
     await operationsApi.archiveInteraction(created.id);
     expect(await snapshot()).toBe(before);
   });
+
+  // Lifecycle history (L-01): mirrors public.property_lifecycle_history and
+  // Timeline source 8.
+  it('records initial stage and status on create and each changed field on update, shown in the Timeline at rank 8', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'LH-DEMO-1',
+    });
+    const created = await operationsApi.getPropertyTimeline(property.id);
+    expect(created.map((entry) => [entry.source_type, entry.kind, entry.summary]).sort()).toEqual([
+      ['lifecycle', 'stage_changed', 'Acquisition stage set to Identified'],
+      ['lifecycle', 'status_changed', 'Acquisition status set to Active'],
+    ]);
+    expect(created.every((entry) => entry.actor?.id === alex && entry.basis === 'occurrence')).toBe(true);
+
+    // Readiness and other non-lifecycle fields record nothing.
+    await operationsApi.updateProperty(property.id, { risk: 'high', readinessPercent: 40 });
+    expect(await operationsApi.getPropertyTimeline(property.id)).toHaveLength(2);
+
+    // Stage and status in one update: one entry each.
+    // Stage and status change through their transitions (L-02, L-03).
+    await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'initial_contact' });
+    await operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'on_hold' });
+    const summaries = (await operationsApi.getPropertyTimeline(property.id)).map((entry) => entry.summary);
+    expect(summaries).toHaveLength(4);
+    expect(summaries).toEqual(
+      expect.arrayContaining([
+        'Acquisition stage changed from Identified to Initial contact',
+        'Acquisition status changed from Active to On hold',
+      ]),
+    );
+  });
+
+  it('has no lifecycle history for seeded properties (no backfill)', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const entries = await operationsApi.getPropertyTimeline(signatureProperty);
+    expect(entries.some((entry) => entry.source_type === 'lifecycle')).toBe(false);
+  });
+
+  // Stage transitions (L-02): mirrors transition_property_stage(). The demo
+  // actor is always system_admin, so role refusals are proven against
+  // PostgreSQL; direction, reason, legacy, and no-op rules are mirrored here.
+  it('changes the stage only through a transition, forward without a reason and backward with one', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'ST-DEMO-1',
+    });
+    await expect(operationsApi.updateProperty(property.id, { acquisitionStage: 'signing' })).rejects.toThrow(/stage transition/);
+
+    expect(await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'negotiation' })).toMatchObject({
+      acquisition_stage: 'negotiation',
+      acquisition_status: 'active',
+    });
+    for (const reason of [undefined, null, '', ' \t\n ']) {
+      await expect(operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'documentation', reason })).rejects.toThrow(
+        /reason is required/,
+      );
+    }
+    await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'documentation', reason: ' Missing title copy ' });
+    // Same stage is a no-op.
+    await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'documentation' });
+
+    const current = await operationsApi.getProperty(property.id);
+    expect(current).toMatchObject({ acquisition_stage: 'documentation', acquisition_status: 'active' });
+    const summaries = (await operationsApi.getPropertyTimeline(property.id)).map((entry) => entry.summary);
+    // Demo writes can share a millisecond, so compare without order.
+    expect(summaries.filter((summary) => summary.startsWith('Acquisition stage')).sort()).toEqual([
+      'Acquisition stage changed from Identified to Negotiation',
+      'Acquisition stage changed from Negotiation to Documentation',
+      'Acquisition stage set to Identified',
+    ]);
+    expect(JSON.stringify(await operationsApi.getPropertyTimeline(property.id))).not.toContain('Missing title copy');
+  });
+
+  it('never selects a legacy value and never moves a property off one', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const create = (propertyReference: string, acquisitionStage?: 'withdrawn') =>
+      operationsApi.createProperty({
+        organizationId: DEMO_ORGANIZATION_ID,
+        projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+        propertyReference,
+        acquisitionStage,
+      });
+    const normal = await create('ST-DEMO-2');
+    for (const legacy of ['on_hold', 'withdrawn', 'acquisition_complete'] as const) {
+      await expect(operationsApi.transitionPropertyStage(normal.id, { expectedStage: (await operationsApi.getProperty(normal.id)).acquisition_stage, targetStage: legacy, reason: 'x' })).rejects.toThrow(/legacy value/);
+    }
+    // Since L-05 a legacy value cannot be created either, so the demo holds no
+    // legacy rows; moving off one is proven against PostgreSQL.
+    await expect(create('ST-DEMO-3', 'withdrawn')).rejects.toThrow(/only be created in the identified stage/);
+    await expect(operationsApi.transitionPropertyStage('70000000-0000-4000-8000-00000000dead', { expectedStage: 'identified', targetStage: 'signing' })).rejects.toThrow(
+      /Property not found/,
+    );
+  });
+
+  // Status transitions (L-03): mirrors transition_property_status(). The demo
+  // actor is always system_admin, so role refusals (including the supervisor
+  // complete reversal) are proven against PostgreSQL; the matrix, reason,
+  // override, completion-condition, and no-op rules are mirrored here.
+  it('changes the status only through a transition, applying reasons, overrides, and the completion condition', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'SS-DEMO-1',
+    });
+    // Since L-05 creation starts in identified; the stage moves forward through a transition.
+    await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'signing' });
+    await expect(operationsApi.updateProperty(property.id, { acquisitionStatus: 'complete' })).rejects.toThrow(/status transition/);
+
+    await operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'on_hold' });
+    await expect(operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'on_hold', override: true })).resolves.toMatchObject({
+      acquisition_status: 'on_hold',
+    });
+    await expect(operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'active', override: true })).rejects.toThrow(
+      /No override applies/,
+    );
+    for (const reason of [undefined, null, '', ' \t\n ']) {
+      await expect(operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'withdrawn', reason })).rejects.toThrow(
+        /reason is required/,
+      );
+    }
+    await operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'withdrawn', reason: ' Owner declined ' });
+    await expect(
+      operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'complete', reason: 'Closed anyway' }),
+    ).rejects.toThrow(/requires an override \(withdrawn_reversal, completion_stage_condition\)/);
+    const completed = await operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status,
+      targetStatus: 'complete',
+      reason: 'Closed anyway',
+      override: true,
+    });
+    expect(completed).toMatchObject({ acquisition_stage: 'signing', acquisition_status: 'complete' });
+    await operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'active', reason: 'Payment bounced', override: true });
+
+    const summaries = (await operationsApi.getPropertyTimeline(property.id))
+      .filter((entry) => entry.kind === 'status_changed')
+      .map((entry) => entry.summary)
+      .sort();
+    expect(summaries).toEqual([
+      'Acquisition status changed from Active to On hold',
+      'Acquisition status changed from Complete to Active (override)',
+      'Acquisition status changed from On hold to Withdrawn',
+      'Acquisition status changed from Withdrawn to Complete (override)',
+      'Acquisition status set to Active',
+    ]);
+    const serialized = JSON.stringify(await operationsApi.getPropertyTimeline(property.id));
+    expect(serialized).not.toContain('Payment bounced');
+    expect(serialized).not.toContain('complete_reversal');
+    expect((await operationsApi.getProperty(property.id)).acquisition_stage).toBe('signing');
+  });
+
+  it('completes at payment_closing without an override and refuses an unneeded one', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'SS-DEMO-2',
+    });
+    // Since L-05 creation starts in identified; the stage moves forward through a transition.
+    await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'payment_closing' });
+    await expect(
+      operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'complete', reason: 'x', override: true }),
+    ).rejects.toThrow(/No override applies/);
+    expect(await operationsApi.transitionPropertyStatus(property.id, { expectedStatus: (await operationsApi.getProperty(property.id)).acquisition_status, targetStatus: 'complete' })).toMatchObject({
+      acquisition_stage: 'payment_closing',
+      acquisition_status: 'complete',
+    });
+    await expect(operationsApi.transitionPropertyStatus('70000000-0000-4000-8000-00000000dead', { expectedStatus: 'active', targetStatus: 'on_hold' })).rejects.toThrow(
+      /Property not found/,
+    );
+  });
+
+  // Negotiation exception (L-04): mirrors transition_property_stage() in 015.
+  // The seeded NCP-00102 is in negotiation with an open negotiation.
+  it('blocks leaving negotiation with an open negotiation unless the exception is used, leaving the negotiation unchanged', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const negotiationsBefore = JSON.stringify(
+      await operationsApi.listNegotiations('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { propertyId: signatureProperty }),
+    );
+    for (const input of [
+      { targetStage: 'commercial_review' as const, expectedStage: 'negotiation' as const, reason: 'Terms agreed verbally' },
+      { targetStage: 'commercial_review' as const, expectedStage: 'negotiation' as const, reason: 'Terms agreed verbally', override: false },
+      { targetStage: 'documentation' as const, expectedStage: 'negotiation' as const, reason: 'Back for papers' },
+    ]) {
+      await expect(operationsApi.transitionPropertyStage(signatureProperty, input)).rejects.toThrow(
+        /requires an override \(negotiation_unresolved_exit\)/,
+      );
+    }
+    for (const reason of [undefined, null, '', ' \t ']) {
+      await expect(
+        operationsApi.transitionPropertyStage(signatureProperty, { expectedStage: (await operationsApi.getProperty(signatureProperty)).acquisition_stage, targetStage: 'commercial_review', reason, override: true }),
+      ).rejects.toThrow(/reason is required to leave negotiation/);
+    }
+    expect((await operationsApi.getProperty(signatureProperty)).acquisition_stage).toBe('negotiation');
+
+    const moved = await operationsApi.transitionPropertyStage(signatureProperty, { expectedStage: (await operationsApi.getProperty(signatureProperty)).acquisition_stage,
+      targetStage: 'commercial_review',
+      reason: ' Terms agreed verbally ',
+      override: true,
+    });
+    expect(moved).toMatchObject({ acquisition_stage: 'commercial_review', acquisition_status: 'active' });
+    const entries = await operationsApi.getPropertyTimeline(signatureProperty);
+    expect(entries.map((entry) => entry.summary)).toContain('Acquisition stage changed from Negotiation to Commercial review (override)');
+    expect(JSON.stringify(entries)).not.toContain('Terms agreed verbally');
+    expect(JSON.stringify(entries)).not.toContain('negotiation_unresolved_exit');
+    expect(
+      JSON.stringify(await operationsApi.listNegotiations('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { propertyId: signatureProperty })),
+    ).toBe(negotiationsBefore);
+  });
+
+  // Creation rules (L-05): mirrors enforce_property_creation_rules() (P-6).
+  it('creates properties only in identified and active, with the creation history, and nothing on refusal', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const base = { organizationId: DEMO_ORGANIZATION_ID, projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001' };
+    const before = (await operationsApi.listProperties(DEMO_ORGANIZATION_ID)).length;
+    expect(before).toBeGreaterThan(0);
+    for (const acquisitionStage of [
+      'initial_contact',
+      'negotiation',
+      'payment_closing',
+      'on_hold',
+      'withdrawn',
+      'acquisition_complete',
+    ] as const) {
+      await expect(operationsApi.createProperty({ ...base, propertyReference: `CR-DEMO-${acquisitionStage}`, acquisitionStage })).rejects.toThrow(
+        /only be created in the identified stage/,
+      );
+    }
+    expect((await operationsApi.listProperties(DEMO_ORGANIZATION_ID)).length).toBe(before);
+
+    for (const acquisitionStage of [undefined, 'identified'] as const) {
+      const created = await operationsApi.createProperty({ ...base, propertyReference: `CR-DEMO-${acquisitionStage ?? 'default'}`, acquisitionStage });
+      expect(created).toMatchObject({ acquisition_stage: 'identified', acquisition_status: 'active' });
+      expect((await operationsApi.getPropertyTimeline(created.id)).map((entry) => entry.summary).sort()).toEqual([
+        'Acquisition stage set to Identified',
+        'Acquisition status set to Active',
+      ]);
+    }
+  });
+
+  it('refuses an override on a stage transition where no designated rule applies', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'NX-DEMO-1',
+    });
+    // Since L-05 creation starts in identified; the stage moves forward through a transition.
+    await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'negotiation' });
+    await expect(
+      operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'commercial_review', reason: 'x', override: true }),
+    ).rejects.toThrow(/No override applies/);
+    expect(await operationsApi.transitionPropertyStage(property.id, { expectedStage: (await operationsApi.getProperty(property.id)).acquisition_stage, targetStage: 'commercial_review' })).toMatchObject({
+      acquisition_stage: 'commercial_review',
+    });
+  });
+
+  // Legacy stage remediation (L-06): mirrors the 017 functions. The seeded
+  // NCP-00077 is a pre-existing record on the legacy stage withdrawn. The demo
+  // actor is always system_admin, so role refusals are proven against PostgreSQL.
+  const legacySeed = '70000000-0000-4000-8000-000000000004';
+
+  it('remediates a legacy stage only through review and resolution with reason and evidence, then reopens as a new cycle', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    expect((await operationsApi.listRemediationQueue(DEMO_ORGANIZATION_ID)).map((item) => [item.property_reference, item.state])).toEqual([
+      ['NCP-00077', 'NOT_REVIEWED'],
+    ]);
+    // Ordinary paths never convert it.
+    await expect(operationsApi.transitionPropertyStage(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage, targetStage: 'documentation', reason: 'x' })).rejects.toThrow(/remediation/);
+    await expect(operationsApi.updateProperty(legacySeed, { acquisitionStage: 'documentation' })).rejects.toThrow(/stage transition/);
+
+    await expect(operationsApi.escalateRemediation(legacySeed, { reason: 'x' })).rejects.toThrow(/No remediation cycle/);
+    expect(await operationsApi.startRemediation(legacySeed)).toMatchObject({ cycle: 1, legacy_value: 'withdrawn', state: 'UNDER_REVIEW' });
+    await expect(operationsApi.startRemediation(legacySeed)).rejects.toThrow(/already has a remediation cycle/);
+    for (const reason of [undefined, null, '', ' \t ']) {
+      await expect(operationsApi.escalateRemediation(legacySeed, { reason })).rejects.toThrow(/reason is required/);
+    }
+    await operationsApi.escalateRemediation(legacySeed, { reason: 'Survey missing' });
+    await expect(
+      operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage, resultingStage: 'documentation', reason: 'x', evidence: 'y' }),
+    ).rejects.toThrow(/No remediation cycle of this property is UNDER_REVIEW/);
+    expect((await operationsApi.getProperty(legacySeed)).acquisition_stage).toBe('withdrawn');
+    // Q-4: returning to review takes an optional reason.
+    await operationsApi.returnRemediationToReview(legacySeed, {});
+    await operationsApi.escalateRemediation(legacySeed, { reason: ' Still missing ' });
+    await operationsApi.returnRemediationToReview(legacySeed, { reason: '  Survey found ' });
+
+    for (const reason of [undefined, null, '', '   ']) {
+      await expect(operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage, resultingStage: 'documentation', reason, evidence: 'Survey 2024' })).rejects.toThrow(
+        /reason is required to resolve/,
+      );
+    }
+    for (const evidence of [undefined, null, '', '   ']) {
+      await expect(operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage, resultingStage: 'documentation', reason: 'Survey decides', evidence })).rejects.toThrow(
+        /Supporting evidence is required/,
+      );
+    }
+    await expect(
+      operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage, resultingStage: 'on_hold', reason: 'Survey decides', evidence: 'Survey 2024' }),
+    ).rejects.toThrow(/legacy value/);
+    const otherDocument = (await operationsApi.listDocuments(signatureProperty))[0];
+    await expect(
+      operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage,
+        resultingStage: 'documentation',
+        reason: 'Survey decides',
+        evidence: 'Survey 2024',
+        evidenceDocumentId: otherDocument.id,
+      }),
+    ).rejects.toThrow(/must belong to this property/);
+    const interaction = await operationsApi.createInteraction(legacySeed, { interactionType: 'call', notes: 'Owner confirmed' });
+    expect((await operationsApi.getProperty(legacySeed)).acquisition_stage).toBe('withdrawn');
+
+    const resolved = await operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage,
+      resultingStage: 'documentation',
+      reason: '  Survey decides ',
+      evidence: ' Survey 2024 ',
+      evidenceInteractionId: interaction.id,
+    });
+    expect(resolved).toMatchObject({
+      state: 'RESOLVED',
+      resulting_stage: 'documentation',
+      resolution_reason: 'Survey decides',
+      evidence: 'Survey 2024',
+      evidence_interaction_id: interaction.id,
+    });
+    expect(await operationsApi.getProperty(legacySeed)).toMatchObject({ acquisition_stage: 'documentation', acquisition_status: 'active' });
+    const entries = await operationsApi.getPropertyTimeline(legacySeed);
+    expect(entries.map((entry) => entry.summary)).toContain('Acquisition stage changed from Withdrawn to Documentation (legacy remediation)');
+    expect(JSON.stringify(entries)).not.toContain('Survey decides');
+    expect(await operationsApi.listRemediationQueue(DEMO_ORGANIZATION_ID)).toEqual([]);
+
+    // Q-5: reopening takes an optional reason.
+    expect(await operationsApi.reopenRemediation(legacySeed, {})).toMatchObject({
+      cycle: 2,
+      stage_at_open: 'documentation',
+      legacy_value: 'withdrawn',
+      state: 'UNDER_REVIEW',
+    });
+    await expect(operationsApi.resolveRemediation(legacySeed, { expectedStage: (await operationsApi.getProperty(legacySeed)).acquisition_stage, resultingStage: 'signing', reason: 'x', evidence: ' ' })).rejects.toThrow(
+      /Supporting evidence is required/,
+    );
+    const cycles = await operationsApi.listPropertyRemediations(legacySeed);
+    expect(cycles.map((cycle) => [cycle.cycle, cycle.state, cycle.resulting_stage])).toEqual([
+      [1, 'RESOLVED', 'documentation'],
+      [2, 'UNDER_REVIEW', null],
+    ]);
+    expect(cycles[0].events?.map((event) => [event.action, event.reason])).toEqual([
+      ['review_started', null],
+      ['escalated', 'Survey missing'],
+      ['returned_to_review', null],
+      ['escalated', 'Still missing'],
+      ['returned_to_review', 'Survey found'],
+      ['resolved', 'Survey decides'],
+    ]);
+    expect(cycles[1].events?.map((event) => [event.action, event.reason])).toEqual([['reopened', null]]);
+  });
+
+  it('refuses to remediate a property that is not on a legacy stage', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    await expect(operationsApi.startRemediation(signatureProperty)).rejects.toThrow(/not a legacy value/);
+  });
+
+  // Lifecycle concurrency (L-07): the demo mirrors the 409 lifecycle conflict
+  // the functions raise for a stale expected value (D-X1, S-25).
+  it('refuses stale stage, status, and resolution requests as lifecycle conflicts, changing nothing', async () => {
+    const { operationsApi, isLifecycleConflict, OperationsApiError, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'CC-DEMO-1',
+    });
+    await operationsApi.transitionPropertyStage(property.id, { targetStage: 'documentation', expectedStage: 'identified' });
+
+    const stale = await operationsApi
+      .transitionPropertyStage(property.id, { targetStage: 'initial_contact', expectedStage: 'identified' })
+      .catch((error: unknown) => error);
+    expect(stale).toBeInstanceOf(OperationsApiError);
+    expect(isLifecycleConflict(stale)).toBe(true);
+    expect(stale).toMatchObject({
+      status: 409,
+      code: 'lifecycle_conflict',
+      details: { conflict: 'lifecycle', field: 'acquisition_stage', current: 'documentation', expected: 'identified' },
+    });
+    // A stale no-op is a conflict too, not a success.
+    await expect(
+      operationsApi.transitionPropertyStage(property.id, { targetStage: 'documentation', expectedStage: 'identified' }),
+    ).rejects.toMatchObject({ code: 'lifecycle_conflict' });
+    await expect(operationsApi.transitionPropertyStatus(property.id, { targetStatus: 'on_hold', expectedStatus: 'withdrawn' })).rejects.toMatchObject({
+      code: 'lifecycle_conflict',
+      details: { field: 'acquisition_status', current: 'active', expected: 'withdrawn' },
+    });
+    const summaries = (await operationsApi.getPropertyTimeline(property.id)).map((entry) => entry.summary).sort();
+    expect(summaries).toEqual([
+      'Acquisition stage changed from Identified to Documentation',
+      'Acquisition stage set to Identified',
+      'Acquisition status set to Active',
+    ]);
+
+    await operationsApi.startRemediation(legacySeed);
+    await expect(
+      operationsApi.resolveRemediation(legacySeed, { resultingStage: 'documentation', expectedStage: 'on_hold', reason: 'x', evidence: 'y' }),
+    ).rejects.toMatchObject({ code: 'lifecycle_conflict', details: { current: 'withdrawn', expected: 'on_hold' } });
+    expect((await operationsApi.listPropertyRemediations(legacySeed))[0].state).toBe('UNDER_REVIEW');
+
+    // Other refusals are not conflicts.
+    const invalid = await operationsApi
+      .transitionPropertyStage(property.id, { targetStage: 'identified', expectedStage: 'documentation' })
+      .catch((error: unknown) => error);
+    expect(isLifecycleConflict(invalid)).toBe(false);
+  });
 });

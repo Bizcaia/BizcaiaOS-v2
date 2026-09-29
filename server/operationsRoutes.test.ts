@@ -43,6 +43,9 @@ type Store = {
   timezone: string;
   timelineRows: Array<Record<string, unknown>>;
   interactions: Array<Record<string, unknown>>;
+  stageTransitionError: { code: string; message: string } | null;
+  statusTransitionError: { code: string; message: string } | null;
+  remediationError: { code: string; message: string } | null;
 };
 
 const EXECUTED_DOC_A = 'e0000000-0000-4000-8000-00000000000a';
@@ -155,6 +158,9 @@ function seedStore(role: Role = 'system_admin'): Store {
     timezone: 'Asia/Manila',
     timelineRows: [],
     interactions: [],
+    stageTransitionError: null,
+    statusTransitionError: null,
+    remediationError: null,
   };
 }
 
@@ -247,6 +253,31 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
   const normalized = sql.replace(/\s+/g, ' ').trim().toLowerCase();
   // Timeline branches come first: the UNION ALL text would otherwise match
   // the per-table branches below.
+  if (normalized.startsWith('select * from public.transition_property_stage')) {
+    // The stage rules are proven against real PostgreSQL; here the function's
+    // result or error is simulated so the route's validation and mapping can
+    // be exercised.
+    if (store.stageTransitionError) throw sqlError(store.stageTransitionError.code, store.stageTransitionError.message);
+    const property = store.properties.find((entry) => entry.id === params[0]);
+    if (!property) throw sqlError('P0002', 'Property not found');
+    property.acquisition_stage = params[1];
+    return { rows: [property], rowCount: 1 };
+  }
+  if (/^select \* from public\.(start|escalate|return|resolve|reopen)_property_stage_remediation/.test(normalized)) {
+    // The remediation rules are proven against real PostgreSQL; here the
+    // function's result or error is simulated for the routes.
+    if (store.remediationError) throw sqlError(store.remediationError.code, store.remediationError.message);
+    return { rows: [{ id: 'rem-1', property_id: params[0], state: 'UNDER_REVIEW', cycle: 1 }], rowCount: 1 };
+  }
+  if (normalized.startsWith('select * from public.transition_property_status')) {
+    // The status rules are proven against real PostgreSQL; simulated here the
+    // same way as the stage function.
+    if (store.statusTransitionError) throw sqlError(store.statusTransitionError.code, store.statusTransitionError.message);
+    const property = store.properties.find((entry) => entry.id === params[0]);
+    if (!property) throw sqlError('P0002', 'Property not found');
+    property.acquisition_status = params[1];
+    return { rows: [property], rowCount: 1 };
+  }
   if (normalized.startsWith('with entries as')) {
     // Timeline semantics are proven against real PostgreSQL; here the rows
     // are supplied directly so the route's gate, validation, and mapping can
@@ -919,6 +950,83 @@ describe('property workflow API', () => {
     });
   });
 
+  describe('creation rules (L-05)', () => {
+    function postProperty(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = AUTH) {
+      return fetch(`${baseUrl}/api/v1/ops/properties`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ organizationId: ORG_A, projectId: PROJECT_A, propertyReference: 'NCP-L05', ...body }),
+      });
+    }
+
+    function propertyInserts() {
+      return actorQuery.mock.calls.filter(([sql]) => /insert into public\.properties/i.test(String(sql)));
+    }
+
+    it('creates in identified, whether the stage is omitted or given as identified, and never sends a status', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await postProperty(baseUrl, {})).status).toBe(201);
+        expect((await postProperty(baseUrl, { propertyReference: 'NCP-L05B', acquisitionStage: 'identified' })).status).toBe(201);
+        // An unknown status field is not part of the creation contract and is dropped.
+        expect((await postProperty(baseUrl, { propertyReference: 'NCP-L05C', acquisitionStatus: 'complete' })).status).toBe(201);
+      });
+      const inserts = propertyInserts();
+      expect(inserts).toHaveLength(3);
+      expect(inserts.map(([, params]) => (params as unknown[])[10])).toEqual(['identified', 'identified', 'identified']);
+      expect(inserts.every(([sql]) => !/acquisition_status/.test(String(sql)))).toBe(true);
+    });
+
+    it.each(['initial_contact', 'negotiation', 'payment_closing', 'on_hold', 'withdrawn', 'acquisition_complete', 'complete'])(
+      'refuses the creation stage %s with 400 before any insert',
+      async (stage) => {
+        await withApi(async (baseUrl) => {
+          const response = await postProperty(baseUrl, { acquisitionStage: stage });
+          expect(response.status).toBe(400);
+          expect((await response.json()).error.code).toBe('validation_error');
+        });
+        expect(propertyInserts()).toHaveLength(0);
+      },
+    );
+
+    it.each(['supervisor', 'negotiator', 'legal_documentation', 'finance', 'viewer'] as const)(
+      'refuses creation for %s with 403 before any insert',
+      async (role) => {
+        store.role = role;
+        await withApi(async (baseUrl) => {
+          expect((await postProperty(baseUrl, {})).status).toBe(403);
+        });
+        expect(propertyInserts()).toHaveLength(0);
+      },
+    );
+
+    it('allows land_acquisition_manager and system_admin', async () => {
+      for (const role of ['land_acquisition_manager', 'system_admin'] as const) {
+        store.role = role;
+        await withApi(async (baseUrl) => {
+          expect((await postProperty(baseUrl, { propertyReference: `NCP-${role}` })).status).toBe(201);
+        });
+      }
+      expect(propertyInserts()).toHaveLength(2);
+    });
+
+    it('requires authentication', async () => {
+      await withApi(async (baseUrl) => {
+        const response = await postProperty(baseUrl, {}, { 'Content-Type': 'application/json' });
+        expect(response.status).toBe(401);
+      });
+      expect(propertyInserts()).toHaveLength(0);
+    });
+
+    it('validates required fields before any insert', async () => {
+      await withApi(async (baseUrl) => {
+        for (const body of [{ propertyReference: '' }, { propertyReference: '   ' }, { propertyReference: null }, { projectId: 'not-a-uuid' }]) {
+          expect((await postProperty(baseUrl, body)).status).toBe(400);
+        }
+      });
+      expect(propertyInserts()).toHaveLength(0);
+    });
+  });
+
   it('gets a property', async () => {
     await withApi(async (baseUrl) => {
       const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, { headers: AUTH });
@@ -958,12 +1066,33 @@ describe('property workflow API', () => {
       const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, {
         method: 'PATCH',
         headers: AUTH,
-        body: JSON.stringify({ acquisitionStage: 'negotiation' }),
+        body: JSON.stringify({ risk: 'high' }),
       });
       const body = await response.json();
       expect(response.status).toBe(200);
-      expect(body.data.acquisition_stage).toBe('negotiation');
+      // PATCH no longer supplies or changes the stage (L-02).
+      expect(body.data.acquisition_stage).toBe('identified');
     });
+    const updates = actorQuery.mock.calls.map(([sql]) => String(sql)).filter((sql) => /update public\.properties/i.test(sql));
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).not.toMatch(/acquisition_stage/);
+  });
+
+  it('refuses acquisitionStage on PATCH for every role, before any update', async () => {
+    for (const role of ['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator'] as const) {
+      store.role = role;
+      actorQuery.mockClear();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, {
+          method: 'PATCH',
+          headers: AUTH,
+          body: JSON.stringify({ acquisitionStage: 'negotiation' }),
+        });
+        expect(response.status).toBe(400);
+      });
+      expect(actorQuery.mock.calls.some(([sql]) => /update public\.properties/i.test(String(sql)))).toBe(false);
+    }
+    expect(store.properties[0].acquisition_stage).toBe('identified');
   });
 
   it('rejects a supervisor attempting a forbidden property field update', async () => {
@@ -972,7 +1101,7 @@ describe('property workflow API', () => {
       const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, {
         method: 'PATCH',
         headers: AUTH,
-        body: JSON.stringify({ acquisitionStage: 'negotiation' }),
+        body: JSON.stringify({ legalStatus: 'clear' }),
       });
       const body = await response.json();
       expect(response.status).toBe(403);
@@ -2591,5 +2720,410 @@ describe('property workflow API', () => {
     const timelineSql = String(timelineQueryCalls()[0][0]);
     expect(timelineSql).toContain(`'interaction', 7`);
     expect(timelineSql).not.toMatch(/\bi\.notes\b/);
+  });
+
+  it('maps lifecycle history rows into stage and status Timeline entries without the reason', async () => {
+    store.timelineRows = [
+      { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-4', kind: 'status_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_status', title: 'active', secondary: 'on_hold', event_ts: new Date('2026-09-21T03:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-3', kind: 'stage_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_stage', title: 'signing', secondary: 'payment_closing', event_ts: new Date('2026-09-20T03:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-2', kind: 'status_changed', basis: 'occurrence', code: 'acquisition_status', secondary: 'active', event_ts: new Date('2026-09-19T03:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-1', kind: 'stage_changed', basis: 'occurrence', code: 'acquisition_stage', secondary: 'withdrawn', event_ts: new Date('2026-09-19T03:00:00Z') },
+    ];
+    await withApi(async (baseUrl) => {
+      const body = await (await getTimeline(baseUrl)).json();
+      expect(body.data).toEqual([
+        {
+          id: 'lifecycle:lh-4:status_changed',
+          kind: 'status_changed',
+          source_type: 'lifecycle',
+          source_id: 'lh-4',
+          occurred_at: '2026-09-21T03:00:00.000Z',
+          precision: 'timestamp',
+          basis: 'occurrence',
+          actor: { id: USER_ID, display_name: 'Test User' },
+          summary: 'Acquisition status changed from Active to On hold',
+          archived: false,
+        },
+        expect.objectContaining({ kind: 'stage_changed', summary: 'Acquisition stage changed from Signing to Payment / closing' }),
+        expect.objectContaining({ actor: null, summary: 'Acquisition status set to Active' }),
+        // A legacy stage value is shown as recorded, never converted.
+        expect.objectContaining({ actor: null, summary: 'Acquisition stage set to Withdrawn' }),
+      ]);
+    });
+    const timelineSql = String(timelineQueryCalls()[0][0]);
+    expect(timelineSql).toContain(`'lifecycle', 8`);
+    expect(timelineSql).toContain('public.property_lifecycle_history');
+    expect(timelineSql).not.toMatch(/\bh\.reason\b/);
+  });
+
+  describe('stage transitions (L-02)', () => {
+    function postTransition(baseUrl: string, body: Record<string, unknown>, propertyId = PROPERTY_A) {
+      return fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/stage-transitions`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ expectedStage: 'identified', ...body }),
+      });
+    }
+
+    function transitionCalls() {
+      return actorQuery.mock.calls.filter(([sql]) => String(sql).includes('transition_property_stage'));
+    }
+
+    it('calls the transition function with the target stage and reason and returns the property', async () => {
+      store.role = 'negotiator';
+      await withApi(async (baseUrl) => {
+        const response = await postTransition(baseUrl, { targetStage: 'initial_contact' });
+        expect(response.status).toBe(200);
+        expect((await response.json()).data).toMatchObject({ id: PROPERTY_A, acquisition_stage: 'initial_contact' });
+        const withReason = await postTransition(baseUrl, { targetStage: 'identified', reason: 'Owner details were wrong' });
+        expect(withReason.status).toBe(200);
+        const withOverride = await postTransition(baseUrl, {
+          targetStage: 'commercial_review',
+          reason: 'Terms agreed verbally',
+          override: true,
+        });
+        expect(withOverride.status).toBe(200);
+      });
+      expect(transitionCalls().map(([, params]) => params)).toEqual([
+        [PROPERTY_A, 'initial_contact', null, false, 'identified'],
+        [PROPERTY_A, 'identified', 'Owner details were wrong', false, 'identified'],
+        [PROPERTY_A, 'commercial_review', 'Terms agreed verbally', true, 'identified'],
+      ]);
+    });
+
+    it('validates the body before calling the function', async () => {
+      await withApi(async (baseUrl) => {
+        for (const body of [
+          {},
+          { targetStage: 'complete' },
+          { targetStage: 'signing', reason: 'x'.repeat(2001) },
+          { targetStage: 'signing', override: 'yes' },
+        ]) {
+          expect((await postTransition(baseUrl, body)).status).toBe(400);
+        }
+        expect((await postTransition(baseUrl, { targetStage: 'signing' }, 'not-a-uuid')).status).toBe(400);
+      });
+      expect(transitionCalls()).toHaveLength(0);
+    });
+
+    it.each([
+      ['42501', 403, 'You do not have permission to move this property to an earlier stage'],
+      ['22023', 422, 'A reason is required to move a property to an earlier stage'],
+      ['22023', 422, 'The stage withdrawn is a legacy value and cannot be selected'],
+      ['42501', 403, 'You do not have permission to leave negotiation while a negotiation is open or paused'],
+      ['22023', 422, 'Leaving negotiation while a negotiation is open or paused requires an override (negotiation_unresolved_exit)'],
+      ['22023', 422, 'No override applies to moving this property from identified to signing'],
+      ['P0002', 404, 'Property not found'],
+    ])('maps a %s refusal from the function to %i', async (code, status, message) => {
+      store.stageTransitionError = { code, message };
+      await withApi(async (baseUrl) => {
+        const response = await postTransition(baseUrl, { targetStage: 'identified' });
+        expect(response.status).toBe(status);
+        expect((await response.json()).error.message).toBe(message);
+      });
+      expect(store.properties[0].acquisition_stage).toBe('identified');
+    });
+
+    it('requires authentication', async () => {
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/stage-transitions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetStage: 'signing' }),
+        });
+        expect(response.status).toBe(401);
+      });
+      expect(transitionCalls()).toHaveLength(0);
+    });
+  });
+
+  describe('status transitions (L-03)', () => {
+    function postStatus(baseUrl: string, body: Record<string, unknown>, propertyId = PROPERTY_A) {
+      return fetch(`${baseUrl}/api/v1/ops/properties/${propertyId}/status-transitions`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify({ expectedStatus: 'active', ...body }),
+      });
+    }
+
+    function statusCalls() {
+      return actorQuery.mock.calls.filter(([sql]) => String(sql).includes('transition_property_status'));
+    }
+
+    it('calls the status function with the target, reason, and override flag and returns the property', async () => {
+      store.role = 'land_acquisition_manager';
+      await withApi(async (baseUrl) => {
+        const paused = await postStatus(baseUrl, { targetStatus: 'on_hold' });
+        expect(paused.status).toBe(200);
+        expect((await paused.json()).data).toMatchObject({ id: PROPERTY_A, acquisition_status: 'on_hold', acquisition_stage: 'identified' });
+        const completed = await postStatus(baseUrl, { targetStatus: 'complete', reason: 'Resolved while paused', override: true });
+        expect(completed.status).toBe(200);
+      });
+      expect(statusCalls().map(([, params]) => params)).toEqual([
+        [PROPERTY_A, 'on_hold', null, false, 'active'],
+        [PROPERTY_A, 'complete', 'Resolved while paused', true, 'active'],
+      ]);
+    });
+
+    it('validates the body before calling the function', async () => {
+      await withApi(async (baseUrl) => {
+        for (const body of [
+          {},
+          { targetStatus: 'completed' },
+          { targetStatus: 'paused' },
+          { targetStatus: 'complete', override: 'yes' },
+          { targetStatus: 'withdrawn', reason: 'x'.repeat(2001) },
+        ]) {
+          expect((await postStatus(baseUrl, body)).status).toBe(400);
+        }
+        expect((await postStatus(baseUrl, { targetStatus: 'on_hold' }, 'not-a-uuid')).status).toBe(400);
+      });
+      expect(statusCalls()).toHaveLength(0);
+    });
+
+    it.each([
+      ['42501', 403, 'You do not have permission to change this property from complete to active'],
+      ['22023', 422, 'A reason is required to change this property from active to withdrawn'],
+      ['22023', 422, 'Changing this property from active to complete requires an override (completion_stage_condition)'],
+      ['22023', 422, 'No override applies to changing this property from active to on_hold'],
+      ['P0002', 404, 'Property not found'],
+    ])('maps a %s refusal from the function to %i', async (code, status, message) => {
+      store.statusTransitionError = { code, message };
+      await withApi(async (baseUrl) => {
+        const response = await postStatus(baseUrl, { targetStatus: 'complete' });
+        expect(response.status).toBe(status);
+        expect((await response.json()).error.message).toBe(message);
+      });
+      expect(store.properties[0].acquisition_status).toBe('active');
+    });
+
+    it('requires authentication', async () => {
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/status-transitions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetStatus: 'on_hold' }),
+        });
+        expect(response.status).toBe(401);
+      });
+      expect(statusCalls()).toHaveLength(0);
+    });
+
+    it('refuses acquisitionStatus on PATCH for every role, before any update, and keeps other fields working', async () => {
+      for (const role of ['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator'] as const) {
+        store.role = role;
+        actorQuery.mockClear();
+        await withApi(async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, {
+            method: 'PATCH',
+            headers: AUTH,
+            body: JSON.stringify({ acquisitionStatus: 'complete' }),
+          });
+          expect(response.status).toBe(400);
+        });
+        expect(actorQuery.mock.calls.some(([sql]) => /update public\.properties/i.test(String(sql)))).toBe(false);
+      }
+      store.role = 'land_acquisition_manager';
+      actorQuery.mockClear();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, {
+          method: 'PATCH',
+          headers: AUTH,
+          body: JSON.stringify({ risk: 'high' }),
+        });
+        expect(response.status).toBe(200);
+      });
+      const updates = actorQuery.mock.calls.map(([sql]) => String(sql)).filter((sql) => /update public\.properties/i.test(sql));
+      expect(updates).toHaveLength(1);
+      expect(updates[0]).not.toMatch(/acquisition_status/);
+      expect(store.properties[0].acquisition_status).toBe('active');
+    });
+
+    it('marks override status entries in the Timeline without rules or reasons', async () => {
+      store.timelineRows = [
+        { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-2', kind: 'status_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_status', status: 'override', title: 'complete', secondary: 'active', event_ts: new Date('2026-09-21T03:00:00Z') },
+        { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-1', kind: 'status_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_status', title: 'active', secondary: 'complete', event_ts: new Date('2026-09-20T03:00:00Z') },
+      ];
+      await withApi(async (baseUrl) => {
+        const body = await (await getTimeline(baseUrl)).json();
+        expect(body.data.map((entry: { summary: string }) => entry.summary)).toEqual([
+          'Acquisition status changed from Complete to Active (override)',
+          'Acquisition status changed from Active to Complete',
+        ]);
+      });
+      const timelineSql = String(timelineQueryCalls()[0][0]);
+      expect(timelineSql).toContain('h.is_override');
+      expect(timelineSql).not.toMatch(/\bh\.(reason|overridden_rules)\b/);
+    });
+  });
+
+  describe('negotiation exception (L-04)', () => {
+    it('marks a stage override (the negotiation exception) in the Timeline without rules or reasons', async () => {
+      store.timelineRows = [
+        { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-2', kind: 'stage_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_stage', status: 'override', title: 'negotiation', secondary: 'commercial_review', event_ts: new Date('2026-09-21T03:00:00Z') },
+        { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-1', kind: 'stage_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_stage', title: 'documentation', secondary: 'negotiation', event_ts: new Date('2026-09-20T03:00:00Z') },
+      ];
+      await withApi(async (baseUrl) => {
+        const body = await (await getTimeline(baseUrl)).json();
+        expect(body.data.map((entry: { summary: string }) => entry.summary)).toEqual([
+          'Acquisition stage changed from Negotiation to Commercial review (override)',
+          'Acquisition stage changed from Documentation to Negotiation',
+        ]);
+        expect(JSON.stringify(body.data)).not.toContain('negotiation_unresolved_exit');
+      });
+    });
+  });
+
+  describe('legacy remediation (L-06)', () => {
+    function post(baseUrl: string, step: string, body: unknown, headers: Record<string, string> = AUTH) {
+      return fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/remediation/${step}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      });
+    }
+
+    function remediationCalls() {
+      return actorQuery.mock.calls.filter(([sql]) => /_property_stage_remediation/.test(String(sql)));
+    }
+
+    it('calls each remediation function with its parameters', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await post(baseUrl, 'start', {})).status).toBe(201);
+        expect((await post(baseUrl, 'escalate', { reason: 'Survey missing' })).status).toBe(200);
+        expect((await post(baseUrl, 'return-to-review', { reason: 'Survey found' })).status).toBe(200);
+        expect(
+          (
+            await post(baseUrl, 'resolve', {
+              resultingStage: 'documentation',
+              expectedStage: 'withdrawn',
+              reason: 'Survey decides',
+              evidence: 'Survey 2024',
+              evidenceDocumentId: EXECUTED_DOC_A,
+            })
+          ).status,
+        ).toBe(200);
+        expect((await post(baseUrl, 'reopen', { reason: 'Owner disputes' })).status).toBe(200);
+      });
+      expect(remediationCalls().map(([sql, params]) => [String(sql).match(/public\.(\w+)/)?.[1], params])).toEqual([
+        ['start_property_stage_remediation', [PROPERTY_A]],
+        ['escalate_property_stage_remediation', [PROPERTY_A, 'Survey missing']],
+        ['return_property_stage_remediation_to_review', [PROPERTY_A, 'Survey found']],
+        ['resolve_property_stage_remediation', [PROPERTY_A, 'documentation', 'Survey decides', 'Survey 2024', EXECUTED_DOC_A, null, 'withdrawn']],
+        ['reopen_property_stage_remediation', [PROPERTY_A, 'Owner disputes']],
+      ]);
+    });
+
+    it('validates requests before calling any function and knows only the defined steps', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await post(baseUrl, 'resolve', { reason: 'x', evidence: 'y' })).status).toBe(400);
+        // L-07: the stage the screen showed is required.
+        expect((await post(baseUrl, 'resolve', { resultingStage: 'documentation', reason: 'x', evidence: 'y' })).status).toBe(400);
+        expect((await post(baseUrl, 'resolve', { resultingStage: 'resolved', reason: 'x', evidence: 'y' })).status).toBe(400);
+        expect((await post(baseUrl, 'resolve', { resultingStage: 'documentation', evidenceDocumentId: 'nope' })).status).toBe(400);
+        expect((await post(baseUrl, 'escalate', { reason: 'x'.repeat(2001) })).status).toBe(400);
+        expect((await post(baseUrl, 'override', { reason: 'x' })).status).toBe(404);
+        expect((await post(baseUrl, 'convert', { reason: 'x' })).status).toBe(404);
+      });
+      expect(remediationCalls()).toHaveLength(0);
+    });
+
+    it.each([
+      ['42501', 403, "You do not have permission to remediate this property's legacy stage"],
+      ['22023', 422, 'Supporting evidence is required to resolve a legacy stage'],
+      ['22023', 422, 'No remediation cycle of this property is UNDER_REVIEW'],
+      ['P0002', 404, 'Property not found'],
+    ])('maps a %s refusal from the function to %i', async (code, status, message) => {
+      store.remediationError = { code, message };
+      await withApi(async (baseUrl) => {
+        const response = await post(baseUrl, 'resolve', { resultingStage: 'documentation', expectedStage: 'withdrawn', reason: 'x', evidence: 'y' });
+        expect(response.status).toBe(status);
+        expect((await response.json()).error.message).toBe(message);
+      });
+    });
+
+    it('requires authentication', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await post(baseUrl, 'start', {}, { 'Content-Type': 'application/json' })).status).toBe(401);
+      });
+      expect(remediationCalls()).toHaveLength(0);
+    });
+
+    it('lists the queue only for an organization member', async () => {
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/remediations?organizationId=${ORG_B}`, { headers: AUTH });
+        expect(response.status).toBe(403);
+        expect((await fetch(`${baseUrl}/api/v1/ops/remediations`, { headers: AUTH })).status).toBe(400);
+      });
+    });
+  });
+
+  describe('lifecycle concurrency (L-07)', () => {
+    function post(baseUrl: string, path: string, body: Record<string, unknown>) {
+      return fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/${path}`, {
+        method: 'POST',
+        headers: AUTH,
+        body: JSON.stringify(body),
+      });
+    }
+
+    function lifecycleCalls() {
+      return actorQuery.mock.calls.filter(([sql]) => /transition_property_(stage|status)|resolve_property_stage_remediation/.test(String(sql)));
+    }
+
+    it('Q-L07-API = A: requires the value the screen showed, for stage, status, and resolve, before calling any function', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await post(baseUrl, 'stage-transitions', { targetStage: 'initial_contact' })).status).toBe(400);
+        expect((await post(baseUrl, 'stage-transitions', { targetStage: 'initial_contact', expectedStage: null })).status).toBe(400);
+        expect((await post(baseUrl, 'remediation/resolve', { resultingStage: 'documentation', reason: 'x', evidence: 'y' })).status).toBe(400);
+        expect(
+          (await post(baseUrl, 'remediation/resolve', { resultingStage: 'documentation', expectedStage: '', reason: 'x', evidence: 'y' })).status,
+        ).toBe(400);
+        expect((await post(baseUrl, 'stage-transitions', { targetStage: 'initial_contact', expectedStage: 'nope' })).status).toBe(400);
+        expect((await post(baseUrl, 'status-transitions', { targetStatus: 'on_hold' })).status).toBe(400);
+        expect((await post(baseUrl, 'status-transitions', { targetStatus: 'on_hold', expectedStatus: 'paused' })).status).toBe(400);
+      });
+      expect(lifecycleCalls()).toHaveLength(0);
+    });
+
+    it.each([
+      ['stage-transitions', { targetStage: 'initial_contact', expectedStage: 'identified' }, 'acquisition_stage', 'documentation', 'identified'],
+      ['status-transitions', { targetStatus: 'on_hold', expectedStatus: 'active' }, 'acquisition_status', 'withdrawn', 'active'],
+      ['remediation/resolve', { resultingStage: 'documentation', expectedStage: 'withdrawn', reason: 'x', evidence: 'y' }, 'acquisition_stage', 'documentation', 'withdrawn'],
+    ] as const)('returns a stale %s as 409 lifecycle_conflict naming the field and the current and stale values', async (path, body, field, current, expected) => {
+      const conflict = Object.assign(new Error(`The value is now ${current} (this screen showed ${expected}); reload before retrying`), {
+        code: '40001',
+        detail: JSON.stringify({ conflict: 'lifecycle', field, current, expected }),
+      });
+      actorQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+        if (/transition_property_(stage|status)|resolve_property_stage_remediation/.test(sql)) throw conflict;
+        return handleActorQuery(sql, params);
+      });
+      await withApi(async (baseUrl) => {
+        const response = await post(baseUrl, path, body);
+        expect(response.status).toBe(409);
+        expect((await response.json()).error).toEqual({
+          code: 'lifecycle_conflict',
+          message: conflict.message,
+          details: { conflict: 'lifecycle', field, current, expected },
+        });
+      });
+      expect(store.properties[0]).toMatchObject({ acquisition_stage: 'identified', acquisition_status: 'active' });
+    });
+
+    it('keeps validation, authority, and not-found refusals distinct from a conflict', async () => {
+      for (const [code, status] of [
+        ['22023', 422],
+        ['42501', 403],
+        ['P0002', 404],
+      ] as const) {
+        store.stageTransitionError = { code, message: `refused ${code}` };
+        await withApi(async (baseUrl) => {
+          const response = await post(baseUrl, 'stage-transitions', { targetStage: 'initial_contact', expectedStage: 'identified' });
+          expect(response.status).toBe(status);
+          expect((await response.json()).error.code).not.toBe('lifecycle_conflict');
+        });
+      }
+    });
   });
 });

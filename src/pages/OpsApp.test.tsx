@@ -603,4 +603,213 @@ describe('OpsApp property workflow', () => {
     expect(screen.queryByRole('heading', { name: 'Interactions' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Interaction notes')).not.toBeInTheDocument();
   });
+
+  it('changes the stage through the stage transition, asking for a reason and showing a refusal', async () => {
+    // NCP-00118 has no negotiation, so no negotiation exception applies (L-04).
+    const propertyId = '70000000-0000-4000-8000-000000000002';
+    const transitionSpy = vi.spyOn(operationsApi, 'transitionPropertyStage');
+    const updateSpy = vi.spyOn(operationsApi, 'updateProperty');
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
+    const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
+
+    // Backward (Commercial review → Documentation) without a reason is refused and nothing changes.
+    expect(within(lifecycle).queryByLabelText('Reason for stage change')).not.toBeInTheDocument();
+    await user.selectOptions(within(lifecycle).getByLabelText('Acquisition stage'), 'documentation');
+    await user.click(within(lifecycle).getByRole('button', { name: 'Change stage' }));
+    expect(await within(lifecycle).findByText(/A reason is required/)).toHaveClass('form-error');
+    expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('commercial_review');
+
+    await user.type(within(lifecycle).getByLabelText('Reason for stage change'), 'Missing title copy');
+    await user.click(within(lifecycle).getByRole('button', { name: 'Change stage' }));
+    await waitFor(() => expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Stage Documentation'));
+    expect(transitionSpy).toHaveBeenLastCalledWith(propertyId, {
+      targetStage: 'documentation',
+      expectedStage: 'commercial_review',
+      reason: 'Missing title copy',
+    });
+    expect(updateSpy).not.toHaveBeenCalled();
+    expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('documentation');
+    transitionSpy.mockRestore();
+    updateSpy.mockRestore();
+  });
+
+  it('shows the negotiation-exception refusal without the override, and leaves negotiation with it', async () => {
+    // NCP-00102 is in negotiation with an open negotiation (L-04).
+    const propertyId = '70000000-0000-4000-8000-000000000001';
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+    const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
+    await user.selectOptions(within(lifecycle).getByLabelText('Acquisition stage'), 'commercial_review');
+    await user.type(within(lifecycle).getByLabelText('Reason for stage change (optional)'), 'Terms agreed verbally');
+    await user.click(within(lifecycle).getByRole('button', { name: 'Change stage' }));
+    expect(await within(lifecycle).findByText(/requires an override \(negotiation_unresolved_exit\)/)).toHaveClass('form-error');
+    expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('negotiation');
+
+    await user.click(within(lifecycle).getByLabelText(/Use the negotiation exception/));
+    await user.click(within(lifecycle).getByRole('button', { name: 'Change stage' }));
+    await waitFor(() => expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Stage Commercial review'));
+    expect(await screen.findByText('Acquisition stage changed from Negotiation to Commercial review (override)')).toBeVisible();
+  });
+
+  // Concurrency and UI integration (L-07).
+  async function openProperty118() {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
+    const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
+    return { user, lifecycle, propertyId: '70000000-0000-4000-8000-000000000002' };
+  }
+
+  it('keeps the drawer open after a lifecycle change and refreshes the displayed state and the Timeline', async () => {
+    const { user, lifecycle } = await openProperty118();
+    expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Stage Commercial review · Status Active');
+    await user.selectOptions(within(lifecycle).getByLabelText('Acquisition stage'), 'legal_review');
+    await user.click(within(lifecycle).getByRole('button', { name: 'Change stage' }));
+    await waitFor(() => expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Stage Legal review'));
+    expect(await screen.findByText('Acquisition stage changed from Commercial review to Legal review')).toBeVisible();
+    // The list behind the drawer shows the new stage too.
+    expect(screen.getByRole('button', { name: /NCP-00118/ })).toHaveTextContent('Legal review');
+
+    const refreshed = await screen.findByRole('region', { name: 'Lifecycle' });
+    await user.selectOptions(within(refreshed).getByLabelText('Acquisition status'), 'on_hold');
+    await user.click(within(refreshed).getByRole('button', { name: 'Change status' }));
+    await waitFor(() => expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Status On hold'));
+    expect(await screen.findByText('Acquisition status changed from Active to On hold')).toBeVisible();
+  });
+
+  it('shows a stale-screen conflict with the current and stale values, reloads, and records nothing from the stale attempt', async () => {
+    const { user, lifecycle, propertyId } = await openProperty118();
+    // Another user moves the property after this screen was loaded.
+    await operationsApi.transitionPropertyStage(propertyId, { targetStage: 'legal_review', expectedStage: 'commercial_review' });
+
+    await user.selectOptions(within(lifecycle).getByLabelText('Acquisition stage'), 'signing');
+    await user.click(within(lifecycle).getByRole('button', { name: 'Change stage' }));
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('Not saved: the acquisition stage changed to Legal review while this screen showed Commercial review');
+    // The display is reconciled with the server, not the attempted value.
+    await waitFor(() => expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Stage Legal review'));
+    expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('legal_review');
+    const summaries = (await operationsApi.getPropertyTimeline(propertyId)).map((entry) => entry.summary);
+    expect(summaries).toContain('Acquisition stage changed from Commercial review to Legal review');
+    expect(summaries.some((summary) => summary.includes('Signing'))).toBe(false);
+
+    // Retrying from the reloaded screen works.
+    const reloaded = await screen.findByRole('region', { name: 'Lifecycle' });
+    await user.selectOptions(within(reloaded).getByLabelText('Acquisition stage'), 'signing');
+    await user.click(within(reloaded).getByRole('button', { name: 'Change stage' }));
+    await waitFor(() => expect(screen.getByLabelText('Current lifecycle')).toHaveTextContent('Stage Signing'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('offers a status override only where a designated rule applies', async () => {
+    const { user, lifecycle } = await openProperty118();
+    await user.selectOptions(within(lifecycle).getByLabelText('Acquisition status'), 'on_hold');
+    expect(within(lifecycle).queryByLabelText(/Override:/)).not.toBeInTheDocument();
+    await user.selectOptions(within(lifecycle).getByLabelText('Acquisition status'), 'complete');
+    expect(within(lifecycle).getByLabelText(/Override: completion away from Payment \/ closing/)).toBeInTheDocument();
+  });
+
+  it('offers a negotiator only later stages and pause/resume, and legal no lifecycle controls', async () => {
+    actAs('negotiator');
+    const { lifecycle } = await openProperty118();
+    const stageOptions = [...within(lifecycle).getByLabelText('Acquisition stage').querySelectorAll('option')].map((option) => option.getAttribute('value'));
+    expect(stageOptions).toEqual(['', 'legal_review', 'agreement_preparation', 'signing', 'payment_closing']);
+    const statusOptions = [...within(lifecycle).getByLabelText('Acquisition status').querySelectorAll('option')].map((option) => option.getAttribute('value'));
+    expect(statusOptions).toEqual(['', 'on_hold']);
+  });
+
+  it.each(['legal_documentation', 'finance', 'viewer'])('shows %s the lifecycle state without lifecycle controls', async (role) => {
+    actAs(role);
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
+    expect(await screen.findByLabelText('Current lifecycle')).toHaveTextContent('Stage Commercial review · Status Active');
+    expect(screen.queryByRole('region', { name: 'Lifecycle' })).not.toBeInTheDocument();
+  });
+
+  it('offers no stage control on a legacy stage, only the status control and remediation', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00077/ }));
+    const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
+    expect(within(lifecycle).queryByLabelText('Acquisition stage')).not.toBeInTheDocument();
+    expect(within(lifecycle).getByLabelText('Acquisition status')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Legacy remediation' })).toBeInTheDocument();
+  });
+
+  // Legacy stage remediation (L-06): the seeded NCP-00077 is on the legacy stage withdrawn.
+  async function openLegacyProperty() {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    expect(await screen.findByText(/Withdrawn · Needs review/)).toBeVisible();
+    await user.click(await screen.findByRole('button', { name: /NCP-00077/ }));
+    const section = await screen.findByRole('region', { name: 'Legacy remediation' });
+    return { user, section };
+  }
+
+  it('corrects a legacy stage only through remediation, requiring a reason and supporting evidence', async () => {
+    const propertyId = '70000000-0000-4000-8000-000000000004';
+    const { user, section } = await openLegacyProperty();
+    // No ordinary stage control for a legacy value.
+    expect(screen.queryByLabelText('Acquisition stage')).not.toBeInTheDocument();
+    expect(within(section).getByText(/Not reviewed/)).toBeVisible();
+
+    await user.click(within(section).getByRole('button', { name: 'Start review' }));
+    expect(await within(section).findByText('Cycle 1 · Under review')).toBeVisible();
+
+    await user.selectOptions(within(section).getByLabelText('Corrected stage'), 'documentation');
+    await user.click(within(section).getByRole('button', { name: 'Resolve' }));
+    expect(await within(section).findByText(/A reason is required to resolve/)).toHaveClass('form-error');
+    await user.type(within(section).getByLabelText('Remediation reason'), 'Survey confirms documentation');
+    await user.click(within(section).getByRole('button', { name: 'Resolve' }));
+    expect(await within(section).findByText(/Supporting evidence is required/)).toHaveClass('form-error');
+    expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('withdrawn');
+
+    expect(
+      [...within(section).getByLabelText('Corrected stage').querySelectorAll('option')].map((option) => option.getAttribute('value')),
+    ).not.toEqual(expect.arrayContaining(['on_hold', 'withdrawn', 'acquisition_complete']));
+    await user.type(within(section).getByLabelText('Supporting evidence'), 'Survey report 2024-11');
+    await user.click(within(section).getByRole('button', { name: 'Resolve' }));
+    await waitFor(async () => expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('documentation'));
+    const [cycle] = await operationsApi.listPropertyRemediations(propertyId);
+    expect(cycle).toMatchObject({ state: 'RESOLVED', resolution_reason: 'Survey confirms documentation', evidence: 'Survey report 2024-11' });
+  });
+
+  it('requires a reason to escalate (Q-3) but not to return to review (Q-4)', async () => {
+    const propertyId = '70000000-0000-4000-8000-000000000004';
+    const { user, section } = await openLegacyProperty();
+    await user.click(within(section).getByRole('button', { name: 'Start review' }));
+    await user.click(await within(section).findByRole('button', { name: 'Escalate (evidence insufficient)' }));
+    expect(await within(section).findByText(/A reason is required to escalate/)).toHaveClass('form-error');
+    await user.type(within(section).getByLabelText('Remediation reason'), 'Survey missing');
+    await user.click(within(section).getByRole('button', { name: 'Escalate (evidence insufficient)' }));
+    expect(await within(section).findByText('Cycle 1 · Requires escalation')).toBeVisible();
+
+    expect(within(section).getByLabelText('Remediation reason (optional)')).toHaveValue('');
+    await user.click(within(section).getByRole('button', { name: 'Return to review' }));
+    expect(await within(section).findByText('Cycle 1 · Under review')).toBeVisible();
+    const [cycle] = await operationsApi.listPropertyRemediations(propertyId);
+    expect(cycle.events?.map((event) => [event.action, event.reason])).toEqual([
+      ['review_started', null],
+      ['escalated', 'Survey missing'],
+      ['returned_to_review', null],
+    ]);
+    expect((await operationsApi.getProperty(propertyId)).acquisition_stage).toBe('withdrawn');
+  });
+
+  it.each(['negotiator', 'legal_documentation', 'finance', 'viewer'])('shows the legacy remediation state to %s without any remediation action', async (role) => {
+    actAs(role);
+    const { section } = await openLegacyProperty();
+    expect(within(section).getByText(/Needs review/)).toBeVisible();
+    expect(within(section).queryByRole('button')).not.toBeInTheDocument();
+  });
 });

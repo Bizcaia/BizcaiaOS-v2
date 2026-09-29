@@ -36,6 +36,29 @@ export async function asUser<T>(
   }
 }
 
+/**
+ * Test fixture for a property that must start somewhere other than the
+ * identified stage (L-05 limits application creation to identified/active).
+ * The insert runs as a controlled owner operation, with actorId recorded as
+ * the acting user so lifecycle history keeps the same creator.
+ */
+export async function insertPropertyFixture(actorId: string, sql: string, params: unknown[]): Promise<string> {
+  const client = new pg.Client({ connectionString: requireDatabaseEnv().migrateUrl });
+  await client.connect();
+  try {
+    await client.query('begin');
+    await client.query("select set_config('app.user_id', $1, true)", [actorId]);
+    const result = await client.query<{ id: string }>(sql, params);
+    await client.query('commit');
+    return result.rows[0].id;
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    await client.end();
+  }
+}
+
 export async function expectSqlError(operation: () => Promise<unknown>, code: string) {
   try {
     await operation();

@@ -11,15 +11,56 @@ export const idParamsSchema = z.object({ id: z.uuid() });
 export const organizationAndIdParamsSchema = z.object({ organizationId: z.uuid(), id: z.uuid() });
 
 export const createProjectSchema = z.object({ organizationId: z.uuid(), code: z.string().trim().min(2).max(40), name: z.string().trim().min(2).max(160), description: z.string().trim().max(2000).optional(), status: projectStatusSchema.default('planning'), acquisitionTarget: z.number().nonnegative().optional(), managerUserId: z.uuid().nullable().optional(), startsOn: z.string().date().nullable().optional(), targetCompletionOn: z.string().date().nullable().optional() });
-export const createPropertySchema = z.object({ organizationId: z.uuid(), projectId: z.uuid(), propertyReference: z.string().trim().min(1).max(80), titleNumber: z.string().trim().max(120).nullable().optional(), taxDeclaration: z.string().trim().max(120).nullable().optional(), lotNumber: z.string().trim().max(120).nullable().optional(), areaHectares: z.number().nonnegative().nullable().optional(), municipality: z.string().trim().max(120).nullable().optional(), province: z.string().trim().max(120).nullable().optional(), barangay: z.string().trim().max(120).nullable().optional(), acquisitionStage: acquisitionStageSchema.default('identified'), assignedNegotiatorId: z.uuid().nullable().optional(), assignedManagerId: z.uuid().nullable().optional(), risk: propertyRiskSchema.default('medium') });
+// P-6 (L-05): identified is the only creation stage; status always starts active.
+export const createPropertySchema = z.object({ organizationId: z.uuid(), projectId: z.uuid(), propertyReference: z.string().trim().min(1).max(80), titleNumber: z.string().trim().max(120).nullable().optional(), taxDeclaration: z.string().trim().max(120).nullable().optional(), lotNumber: z.string().trim().max(120).nullable().optional(), areaHectares: z.number().nonnegative().nullable().optional(), municipality: z.string().trim().max(120).nullable().optional(), province: z.string().trim().max(120).nullable().optional(), barangay: z.string().trim().max(120).nullable().optional(), acquisitionStage: z.literal('identified', { error: 'A property can only be created in the identified stage' }).default('identified'), assignedNegotiatorId: z.uuid().nullable().optional(), assignedManagerId: z.uuid().nullable().optional(), risk: propertyRiskSchema.default('medium') });
 export const updatePropertySchema = createPropertySchema.partial().omit({ organizationId: true, projectId: true, propertyReference: true }).extend({
-  acquisitionStatus: acquisitionStatusSchema.optional(),
+  // The stage changes only through a stage transition (L-02).
+  acquisitionStage: z.never({ error: 'Use a stage transition to change the acquisition stage' }).optional(),
+  // The status changes only through a status transition (L-03).
+  acquisitionStatus: z.never({ error: 'Use a status transition to change the acquisition status' }).optional(),
   legalStatus: z.enum(['unknown','clear','under_review','blocked']).optional(),
   documentationStatus: z.string().trim().max(80).optional(),
   paymentStatus: z.string().trim().max(80).optional(),
   readinessPercent: z.number().int().min(0).max(100).optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
+
+// Legacy values are accepted here so the database can refuse them with a clear
+// message; the transition function is the authority for every stage rule.
+// expectedStage / expectedStatus: the value the caller's screen showed (D-X1,
+// L-07). A stale value is refused as a lifecycle conflict (409).
+export const stageTransitionSchema = z.object({
+  targetStage: acquisitionStageSchema,
+  expectedStage: acquisitionStageSchema,
+  reason: z.string().max(2000).nullable().optional(),
+  // Only a designated rule (the negotiation exception, L-04) can be overridden.
+  override: z.boolean().optional(),
+});
+
+// The transition function is the authority for every status rule (N-2).
+export const statusTransitionSchema = z.object({
+  targetStatus: acquisitionStatusSchema,
+  expectedStatus: acquisitionStatusSchema,
+  reason: z.string().max(2000).nullable().optional(),
+  override: z.boolean().optional(),
+});
+
+// Legacy stage remediation (L-06). The remediation functions are the
+// authority for every rule (state, authority, reason, evidence, integrity).
+export const remediationStepSchema = z.object({
+  reason: z.string().max(2000).nullable().optional(),
+});
+
+export const remediationResolveSchema = z.object({
+  resultingStage: acquisitionStageSchema,
+  expectedStage: acquisitionStageSchema,
+  reason: z.string().max(2000).nullable().optional(),
+  evidence: z.string().max(4000).nullable().optional(),
+  evidenceDocumentId: z.uuid().nullable().optional(),
+  evidenceInteractionId: z.uuid().nullable().optional(),
+});
+
+export const remediationQueueQuerySchema = z.object({ organizationId: z.uuid() });
 
 export const ownerTypeSchema = z.enum(['individual', 'corporate', 'estate', 'government', 'other']);
 export const ownerListQuerySchema = z.object({ organizationId: z.uuid() });
