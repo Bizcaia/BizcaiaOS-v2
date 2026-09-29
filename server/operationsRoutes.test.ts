@@ -42,6 +42,7 @@ type Store = {
   agreementSignatures: Array<Record<string, unknown>>;
   timezone: string;
   timelineRows: Array<Record<string, unknown>>;
+  interactions: Array<Record<string, unknown>>;
 };
 
 const EXECUTED_DOC_A = 'e0000000-0000-4000-8000-00000000000a';
@@ -153,6 +154,7 @@ function seedStore(role: Role = 'system_admin'): Store {
     agreementSignatures: [],
     timezone: 'Asia/Manila',
     timelineRows: [],
+    interactions: [],
   };
 }
 
@@ -250,6 +252,56 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
     // are supplied directly so the route's gate, validation, and mapping can
     // be exercised.
     return { rows: store.timelineRows, rowCount: store.timelineRows.length };
+  }
+  if (normalized.startsWith('insert into public.interactions')) {
+    const [organizationId, propertyId, ownerId, interactionType, notes, occurredAt, recordedBy] = params as Array<string | null>;
+    // Simulates enforce_interaction_scope(): owner linked at recording time,
+    // and a supplied occurred_at not in the future (zero tolerance).
+    if (ownerId && !store.links.some((link) => link.property_id === propertyId && link.owner_id === ownerId)) {
+      throw sqlError('23514', 'Interaction owner must be an existing owner of the property');
+    }
+    if (occurredAt && new Date(occurredAt).getTime() > Date.now()) {
+      throw sqlError('23514', 'Interactions must record something that already happened; occurred_at is in the future');
+    }
+    const timestamp = new Date().toISOString();
+    const row = {
+      id: crypto.randomUUID(),
+      organization_id: organizationId,
+      property_id: propertyId,
+      owner_id: ownerId,
+      interaction_type: interactionType,
+      notes,
+      occurred_at: occurredAt ?? timestamp,
+      recorded_by_user_id: recordedBy,
+      created_at: timestamp,
+      updated_at: timestamp,
+      archived_at: null,
+    };
+    store.interactions.push(row);
+    return { rows: [{ id: row.id }], rowCount: 1 };
+  }
+  if (normalized.includes('from public.interactions i')) {
+    let rows: Array<Record<string, unknown>> = store.interactions.map((interaction) => ({
+      ...interaction,
+      owner_name: store.owners.find((owner) => owner.id === interaction.owner_id)?.display_name ?? null,
+      recorded_by_name: TASK_USER_NAMES[interaction.recorded_by_user_id as string] ?? null,
+    }));
+    if (normalized.includes('where i.id=$1')) {
+      rows = rows.filter((interaction) => interaction.id === params[0]);
+    } else if (normalized.includes('i.property_id=$1')) {
+      rows = rows.filter((interaction) => interaction.property_id === params[0] && interaction.archived_at == null);
+    }
+    return { rows, rowCount: rows.length };
+  }
+  if (normalized.startsWith('select property_id from public.interactions where id=$1')) {
+    const interaction = store.interactions.find((entry) => entry.id === params[0]);
+    return { rows: interaction ? [interaction] : [], rowCount: interaction ? 1 : 0 };
+  }
+  if (normalized.startsWith('update public.interactions')) {
+    const interaction = store.interactions.find((entry) => entry.id === params[0]);
+    if (!interaction) return { rows: [], rowCount: 0 };
+    interaction.archived_at = interaction.archived_at ?? new Date().toISOString();
+    return { rows: [interaction], rowCount: 1 };
   }
   if (normalized.startsWith('select o.timezone')) {
     // Simulates PostgreSQL rejecting an unrecognized time zone name.
@@ -2310,5 +2362,234 @@ describe('property workflow API', () => {
     });
     const statements = actorQuery.mock.calls.map(([sql]) => String(sql));
     expect(statements.some((sql) => /\b(insert|update|delete)\b/i.test(sql))).toBe(false);
+  });
+
+  // Interactions (Gate A). Scope and tenant rules are proven against real
+  // PostgreSQL; these cover the route gate, validation, and mapping.
+  function interactionsUrl(baseUrl: string, propertyId = PROPERTY_A) {
+    return `${baseUrl}/api/v1/ops/properties/${propertyId}/interactions`;
+  }
+
+  function postInteraction(baseUrl: string, body: Record<string, unknown>, propertyId = PROPERTY_A) {
+    return fetch(interactionsUrl(baseUrl, propertyId), { method: 'POST', headers: AUTH, body: JSON.stringify(body) });
+  }
+
+  function archiveInteraction(baseUrl: string, id: string, body: Record<string, unknown> = { archived: true }) {
+    return fetch(`${baseUrl}/api/v1/ops/interactions/${id}`, { method: 'PATCH', headers: AUTH, body: JSON.stringify(body) });
+  }
+
+  function linkOwnerA() {
+    store.links.push({ property_id: PROPERTY_A, owner_id: OWNER_A, ownership_percent: 100, is_primary: true, created_at: '2026-01-01T00:00:00Z' });
+  }
+
+  it.each(['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator'] as const)(
+    'lets %s record, list, and archive an interaction',
+    async (role) => {
+      store.role = role;
+      linkOwnerA();
+      await withApi(async (baseUrl) => {
+        const created = await postInteraction(baseUrl, {
+          interactionType: 'site_visit',
+          notes: '  Walked the boundary with the owner.  ',
+          ownerId: OWNER_A,
+        });
+        const body = await created.json();
+        expect(created.status).toBe(201);
+        expect(body.data).toMatchObject({
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: OWNER_A,
+          owner_name: 'Rosa Mendoza',
+          interaction_type: 'site_visit',
+          notes: 'Walked the boundary with the owner.',
+          recorded_by_user_id: USER_ID,
+          recorded_by_name: 'Test User',
+          archived_at: null,
+        });
+
+        const listed = await fetch(interactionsUrl(baseUrl), { headers: AUTH });
+        expect(listed.status).toBe(200);
+        expect((await listed.json()).data.map((row: { id: string }) => row.id)).toEqual([body.data.id]);
+
+        const archived = await archiveInteraction(baseUrl, body.data.id);
+        expect(archived.status).toBe(200);
+        expect((await archived.json()).data.archived_at).not.toBeNull();
+        expect((await (await fetch(interactionsUrl(baseUrl), { headers: AUTH })).json()).data).toEqual([]);
+      });
+    },
+  );
+
+  it.each(['legal_documentation', 'finance', 'viewer'] as const)(
+    'returns 403 to %s for listing, recording, and archiving',
+    async (role) => {
+      // The mock has no RLS, so the route's own role check is what answers
+      // PATCH here. Against PostgreSQL these roles cannot read the row, so a
+      // live PATCH returns 404 before the role check is reached.
+      store.interactions.push({
+        id: 'c0000000-0000-4000-8000-000000000001',
+        organization_id: ORG_A,
+        property_id: PROPERTY_A,
+        owner_id: null,
+        interaction_type: 'call',
+        notes: 'Existing call',
+        occurred_at: '2026-09-01T00:00:00.000Z',
+        recorded_by_user_id: USER_ID,
+        created_at: '2026-09-01T00:00:00.000Z',
+        updated_at: '2026-09-01T00:00:00.000Z',
+        archived_at: null,
+      });
+      store.role = role;
+      await withApi(async (baseUrl) => {
+        expect((await fetch(interactionsUrl(baseUrl), { headers: AUTH })).status).toBe(403);
+        expect((await postInteraction(baseUrl, { interactionType: 'call', notes: 'Denied' })).status).toBe(403);
+        expect((await archiveInteraction(baseUrl, 'c0000000-0000-4000-8000-000000000001')).status).toBe(403);
+      });
+      expect(store.interactions).toHaveLength(1);
+      expect(store.interactions[0].archived_at).toBeNull();
+    },
+  );
+
+  it('returns 404 for a foreign or unknown property and an unknown interaction', async () => {
+    await withApi(async (baseUrl) => {
+      expect((await fetch(interactionsUrl(baseUrl, PROPERTY_B), { headers: AUTH })).status).toBe(404);
+      expect((await postInteraction(baseUrl, { interactionType: 'call', notes: 'x' }, PROPERTY_B)).status).toBe(404);
+      expect((await postInteraction(baseUrl, { interactionType: 'call', notes: 'x' }, crypto.randomUUID())).status).toBe(404);
+      expect((await archiveInteraction(baseUrl, crypto.randomUUID())).status).toBe(404);
+    });
+    expect(store.interactions).toHaveLength(0);
+  });
+
+  it.each([
+    ['type note', { interactionType: 'note', notes: 'x' }],
+    ['type follow_up', { interactionType: 'follow_up', notes: 'x' }],
+    ['a missing type', { notes: 'x' }],
+    ['missing notes', { interactionType: 'call' }],
+    ['empty notes', { interactionType: 'call', notes: '' }],
+    ['whitespace-only notes', { interactionType: 'call', notes: ' \n\t ' }],
+    ['notes over 4000 characters', { interactionType: 'call', notes: 'x'.repeat(4001) }],
+    ['a non-ISO occurredAt', { interactionType: 'call', notes: 'x', occurredAt: '2026-09-01 10:00' }],
+    ['a malformed ownerId', { interactionType: 'call', notes: 'x', ownerId: 'not-a-uuid' }],
+  ])('rejects %s with 400', async (_label, body) => {
+    await withApi(async (baseUrl) => {
+      expect((await postInteraction(baseUrl, body)).status).toBe(400);
+    });
+    expect(store.interactions).toHaveLength(0);
+  });
+
+  it('accepts all five locked types and 4000-character notes', async () => {
+    await withApi(async (baseUrl) => {
+      for (const interactionType of ['call', 'meeting', 'site_visit', 'message', 'other']) {
+        expect((await postInteraction(baseUrl, { interactionType, notes: 'x'.repeat(4000) })).status).toBe(201);
+      }
+    });
+    expect(store.interactions.map((row) => row.interaction_type)).toEqual(['call', 'meeting', 'site_visit', 'message', 'other']);
+  });
+
+  it('derives organization, property, and recorder on the server and defaults occurredAt to the server clock', async () => {
+    await withApi(async (baseUrl) => {
+      const response = await postInteraction(baseUrl, {
+        interactionType: 'call',
+        notes: 'Server derives the rest',
+        organizationId: ORG_B,
+        propertyId: PROPERTY_B,
+        recordedByUserId: NEGOTIATOR_ID,
+      });
+      expect(response.status).toBe(201);
+    });
+    expect(store.interactions[0]).toMatchObject({ organization_id: ORG_A, property_id: PROPERTY_A, recorded_by_user_id: USER_ID });
+    const insert = actorQuery.mock.calls.find(([sql]) => String(sql).includes('insert into public.interactions'))!;
+    expect(String(insert[0])).toContain(`coalesce($6::timestamptz, timezone('utc', now()))`);
+    expect((insert[1] as unknown[])[5]).toBeNull();
+  });
+
+  it('returns 422 for an owner not linked to the property and for a future occurredAt', async () => {
+    await withApi(async (baseUrl) => {
+      const unlinked = await postInteraction(baseUrl, { interactionType: 'call', notes: 'x', ownerId: OWNER_A });
+      expect(unlinked.status).toBe(422);
+      expect((await unlinked.json()).error.message).toMatch(/existing owner/);
+
+      const future = await postInteraction(baseUrl, {
+        interactionType: 'call',
+        notes: 'x',
+        occurredAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      expect(future.status).toBe(422);
+      expect((await future.json()).error.message).toMatch(/future/);
+
+      const past = await postInteraction(baseUrl, { interactionType: 'call', notes: 'x', occurredAt: '2026-01-15T09:30:00.000Z' });
+      expect(past.status).toBe(201);
+    });
+  });
+
+  it('only accepts archiving on PATCH, keeps the first archive time, and exposes no DELETE route', async () => {
+    await withApi(async (baseUrl) => {
+      const created = await (await postInteraction(baseUrl, { interactionType: 'meeting', notes: 'Original' })).json();
+      const id = created.data.id;
+      expect((await archiveInteraction(baseUrl, id, { archived: false })).status).toBe(400);
+      expect((await archiveInteraction(baseUrl, id, { notes: 'Rewritten' })).status).toBe(400);
+
+      const first = await (await archiveInteraction(baseUrl, id, { archived: true, notes: 'Rewritten', interactionType: 'call' })).json();
+      expect(first.data).toMatchObject({ notes: 'Original', interaction_type: 'meeting' });
+      const again = await (await archiveInteraction(baseUrl, id)).json();
+      expect(again.data.archived_at).toBe(first.data.archived_at);
+
+      const deleted = await fetch(`${baseUrl}/api/v1/ops/interactions/${id}`, { method: 'DELETE', headers: AUTH });
+      expect(deleted.status).toBe(404);
+    });
+    expect(store.interactions).toHaveLength(1);
+  });
+
+  it('ignores includeArchived on the interaction list', async () => {
+    await withApi(async (baseUrl) => {
+      const created = await (await postInteraction(baseUrl, { interactionType: 'call', notes: 'x' })).json();
+      await archiveInteraction(baseUrl, created.data.id);
+      const listed = await (await fetch(`${interactionsUrl(baseUrl)}?includeArchived=true`, { headers: AUTH })).json();
+      expect(listed.data).toEqual([]);
+    });
+  });
+
+  it('writes nothing outside the interactions table when recording and archiving', async () => {
+    linkOwnerA();
+    const before = { ...store.properties[0] };
+    await withApi(async (baseUrl) => {
+      const created = await (await postInteraction(baseUrl, { interactionType: 'call', notes: 'x', ownerId: OWNER_A })).json();
+      await archiveInteraction(baseUrl, created.data.id);
+    });
+    expect(store.properties[0]).toEqual(before);
+    const writes = actorQuery.mock.calls
+      .map(([sql]) => String(sql).replace(/\s+/g, ' ').trim().toLowerCase())
+      .filter((sql) => /^(insert|update|delete)\b/.test(sql));
+    expect(writes.length).toBe(2);
+    expect(writes.every((sql) => /^(insert into|update) public\.interactions\b/.test(sql))).toBe(true);
+  });
+
+  it('maps interaction rows into Timeline entries without notes', async () => {
+    store.timelineRows = [
+      { ...TIMELINE_ROW_BASE, source_type: 'interaction', source_id: 'int-1', kind: 'interaction', basis: 'occurrence', actor_id: NEGOTIATOR_ID, actor_name: 'Negotiator User', code: 'call', title: 'Rosa Mendoza', event_ts: new Date('2026-09-20T03:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'interaction', source_id: 'int-2', kind: 'interaction', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'site_visit', event_ts: new Date('2026-09-19T03:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'interaction', source_id: 'int-3', kind: 'interaction', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'other', event_ts: new Date('2026-09-18T03:00:00Z') },
+    ];
+    await withApi(async (baseUrl) => {
+      const body = await (await getTimeline(baseUrl)).json();
+      expect(body.data).toEqual([
+        {
+          id: 'interaction:int-1:interaction',
+          kind: 'interaction',
+          source_type: 'interaction',
+          source_id: 'int-1',
+          occurred_at: '2026-09-20T03:00:00.000Z',
+          precision: 'timestamp',
+          basis: 'occurrence',
+          actor: { id: NEGOTIATOR_ID, display_name: 'Negotiator User' },
+          summary: 'Call with Rosa Mendoza',
+          archived: false,
+        },
+        expect.objectContaining({ summary: 'Site visit' }),
+        expect.objectContaining({ summary: 'Other interaction' }),
+      ]);
+    });
+    const timelineSql = String(timelineQueryCalls()[0][0]);
+    expect(timelineSql).toContain(`'interaction', 7`);
+    expect(timelineSql).not.toMatch(/\bi\.notes\b/);
   });
 });

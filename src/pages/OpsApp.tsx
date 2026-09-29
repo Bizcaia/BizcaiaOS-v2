@@ -25,6 +25,8 @@ import {
   type TaskPriority,
   type TaskStatus,
   type TimelineEntry,
+  type Interaction,
+  type InteractionType,
 } from '../api/operationsApi';
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
@@ -132,6 +134,17 @@ const paymentStatusLabels: Record<PaymentStatus, string> = {
 const paymentWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'finance'];
 
 const agreementSignatureWriteRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
+
+// Record, read, and archive share this set; other roles never see the block.
+const interactionRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator'];
+
+const interactionTypeLabels: Record<InteractionType, string> = {
+  call: 'Call',
+  meeting: 'Meeting',
+  site_visit: 'Site visit',
+  message: 'Message',
+  other: 'Other interaction',
+};
 
 type OpsTab = 'dashboard' | 'projects' | 'properties' | 'team';
 
@@ -787,6 +800,7 @@ function PropertyDrawer({
             </>
           )}
         </section>
+        {interactionRoles.includes(role) && <InteractionBlock property={property} owners={linkedOwners} />}
         <NegotiationBlock
           property={property}
           members={members}
@@ -1347,6 +1361,124 @@ function TaskBlock({
           </button>
         </>
       )}
+    </section>
+  );
+}
+
+/**
+ * General stakeholder contact that actually happened (not negotiation
+ * activity). Rendered only for the interaction roles. Interactions are
+ * immutable once recorded; archiving is the only change.
+ */
+function InteractionBlock({ property, owners }: { property: Property; owners: PropertyOwner[] }) {
+  const [interactions, setInteractions] = useState<Interaction[]>([]);
+  const [interactionType, setInteractionType] = useState<InteractionType>('call');
+  const [ownerId, setOwnerId] = useState('');
+  const [occurredAt, setOccurredAt] = useState('');
+  const [notes, setNotes] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const refresh = async () => {
+    setInteractions(await operationsApi.listInteractions(property.id));
+  };
+
+  const run = async (action: () => Promise<unknown>) => {
+    setError('');
+    setSaving(true);
+    try {
+      await action();
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to update interactions');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) => setError(cause instanceof Error ? cause.message : 'Unable to load interactions'));
+  }, [property.id]);
+
+  return (
+    <section className="owner-block">
+      <h3>Interactions</h3>
+      {error && <p className="form-error">{error}</p>}
+      <button type="button" aria-label="Refresh interactions" disabled={saving} onClick={() => void run(async () => undefined)}>
+        Refresh
+      </button>
+      {interactions.length === 0 ? (
+        <p>No interactions recorded yet.</p>
+      ) : (
+        <ul className="owner-list" aria-label="Interaction list">
+          {interactions.map((interaction) => {
+            const label = interactionTypeLabels[interaction.interaction_type];
+            const title = interaction.owner_name ? `${label} with ${interaction.owner_name}` : label;
+            const when = new Date(interaction.occurred_at).toLocaleString();
+            return (
+              <li key={interaction.id}>
+                <strong>{title}</strong>
+                <small>
+                  {when} · Recorded by {interaction.recorded_by_name ?? 'a former member'}
+                </small>
+                <p>{interaction.notes}</p>
+                <button
+                  type="button"
+                  aria-label={`Archive ${title} from ${when}`}
+                  disabled={saving}
+                  onClick={() => void run(() => operationsApi.archiveInteraction(interaction.id))}
+                >
+                  Archive
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <label>
+        Interaction type
+        <select value={interactionType} onChange={(event) => setInteractionType(event.target.value as InteractionType)}>
+          {Object.entries(interactionTypeLabels).map(([key, label]) => (
+            <option key={key} value={key}>{label}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Interaction owner
+        <select value={ownerId} onChange={(event) => setOwnerId(event.target.value)}>
+          <option value="">No specific owner</option>
+          {owners.map((owner) => (
+            <option key={owner.owner_id} value={owner.owner_id}>{owner.display_name}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Occurred at (leave empty for now)
+        <input type="datetime-local" value={occurredAt} onChange={(event) => setOccurredAt(event.target.value)} />
+      </label>
+      <label>
+        Interaction notes
+        <textarea value={notes} onChange={(event) => setNotes(event.target.value)} />
+      </label>
+      <button
+        type="button"
+        disabled={saving || !notes.trim()}
+        onClick={() =>
+          void run(async () => {
+            await operationsApi.createInteraction(property.id, {
+              interactionType,
+              notes,
+              ownerId: ownerId || null,
+              // Empty means the server stamps its own clock; a chosen local time is sent as UTC.
+              ...(occurredAt ? { occurredAt: new Date(occurredAt).toISOString() } : {}),
+            });
+            setNotes('');
+            setOccurredAt('');
+          })
+        }
+      >
+        Record interaction
+      </button>
     </section>
   );
 }

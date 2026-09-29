@@ -221,9 +221,36 @@ export type TimelineKind =
   | 'task_created'
   | 'payment_recorded'
   | 'payment_paid'
-  | 'agreement_signed';
+  | 'agreement_signed'
+  | 'interaction';
 
-export type TimelineSourceType = 'negotiation_event' | 'negotiation' | 'document' | 'task' | 'payment' | 'agreement_signature';
+export type TimelineSourceType =
+  | 'negotiation_event'
+  | 'negotiation'
+  | 'document'
+  | 'task'
+  | 'payment'
+  | 'agreement_signature'
+  | 'interaction';
+
+export type InteractionType = 'call' | 'meeting' | 'site_visit' | 'message' | 'other';
+
+/** An actual contact involving a property and optionally one of its owners; immutable except archiving. */
+export type Interaction = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  owner_id: string | null;
+  owner_name?: string | null;
+  interaction_type: InteractionType;
+  notes: string;
+  occurred_at: string;
+  recorded_by_user_id: string;
+  recorded_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
 
 /** A read-model entry built from an existing record; never stored. */
 export type TimelineEntry = {
@@ -493,6 +520,25 @@ function decoratePayment(payment: PropertyPayment): PropertyPayment {
 
 let demoAgreementSignatures: AgreementSignature[] = [];
 
+let demoInteractions: Interaction[] = [];
+
+const interactionRoles = new Set(['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator']);
+const interactionTypes = new Set<InteractionType>(['call', 'meeting', 'site_visit', 'message', 'other']);
+
+/** Mirrors can_read_interaction()/can_write_interaction(): the four interaction roles. */
+function demoCanUseInteractions(): boolean {
+  const member = demoActorMembership();
+  return !!member && interactionRoles.has(member.role);
+}
+
+function decorateInteraction(interaction: Interaction): Interaction {
+  return {
+    ...interaction,
+    owner_name: interaction.owner_id ? demoOwners.find((owner) => owner.id === interaction.owner_id)?.display_name ?? null : null,
+    recorded_by_name: demoUsers[interaction.recorded_by_user_id] ?? null,
+  };
+}
+
 const agreementSignatureWriteRoles = new Set(['system_admin', 'land_acquisition_manager', 'legal_documentation']);
 
 /** Same fixed role set as documents; no property scoping, no assignee model. */
@@ -595,6 +641,15 @@ const timelineSourceRank: Record<TimelineSourceType, number> = {
   task: 4,
   payment: 5,
   agreement_signature: 6,
+  interaction: 7,
+};
+
+const timelineInteractionTypeLabels: Record<InteractionType, string> = {
+  call: 'Call',
+  meeting: 'Meeting',
+  site_visit: 'Site visit',
+  message: 'Message',
+  other: 'Other interaction',
 };
 
 function timelineMoney(amount: number | string, currency: string | null) {
@@ -733,6 +788,24 @@ function demoPropertyTimeline(property: Property, timeZone: string, page: { limi
       actor: demoTimelineActor(signature.recorded_by_user_id),
       summary: `${ownerName ?? 'Unknown owner'} signed ${documentTitle ?? 'an agreement'}`,
     });
+  }
+  // Only the interaction source is role-filtered; notes are never included.
+  if (demoCanUseInteractions()) {
+    for (const interaction of demoInteractions) {
+      if (interaction.property_id !== property.id || interaction.archived_at || !reached(interaction.occurred_at)) continue;
+      const label = timelineInteractionTypeLabels[interaction.interaction_type] ?? 'Interaction';
+      const ownerName = interaction.owner_id ? demoOwners.find((owner) => owner.id === interaction.owner_id)?.display_name : null;
+      add({
+        kind: 'interaction',
+        source_type: 'interaction',
+        source_id: interaction.id,
+        occurred_at: new Date(interaction.occurred_at).toISOString(),
+        precision: 'timestamp',
+        basis: 'occurrence',
+        actor: demoTimelineActor(interaction.recorded_by_user_id),
+        summary: ownerName ? `${label} with ${ownerName}` : label,
+      });
+    }
   }
 
   // Same keys as the server: calendar day (organization timezone) desc,
@@ -1021,6 +1094,8 @@ export function resetOperationsDemoState() {
   // No seeded signatures: the demo seed has no agreement_executed document,
   // and adding one would change the Documents seed other tests rely on.
   demoAgreementSignatures = [];
+  // No seeded interactions, so the seeded Timeline stays as documented.
+  demoInteractions = [];
 }
 
 resetOperationsDemoState();
@@ -1878,6 +1953,87 @@ export const operationsApi = {
     });
     demoAgreementSignatures[index] = next;
     return next;
+  },
+
+  async listInteractions(propertyId: string) {
+    if (operationsApiMode === 'live') {
+      return request<Interaction[]>(`/ops/properties/${propertyId}/interactions`);
+    }
+    if (!demoProperties.some((entry) => entry.id === propertyId)) throw new Error('Property not found');
+    if (!demoCanUseInteractions()) throw new Error('You do not have permission for this operation');
+    return demoInteractions
+      .filter((interaction) => interaction.property_id === propertyId && !interaction.archived_at)
+      .map(decorateInteraction)
+      .sort(
+        (a, b) =>
+          b.occurred_at.localeCompare(a.occurred_at) || b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id),
+      );
+  },
+
+  async createInteraction(
+    propertyId: string,
+    input: { interactionType: InteractionType; notes: string; occurredAt?: string; ownerId?: string | null },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<Interaction>(`/ops/properties/${propertyId}/interactions`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    }
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property) throw new Error('Property not found');
+    if (!demoCanUseInteractions()) throw new Error('You do not have permission for this operation');
+    const notes = typeof input.notes === 'string' ? input.notes.trim() : '';
+    if (!interactionTypes.has(input.interactionType) || !notes || notes.length > 4000) {
+      throw new Error('Request validation failed');
+    }
+    let occurredAt = now();
+    if (input.occurredAt !== undefined) {
+      const parsed = new Date(input.occurredAt);
+      if (Number.isNaN(parsed.getTime()) || !/Z$/.test(input.occurredAt)) throw new Error('Request validation failed');
+      // Zero tolerance, mirroring the database guard.
+      if (parsed.getTime() > Date.now()) {
+        throw new Error('Interactions must record something that already happened; occurred_at is in the future');
+      }
+      occurredAt = parsed.toISOString();
+    }
+    const ownerId = input.ownerId ?? null;
+    if (ownerId && !demoPropertyOwners.some((link) => link.property_id === propertyId && link.owner_id === ownerId)) {
+      throw new Error('Interaction owner must be an existing owner of the property');
+    }
+    const timestamp = now();
+    const interaction: Interaction = {
+      id: crypto.randomUUID(),
+      organization_id: property.organization_id,
+      property_id: propertyId,
+      owner_id: ownerId,
+      interaction_type: input.interactionType,
+      notes,
+      occurred_at: occurredAt,
+      recorded_by_user_id: DEMO_ACTOR_ID,
+      created_at: timestamp,
+      updated_at: timestamp,
+      archived_at: null,
+    };
+    demoInteractions = [interaction, ...demoInteractions];
+    return decorateInteraction(interaction);
+  },
+
+  /** Interactions are immutable; archiving is the only change and cannot be undone. */
+  async archiveInteraction(id: string) {
+    if (operationsApiMode === 'live') {
+      return request<Interaction>(`/ops/interactions/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ archived: true }),
+      });
+    }
+    const index = demoInteractions.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('Interaction not found');
+    if (!demoCanUseInteractions()) throw new Error('You do not have permission for this operation');
+    const existing = demoInteractions[index];
+    const next: Interaction = existing.archived_at ? existing : { ...existing, archived_at: now(), updated_at: now() };
+    demoInteractions[index] = next;
+    return decorateInteraction(next);
   },
 
   /** Read-only; the demo builds the same entries the server derives from its records. */

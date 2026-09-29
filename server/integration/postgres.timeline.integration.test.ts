@@ -34,6 +34,8 @@ describe('PostgreSQL property timeline', () => {
   let negotiatorUnassigned: string;
   let negotiationOnly: string;
   let departedLegal: string;
+  let departedLam: string;
+  let propertyInteract: string;
   let projectA: string;
   let propertyA: string;
   let propertyHidden: string;
@@ -200,6 +202,8 @@ describe('PostgreSQL property timeline', () => {
     await addMember(pool, adminA, orgA, negotiatorUnassigned, 'negotiator');
     await addMember(pool, adminA, orgA, negotiationOnly, 'negotiator');
     await addMember(pool, adminA, orgA, departedLegal, 'legal_documentation');
+    departedLam = await user('departed-lam', 'Tl Departed LAM');
+    await addMember(pool, adminA, orgA, departedLam, 'land_acquisition_manager');
 
     const dates = await pool.query<{ today: string; tomorrow: string }>(
       `select to_char((now() at time zone 'Asia/Manila')::date, 'YYYY-MM-DD') as today,
@@ -311,6 +315,37 @@ describe('PostgreSQL property timeline', () => {
            from generate_series(1, 205) as n`,
         [orgA, propertyPage, lamA],
       ),
+    );
+
+    // --- propertyInteract: the interaction source (rank 7) and its role filter.
+    propertyInteract = await insertProperty('TL-INT', 'identified', negotiatorAssigned, supervisorScoped);
+    const ownerContact = await insertLinkedOwner(lamA, orgA, propertyInteract, 'Owner Contact');
+    const ownerLeaving = await insertLinkedOwner(lamA, orgA, propertyInteract, 'Owner Leaving');
+    const recordInteraction = (actor: string, type: string, ownerId: string | null, occurredAt: string, notes: string) =>
+      insertOne(
+        actor,
+        `insert into public.interactions (
+            organization_id, property_id, owner_id, interaction_type, notes, occurred_at, recorded_by_user_id
+          ) values ($1, $2, $3, $4, $5, $6, $7) returning id`,
+        [orgA, propertyInteract, ownerId, type, notes, occurredAt, actor],
+      );
+    ids.taskBesideCall = await insertTask(propertyInteract, 'Prepare access letter', '2026-07-01T02:00:00Z');
+    ids.callWithOwner = await recordInteraction(negotiatorAssigned, 'call', ownerContact, '2026-07-01T02:00:00Z', 'Owner shared a private family matter');
+    ids.siteVisit = await recordInteraction(supervisorScoped, 'site_visit', null, '2026-07-02T02:00:00Z', 'Gate code 4471');
+    ids.archivedMeeting = await recordInteraction(lamA, 'meeting', null, '2026-07-03T02:00:00Z', 'Archived meeting notes');
+    await asUser(pool, lamA, (client) =>
+      client.query(`update public.interactions set archived_at = timezone('utc', now()) where id = $1`, [ids.archivedMeeting]),
+    );
+    ids.departedMessage = await recordInteraction(departedLam, 'message', null, '2026-07-04T02:00:00Z', 'Sent by a departing manager');
+    await asUser(pool, adminA, (client) =>
+      client.query(`update public.organization_memberships set is_active = false where organization_id = $1 and user_id = $2`, [
+        orgA,
+        departedLam,
+      ]),
+    );
+    ids.otherWithLeavingOwner = await recordInteraction(lamA, 'other', ownerLeaving, '2026-07-05T02:00:00Z', 'Before the unlink');
+    await asUser(pool, lamA, (client) =>
+      client.query(`delete from public.property_owners where property_id = $1 and owner_id = $2`, [propertyInteract, ownerLeaving]),
     );
 
     // --- tenant B and the timezone organization.
@@ -572,6 +607,76 @@ describe('PostgreSQL property timeline', () => {
       const stitched = [...pageOne, ...pageTwo].map((entry) => entry.id);
       expect(stitched).toEqual([...max, ...rest].map((entry) => entry.id));
       expect(new Set(stitched).size).toBe(205);
+    });
+  });
+
+  describe('interaction source', () => {
+    const interactionIds = () => [ids.otherWithLeavingOwner, ids.departedMessage, ids.siteVisit, ids.callWithOwner];
+
+    it('shows active interactions to the four interaction roles, with structured summaries and no notes', async () => {
+      const entries = await timeline(adminA, propertyInteract);
+      expect(entries.map((entry) => [entry.kind, entry.source_id])).toEqual([
+        ['interaction', ids.otherWithLeavingOwner],
+        ['interaction', ids.departedMessage],
+        ['interaction', ids.siteVisit],
+        ['task_created', ids.taskBesideCall],
+        ['interaction', ids.callWithOwner],
+      ]);
+      const call = entries.find((entry) => entry.source_id === ids.callWithOwner)!;
+      expect(call).toEqual({
+        id: `interaction:${ids.callWithOwner}:interaction`,
+        kind: 'interaction',
+        source_type: 'interaction',
+        source_id: ids.callWithOwner,
+        occurred_at: '2026-07-01T02:00:00.000Z',
+        precision: 'timestamp',
+        basis: 'occurrence',
+        actor: { id: negotiatorAssigned, display_name: 'Tl Negotiator Assigned' },
+        summary: 'Call with Owner Contact',
+        archived: false,
+      });
+      expect(entries.find((entry) => entry.source_id === ids.siteVisit)?.summary).toBe('Site visit');
+      // Recorded while the owner was linked; the later unlink leaves it intact.
+      expect(entries.find((entry) => entry.source_id === ids.otherWithLeavingOwner)?.summary).toBe(
+        'Other interaction with Owner Leaving',
+      );
+      expect(entries.find((entry) => entry.source_id === ids.departedMessage)?.actor).toEqual({
+        id: departedLam,
+        display_name: null,
+      });
+      expect(entries.some((entry) => entry.source_id === ids.archivedMeeting)).toBe(false);
+      const serialized = JSON.stringify(entries);
+      for (const note of ['private family matter', 'Gate code', 'departing manager', 'Before the unlink']) {
+        expect(serialized).not.toContain(note);
+      }
+    });
+
+    it.each([
+      ['land_acquisition_manager', () => lamA],
+      ['supervisor managing the property', () => supervisorScoped],
+      ['negotiator assigned to the property', () => negotiatorAssigned],
+    ])('shows the same interaction entries to %s', async (_label, actor) => {
+      const expected = (await timeline(adminA, propertyInteract)).map((entry) => entry.id);
+      expect((await timeline(actor(), propertyInteract)).map((entry) => entry.id)).toEqual(expected);
+    });
+
+    it.each([
+      ['legal_documentation', () => legalA],
+      ['finance', () => financeA],
+      ['viewer', () => viewerA],
+    ])('hides only the interaction entries from %s', async (_label, actor) => {
+      const full = await timeline(adminA, propertyInteract);
+      const withoutInteractions = full.filter((entry) => entry.source_type !== 'interaction').map((entry) => entry.id);
+      const seen = await timeline(actor(), propertyInteract);
+      expect(seen.map((entry) => entry.id)).toEqual(withoutInteractions);
+      expect(seen.some((entry) => interactionIds().includes(entry.source_id))).toBe(false);
+    });
+
+    it('leaves the six existing sources identical for every property-visible role', async () => {
+      const expected = (await timeline(adminA, propertyA)).map((entry) => entry.id);
+      for (const actor of [legalA, financeA, viewerA]) {
+        expect((await timeline(actor, propertyA)).map((entry) => entry.id)).toEqual(expected);
+      }
     });
   });
 

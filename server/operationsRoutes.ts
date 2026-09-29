@@ -33,6 +33,8 @@ import {
   archiveAgreementSignatureSchema,
   createAgreementSignatureSchema,
   propertyTimelineQuerySchema,
+  archiveInteractionSchema,
+  createInteractionSchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 
@@ -45,6 +47,8 @@ const DOCUMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisit
 const TASK_SELF_ASSIGN_CREATE_ROLES: OrganizationRole[] = ['legal_documentation', 'finance'];
 const PAYMENT_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'finance'];
 const AGREEMENT_SIGNATURE_WRITE_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'legal_documentation'];
+// Record, read, and archive share this set; property visibility still applies.
+const INTERACTION_ROLES: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator'];
 
 const negotiationPatchColumns: Record<string, string> = {
   status: 'status',
@@ -1261,6 +1265,84 @@ operationsRouter.patch('/agreement-signatures/:id', async (request, response) =>
   response.json({ data: signature });
 });
 
+// Left joins so a visible interaction is never dropped by a join target's
+// own RLS; owner and recorder names are display-only.
+const interactionSelect = `
+  select i.*, o.display_name as owner_name, u.display_name as recorded_by_name
+    from public.interactions i
+    left join public.owners o on o.id = i.owner_id
+    left join public.app_users u on u.id = i.recorded_by_user_id`;
+
+/** Property visibility first (404), then the interaction role set (403). */
+async function requireInteractionAccess(client: PoolClient, propertyId: string, userId: string) {
+  const property = firstRow(
+    (await client.query<{ organization_id: string }>(`select organization_id from public.properties where id=$1`, [propertyId])).rows,
+    'Property not found',
+  );
+  const role = await requireVisibleProperty(client, property.organization_id, userId);
+  if (!INTERACTION_ROLES.includes(role)) {
+    throw httpError(403, 'You do not have permission for this operation');
+  }
+  return property;
+}
+
+operationsRouter.get('/properties/:id/interactions', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const interactions = await withActorTransaction(user.id, async (client) => {
+    await requireInteractionAccess(client, id, user.id);
+    // Active interactions only; there is deliberately no includeArchived.
+    const result = await client.query(
+      `${interactionSelect} where i.property_id=$1 and i.archived_at is null
+        order by i.occurred_at desc, i.created_at desc, i.id`,
+      [id],
+    );
+    return result.rows;
+  });
+  response.json({ data: interactions });
+});
+
+operationsRouter.post('/properties/:id/interactions', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = createInteractionSchema.parse(request.body);
+  const interaction = await withActorTransaction(user.id, async (client) => {
+    const property = await requireInteractionAccess(client, id, user.id);
+    // Tenant match, owner link, and the zero-tolerance future check are
+    // enforced by the database scope trigger (surfaced as 422/404).
+    const inserted = await client.query<{ id: string }>(
+      `insert into public.interactions (
+          organization_id, property_id, owner_id, interaction_type, notes, occurred_at, recorded_by_user_id
+        ) values ($1,$2,$3,$4,$5,coalesce($6::timestamptz, timezone('utc', now())),$7)
+        returning id`,
+      [property.organization_id, id, body.ownerId ?? null, body.interactionType, body.notes, body.occurredAt ?? null, user.id],
+    );
+    const interactionId = firstRow(inserted.rows, 'Interaction creation failed').id;
+    return firstRow((await client.query(`${interactionSelect} where i.id=$1`, [interactionId])).rows, 'Interaction creation failed');
+  });
+  response.status(201).json({ data: interaction });
+});
+
+operationsRouter.patch('/interactions/:id', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  archiveInteractionSchema.parse(request.body);
+  const interaction = await withActorTransaction(user.id, async (client) => {
+    const existing = firstRow(
+      (await client.query<{ property_id: string }>(`select property_id from public.interactions where id=$1`, [id])).rows,
+      'Interaction not found',
+    );
+    await requireInteractionAccess(client, existing.property_id, user.id);
+    // Archiving twice keeps the first archive time; there is no unarchive.
+    await client.query(
+      `update public.interactions set archived_at = coalesce(archived_at, timezone('utc', now())) where id=$1`,
+      [id],
+    );
+    return firstRow((await client.query(`${interactionSelect} where i.id=$1`, [id])).rows, 'Interaction update failed');
+  });
+  response.json({ data: interaction });
+});
+
 /**
  * Property Timeline: a read-only feed built at request time from records
  * that already exist. It is not an audit log -- it only shows what those
@@ -1275,12 +1357,13 @@ export type TimelineKind =
   | 'task_created'
   | 'payment_recorded'
   | 'payment_paid'
-  | 'agreement_signed';
+  | 'agreement_signed'
+  | 'interaction';
 
 export type TimelineEntry = {
   id: string;
   kind: TimelineKind;
-  source_type: 'negotiation_event' | 'negotiation' | 'document' | 'task' | 'payment' | 'agreement_signature';
+  source_type: 'negotiation_event' | 'negotiation' | 'document' | 'task' | 'payment' | 'agreement_signature' | 'interaction';
   source_id: string;
   occurred_at: string;
   precision: 'timestamp' | 'date';
@@ -1344,6 +1427,14 @@ const timelinePaymentStatusLabels: Record<string, string> = {
   cancelled: 'Cancelled',
 };
 
+const timelineInteractionTypeLabels: Record<string, string> = {
+  call: 'Call',
+  meeting: 'Meeting',
+  site_visit: 'Site visit',
+  message: 'Message',
+  other: 'Other interaction',
+};
+
 function timelineMoney(amount: string | number, currency: string | null) {
   return `${currency ?? ''} ${Number(amount).toLocaleString('en-US')}`.trim();
 }
@@ -1372,6 +1463,11 @@ function timelineSummary(row: TimelineRow): string {
       return `${timelinePaymentTypeLabels[row.code ?? ''] ?? 'Payment'} paid: ${timelineMoney(row.amount ?? 0, row.currency)}`;
     case 'agreement_signed':
       return `${row.title ?? 'Unknown owner'} signed ${row.secondary ?? 'an agreement'}`;
+    case 'interaction': {
+      // Structured only: the interaction's notes are never part of the Timeline.
+      const label = timelineInteractionTypeLabels[row.code ?? ''] ?? 'Interaction';
+      return row.title ? `${label} with ${row.title}` : label;
+    }
   }
 }
 
@@ -1392,10 +1488,12 @@ export function toTimelineEntry(row: TimelineRow): TimelineEntry {
 }
 
 // One branch per entry kind. Tie ranks: negotiation_event 1, negotiation 2,
-// document 3, task 4, payment 5, agreement_signature 6. Timestamps are
-// eligible once reached; dates once reached in the organization's timezone
-// ($3). Date-only entries sort at the end of their calendar day and are never
-// given a time. Each table's own RLS still applies to every branch.
+// document 3, task 4, payment 5, agreement_signature 6, interaction 7.
+// Timestamps are eligible once reached; dates once reached in the
+// organization's timezone ($3). Date-only entries sort at the end of their
+// calendar day and are never given a time. Each table's own RLS still applies
+// to every branch, so interaction entries appear only for the interaction
+// roles while every other source keeps its existing visibility.
 const timelineSql = `
   with entries as (
     select 'negotiation_event'::text as source_type, 1 as source_rank, e.id::text as source_id,
@@ -1439,6 +1537,12 @@ const timelineSql = `
       left join public.owners o on o.id = s.owner_id
       left join public.documents sd on sd.id = s.document_id
      where s.property_id = $1 and s.archived_at is null and s.signed_on <= $3::date
+    union all
+    select 'interaction', 7, i.id::text, 'interaction', i.occurred_at, null, 'occurrence', i.recorded_by_user_id,
+           i.interaction_type::text, null, null, null, io.display_name, null
+      from public.interactions i
+      left join public.owners io on io.id = i.owner_id
+     where i.property_id = $1 and i.archived_at is null and i.occurred_at <= now()
   )
   select x.source_type, x.source_id, x.kind, x.basis, x.actor_id, u.display_name as actor_name,
          x.code, x.status, x.amount, x.currency, x.title, x.secondary, x.event_ts,
