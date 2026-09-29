@@ -11,6 +11,7 @@ import {
   bootstrapOrg,
   createAppPool,
   expectSqlError,
+  insertPropertyFixture,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -172,31 +173,28 @@ describe('PostgreSQL agreement signatures security', () => {
       );
       return result.rows[0].id;
     });
-    propertyA = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+    // Starts in signing: a fixture created as a controlled owner operation (L-05).
+    propertyA = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id, assigned_manager_id
           ) values ($1, $2, 'SIG-001', 'signing', $3, $4) returning id`,
-        [orgA, projectA, negotiatorAssigned, supervisorScoped],
-      );
-      return result.rows[0].id;
-    });
-    propertyOther = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
+      [orgA, projectA, negotiatorAssigned, supervisorScoped],
+    );
+    // Starts in signing: a fixture created as a controlled owner operation (L-05).
+    propertyOther = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
          values ($1, $2, 'SIG-002', 'signing') returning id`,
-        [orgA, projectA],
-      );
-      return result.rows[0].id;
-    });
-    propertyB = await asUser(pool, adminB, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
+      [orgA, projectA],
+    );
+    // Starts in signing: a fixture created as a controlled owner operation (L-05).
+    propertyB = await insertPropertyFixture(
+      adminB,
+      `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
          values ($1, $2, 'SIG-B-001', 'signing') returning id`,
-        [orgB, projectB],
-      );
-      return result.rows[0].id;
-    });
+      [orgB, projectB],
+    );
 
     // Two owners on propertyA (multiple signatories), one owner linked only to
     // propertyOther, and one owner in the other tenant.
@@ -574,17 +572,19 @@ describe('PostgreSQL agreement signatures security', () => {
   });
 
   it('leaves existing task, negotiation, and payment records unchanged when signatures are recorded', async () => {
-    const propertyLife = await asUser(pool, lamA, async (client) => {
+    const projectId = await asUser(pool, lamA, async (client) => {
       const project = await client.query<{ project_id: string }>(`select project_id from public.properties where id = $1`, [
         propertyA,
       ]);
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
-         values ($1, $2, 'SIG-LIFE', 'negotiation') returning id`,
-        [orgA, project.rows[0].project_id],
-      );
-      return result.rows[0].id;
+      return project.rows[0].project_id;
     });
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    const propertyLife = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage)
+       values ($1, $2, 'SIG-LIFE', 'negotiation') returning id`,
+      [orgA, projectId],
+    );
     await linkOwner(lamA, propertyLife, ownerOne);
     await linkOwner(lamA, propertyLife, ownerTwo);
     const document = await insertDocument(lamA, orgA, propertyLife, 'agreement_executed', 'Deed Life');

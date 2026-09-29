@@ -57,8 +57,29 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => 
     return;
   }
 
-  const errorRecord = error as { code?: unknown; status?: unknown; message?: unknown };
+  const errorRecord = error as { code?: unknown; status?: unknown; message?: unknown; detail?: unknown };
   const databaseCode = typeof errorRecord.code === 'string' ? errorRecord.code : undefined;
+
+  // D-X1 (L-07): a stale lifecycle field is a conflict, distinct from
+  // validation (422), authority (403), and not found (404). The lifecycle
+  // functions raise 40001 with a JSON detail naming the field and the current
+  // and expected values (S-25).
+  if (databaseCode === '40001') {
+    let details: unknown;
+    try {
+      details = typeof errorRecord.detail === 'string' ? JSON.parse(errorRecord.detail) : undefined;
+    } catch {
+      details = undefined;
+    }
+    response.status(409).json({
+      error: {
+        code: 'lifecycle_conflict',
+        message: String(errorRecord.message ?? 'The record changed since it was loaded'),
+        ...(details ? { details } : {}),
+      },
+    });
+    return;
+  }
   const explicitStatus = typeof errorRecord.status === 'number' ? errorRecord.status : undefined;
   const databaseStatus: Record<string, number> = {
     '42501': 403,

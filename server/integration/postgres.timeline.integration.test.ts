@@ -10,6 +10,7 @@ import {
   bootstrapOrg,
   createAppPool,
   expectSqlError,
+  insertPropertyFixture,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -55,6 +56,12 @@ describe('PostgreSQL property timeline', () => {
     );
   }
 
+  // The same entries without the lifecycle source (every fixture property has
+  // creation history); used where a test pins the other sources exactly.
+  async function recordTimeline(actor: string, propertyId: string) {
+    return (await timeline(actor, propertyId)).filter((entry) => entry.source_type !== 'lifecycle');
+  }
+
   async function expectNotFound(operation: () => Promise<unknown>) {
     await expect(operation()).rejects.toMatchObject({ status: 404 });
   }
@@ -64,13 +71,13 @@ describe('PostgreSQL property timeline', () => {
   }
 
   function insertProperty(reference: string, stage: string, negotiator: string | null = null, manager: string | null = null) {
-    return insertOne(
-      lamA,
-      `insert into public.properties (
+    const sql = `insert into public.properties (
           organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id, assigned_manager_id
-        ) values ($1, $2, $3, $4, $5, $6) returning id`,
-      [orgA, projectA, `${reference}-${suffix}`, stage, negotiator, manager],
-    );
+        ) values ($1, $2, $3, $4, $5, $6) returning id`;
+    const params = [orgA, projectA, `${reference}-${suffix}`, stage, negotiator, manager];
+    // Since L-05 the application creates properties only in identified; other
+    // starting stages are fixtures created as a controlled owner operation.
+    return stage === 'identified' ? insertOne(lamA, sql, params) : insertPropertyFixture(lamA, sql, params);
   }
 
   function insertDocument(
@@ -364,7 +371,8 @@ describe('PostgreSQL property timeline', () => {
       `insert into public.projects (organization_id, code, name, status) values ($1, 'TL-C', 'Zone', 'active') returning id`,
       [orgC],
     );
-    propertyC = await insertOne(
+    // Starts in signing: a fixture created as a controlled owner operation (L-05).
+    propertyC = await insertPropertyFixture(
       adminC,
       `insert into public.properties (organization_id, project_id, property_reference, acquisition_stage) values ($1, $2, 'TL-C-001', 'signing') returning id`,
       [orgC, projectC],
@@ -387,7 +395,7 @@ describe('PostgreSQL property timeline', () => {
 
   describe('source mapping and ordering', () => {
     it('maps every source to its locked kind, timestamp, precision, basis, and actor, newest first', async () => {
-      const entries = await timeline(adminA, propertyA);
+      const entries = await recordTimeline(adminA, propertyA);
       expect(entries.map((entry) => [entry.kind, entry.source_id])).toEqual([
         ['agreement_signed', ids.signatureA],
         ['document_uploaded', ids.deedA],
@@ -465,12 +473,12 @@ describe('PostgreSQL property timeline', () => {
       expect(entries.some((entry) => entry.source_id === ids.futureEventA)).toBe(false);
       expect(entries.every((entry) => entry.archived === false)).toBe(true);
       expect(new Set(entries.map((entry) => entry.source_type))).toEqual(
-        new Set(['negotiation_event', 'negotiation', 'document', 'task', 'payment', 'agreement_signature']),
+        new Set(['negotiation_event', 'negotiation', 'document', 'task', 'payment', 'agreement_signature', 'lifecycle']),
       );
     });
 
     it('orders date-only entries at the end of their day in the organization timezone, then by tie rank and source id', async () => {
-      const entries = await timeline(adminA, propertyTime);
+      const entries = await recordTimeline(adminA, propertyTime);
       expect(entries.map((entry) => entry.source_id)).toEqual([
         ids.signatureToday,
         ids.documentLateUtc,
@@ -587,14 +595,18 @@ describe('PostgreSQL property timeline', () => {
       expect(propertyTimelineQuerySchema.safeParse({ limit: '200' }).success).toBe(true);
       expect(propertyTimelineQuerySchema.safeParse({ limit: '201' }).success).toBe(false);
 
+      // 205 tasks plus the property's two creation history entries, which are newest.
       const firstPage = await timeline(adminA, propertyPage);
       expect(firstPage).toHaveLength(50);
-      expect(firstPage[0].summary).toBe('Task created: Page task 205');
+      expect(firstPage.slice(0, 2).map((entry) => entry.source_type)).toEqual(['lifecycle', 'lifecycle']);
+      expect(firstPage[2].summary).toBe('Task created: Page task 205');
 
       const max = await timeline(adminA, propertyPage, { limit: 200 });
       expect(max).toHaveLength(200);
       const rest = await timeline(adminA, propertyPage, { limit: 200, offset: 200 });
       expect(rest.map((entry) => entry.summary)).toEqual([
+        'Task created: Page task 7',
+        'Task created: Page task 6',
         'Task created: Page task 5',
         'Task created: Page task 4',
         'Task created: Page task 3',
@@ -606,7 +618,7 @@ describe('PostgreSQL property timeline', () => {
       const pageTwo = await timeline(adminA, propertyPage, { limit: 120, offset: 120 });
       const stitched = [...pageOne, ...pageTwo].map((entry) => entry.id);
       expect(stitched).toEqual([...max, ...rest].map((entry) => entry.id));
-      expect(new Set(stitched).size).toBe(205);
+      expect(new Set(stitched).size).toBe(207);
     });
   });
 
@@ -614,7 +626,7 @@ describe('PostgreSQL property timeline', () => {
     const interactionIds = () => [ids.otherWithLeavingOwner, ids.departedMessage, ids.siteVisit, ids.callWithOwner];
 
     it('shows active interactions to the four interaction roles, with structured summaries and no notes', async () => {
-      const entries = await timeline(adminA, propertyInteract);
+      const entries = await recordTimeline(adminA, propertyInteract);
       expect(entries.map((entry) => [entry.kind, entry.source_id])).toEqual([
         ['interaction', ids.otherWithLeavingOwner],
         ['interaction', ids.departedMessage],

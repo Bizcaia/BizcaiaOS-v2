@@ -10,6 +10,7 @@ import {
   bootstrapOrg,
   createAppPool,
   expectSqlError,
+  insertPropertyFixture,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -107,24 +108,22 @@ describe('PostgreSQL negotiations security', () => {
       );
       return result.rows[0].id;
     });
-    propertyA = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    propertyA = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id
           ) values ($1, $2, 'NEG-001', 'negotiation', $3) returning id`,
-        [orgA, projectA, negotiatorA],
-      );
-      return result.rows[0].id;
-    });
-    propertyChronology = await asUser(pool, lamA, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+      [orgA, projectA, negotiatorA],
+    );
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    propertyChronology = await insertPropertyFixture(
+      lamA,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage, assigned_negotiator_id
           ) values ($1, $2, 'NEG-CHRONO', 'negotiation', $3) returning id`,
-        [orgA, projectA, negotiatorA],
-      );
-      return result.rows[0].id;
-    });
+      [orgA, projectA, negotiatorA],
+    );
     propertyIdentified = await asUser(pool, lamA, async (client) => {
       const result = await client.query<{ id: string }>(
         `insert into public.properties (
@@ -134,15 +133,14 @@ describe('PostgreSQL negotiations security', () => {
       );
       return result.rows[0].id;
     });
-    propertyB = await asUser(pool, adminB, async (client) => {
-      const result = await client.query<{ id: string }>(
-        `insert into public.properties (
+    // Starts in negotiation: a fixture created as a controlled owner operation (L-05).
+    propertyB = await insertPropertyFixture(
+      adminB,
+      `insert into public.properties (
             organization_id, project_id, property_reference, acquisition_stage
           ) values ($1, $2, 'NEG-B-001', 'negotiation') returning id`,
-        [orgB, projectB],
-      );
-      return result.rows[0].id;
-    });
+      [orgB, projectB],
+    );
   }, 60_000);
 
   afterAll(async () => {

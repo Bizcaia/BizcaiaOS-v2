@@ -20,6 +20,11 @@ import {
   negotiationListQuerySchema,
   updateNegotiationSchema,
   updatePropertySchema,
+  stageTransitionSchema,
+  statusTransitionSchema,
+  remediationQueueQuerySchema,
+  remediationResolveSchema,
+  remediationStepSchema,
   createDocumentFieldsSchema,
   documentListQuerySchema,
   updateDocumentSchema,
@@ -76,9 +81,9 @@ function canWriteNegotiation(role: OrganizationRole, assignedNegotiatorId: strin
   return role === 'negotiator' && assignedNegotiatorId === userId;
 }
 
+// acquisition_stage and acquisition_status are absent: they change only
+// through stage and status transitions.
 const propertyPatchColumns: Record<string, string> = {
-  acquisitionStage: 'acquisition_stage',
-  acquisitionStatus: 'acquisition_status',
   titleNumber: 'title_number',
   taxDeclaration: 'tax_declaration',
   lotNumber: 'lot_number',
@@ -356,6 +361,154 @@ operationsRouter.patch('/properties/:id', async (request, response) => {
     return firstRow(result.rows, 'Property update failed');
   });
   response.json({ data: property });
+});
+
+// L-02: the only application path that changes acquisition_stage. The
+// database function checks visibility, direction, authority, the reason, and
+// (L-04) the negotiation exception, whose designated override is the only
+// one `override` can request; the lifecycle history trigger records the
+// change in the same transaction.
+operationsRouter.post('/properties/:id/stage-transitions', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = stageTransitionSchema.parse(request.body);
+  const property = await withActorTransaction(user.id, async (client) => {
+    const result = await client.query(`select * from public.transition_property_stage($1, $2, $3, $4, $5)`, [
+      id,
+      body.targetStage,
+      body.reason ?? null,
+      body.override ?? false,
+      body.expectedStage,
+    ]);
+    return firstRow(result.rows, 'Property not found');
+  });
+  response.json({ data: property });
+});
+
+// L-03: the only application path that changes acquisition_status. The
+// database function applies the N-2 matrix (authority, reason, designated
+// overrides, the payment_closing completion condition), and the lifecycle
+// history trigger records the change and any override in the same transaction.
+operationsRouter.post('/properties/:id/status-transitions', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = statusTransitionSchema.parse(request.body);
+  const property = await withActorTransaction(user.id, async (client) => {
+    const result = await client.query(`select * from public.transition_property_status($1, $2, $3, $4, $5)`, [
+      id,
+      body.targetStatus,
+      body.reason ?? null,
+      body.override ?? false,
+      body.expectedStatus,
+    ]);
+    return firstRow(result.rows, 'Property not found');
+  });
+  response.json({ data: property });
+});
+
+// L-06: legacy stage remediation. Reads follow property visibility (RLS);
+// every step goes through its database function, which checks visibility,
+// authority, the cycle state, the reason and evidence (Q-1), and integrity.
+// NOT_REVIEWED is not stored: it is a legacy-stage property with no cycle.
+/**
+ * The remediation queue of an organization, as visible to the actor (RLS):
+ * properties still on a legacy stage and properties with an open cycle, with
+ * the latest cycle's state, or NOT_REVIEWED when no cycle exists.
+ */
+export async function loadRemediationQueue(client: PoolClient, organizationId: string) {
+  const result = await client.query(
+    `select p.id as property_id, p.property_reference, p.acquisition_stage, p.acquisition_status,
+            r.id as remediation_id, r.cycle, r.legacy_value, coalesce(r.state, 'NOT_REVIEWED') as state
+       from public.properties p
+       left join lateral (
+         select * from public.property_stage_remediations x where x.property_id = p.id order by x.cycle desc limit 1
+       ) r on true
+      where p.organization_id = $1
+        and (p.acquisition_stage in ('on_hold', 'withdrawn', 'acquisition_complete')
+             or r.state in ('UNDER_REVIEW', 'REQUIRES_ESCALATION'))
+      order by p.property_reference`,
+    [organizationId],
+  );
+  return result.rows;
+}
+
+operationsRouter.get('/remediations', async (request, response) => {
+  const user = requireUser(request);
+  const query = remediationQueueQuerySchema.parse(request.query);
+  const rows = await withActorTransaction(user.id, async (client) => {
+    await requireMembership(client, query.organizationId, user.id);
+    return loadRemediationQueue(client, query.organizationId);
+  });
+  response.json({ data: rows });
+});
+
+operationsRouter.get('/properties/:id/remediations', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const cycles = await withActorTransaction(user.id, async (client) => {
+    firstRow((await client.query(`select id from public.properties where id=$1`, [id])).rows, 'Property not found');
+    const result = await client.query(
+      `select r.*,
+              coalesce((select jsonb_agg(to_jsonb(e) order by e.occurred_at, e.id)
+                          from public.property_stage_remediation_events e where e.remediation_id = r.id), '[]'::jsonb) as events
+         from public.property_stage_remediations r
+        where r.property_id = $1
+        order by r.cycle`,
+      [id],
+    );
+    return result.rows;
+  });
+  response.json({ data: cycles });
+});
+
+const remediationSteps: Record<string, string> = {
+  escalate: 'escalate_property_stage_remediation',
+  'return-to-review': 'return_property_stage_remediation_to_review',
+  reopen: 'reopen_property_stage_remediation',
+};
+
+operationsRouter.post('/properties/:id/remediation/start', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const remediation = await withActorTransaction(user.id, async (client) =>
+    firstRow((await client.query(`select * from public.start_property_stage_remediation($1)`, [id])).rows, 'Property not found'),
+  );
+  response.status(201).json({ data: remediation });
+});
+
+operationsRouter.post('/properties/:id/remediation/resolve', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const body = remediationResolveSchema.parse(request.body);
+  const remediation = await withActorTransaction(user.id, async (client) =>
+    firstRow(
+      (
+        await client.query(`select * from public.resolve_property_stage_remediation($1, $2, $3, $4, $5, $6, $7)`, [
+          id,
+          body.resultingStage,
+          body.reason ?? null,
+          body.evidence ?? null,
+          body.evidenceDocumentId ?? null,
+          body.evidenceInteractionId ?? null,
+          body.expectedStage,
+        ])
+      ).rows,
+      'Property not found',
+    ),
+  );
+  response.json({ data: remediation });
+});
+
+operationsRouter.post('/properties/:id/remediation/:step', async (request, response) => {
+  const user = requireUser(request);
+  const { id } = idParamsSchema.parse(request.params);
+  const fn = remediationSteps[String(request.params.step)];
+  if (!fn) throw httpError(404, 'Remediation step not found');
+  const body = remediationStepSchema.parse(request.body);
+  const remediation = await withActorTransaction(user.id, async (client) =>
+    firstRow((await client.query(`select * from public.${fn}($1, $2)`, [id, body.reason ?? null])).rows, 'Property not found'),
+  );
+  response.json({ data: remediation });
 });
 
 operationsRouter.get('/properties/:id/owners', async (request, response) => {
@@ -1358,12 +1511,22 @@ export type TimelineKind =
   | 'payment_recorded'
   | 'payment_paid'
   | 'agreement_signed'
-  | 'interaction';
+  | 'interaction'
+  | 'stage_changed'
+  | 'status_changed';
 
 export type TimelineEntry = {
   id: string;
   kind: TimelineKind;
-  source_type: 'negotiation_event' | 'negotiation' | 'document' | 'task' | 'payment' | 'agreement_signature' | 'interaction';
+  source_type:
+    | 'negotiation_event'
+    | 'negotiation'
+    | 'document'
+    | 'task'
+    | 'payment'
+    | 'agreement_signature'
+    | 'interaction'
+    | 'lifecycle';
   source_id: string;
   occurred_at: string;
   precision: 'timestamp' | 'date';
@@ -1435,6 +1598,40 @@ const timelineInteractionTypeLabels: Record<string, string> = {
   other: 'Other interaction',
 };
 
+// Lifecycle history labels. Stage labels mirror the frontend's stage labels;
+// legacy stage values keep their existing display names.
+const timelineStageLabels: Record<string, string> = {
+  identified: 'Identified',
+  initial_contact: 'Initial contact',
+  owner_validation: 'Owner validation',
+  property_validation: 'Property validation',
+  documentation: 'Documentation',
+  negotiation: 'Negotiation',
+  commercial_review: 'Commercial review',
+  legal_review: 'Legal review',
+  agreement_preparation: 'Agreement preparation',
+  signing: 'Signing',
+  payment_closing: 'Payment / closing',
+  acquisition_complete: 'Complete',
+  on_hold: 'On hold',
+  withdrawn: 'Withdrawn',
+};
+
+const timelineStatusLabels: Record<string, string> = {
+  active: 'Active',
+  on_hold: 'On hold',
+  withdrawn: 'Withdrawn',
+  complete: 'Complete',
+};
+
+function timelineLifecycleSummary(noun: string, labels: Record<string, string>, fromValue: string | null, toValue: string | null) {
+  const to = labels[toValue ?? ''] ?? toValue ?? '';
+  // The reason recorded with a change is never part of the summary.
+  return fromValue == null
+    ? `${noun} set to ${to}`
+    : `${noun} changed from ${labels[fromValue] ?? fromValue} to ${to}`;
+}
+
 function timelineMoney(amount: string | number, currency: string | null) {
   return `${currency ?? ''} ${Number(amount).toLocaleString('en-US')}`.trim();
 }
@@ -1468,6 +1665,17 @@ function timelineSummary(row: TimelineRow): string {
       const label = timelineInteractionTypeLabels[row.code ?? ''] ?? 'Interaction';
       return row.title ? `${label} with ${row.title}` : label;
     }
+    case 'stage_changed':
+    case 'status_changed': {
+      const summary =
+        row.kind === 'stage_changed'
+          ? timelineLifecycleSummary('Acquisition stage', timelineStageLabels, row.title, row.secondary)
+          : timelineLifecycleSummary('Acquisition status', timelineStatusLabels, row.title, row.secondary);
+      // An override is shown as such; its reason and rules stay out of the summary.
+      if (row.status === 'override') return `${summary} (override)`;
+      // A legacy remediation is shown as such; its reason and evidence stay out of the summary.
+      return row.status === 'remediation' ? `${summary} (legacy remediation)` : summary;
+    }
   }
 }
 
@@ -1488,7 +1696,8 @@ export function toTimelineEntry(row: TimelineRow): TimelineEntry {
 }
 
 // One branch per entry kind. Tie ranks: negotiation_event 1, negotiation 2,
-// document 3, task 4, payment 5, agreement_signature 6, interaction 7.
+// document 3, task 4, payment 5, agreement_signature 6, interaction 7,
+// lifecycle 8 (stage and status history, visible wherever the property is).
 // Timestamps are eligible once reached; dates once reached in the
 // organization's timezone ($3). Date-only entries sort at the end of their
 // calendar day and are never given a time. Each table's own RLS still applies
@@ -1543,6 +1752,14 @@ const timelineSql = `
       from public.interactions i
       left join public.owners io on io.id = i.owner_id
      where i.property_id = $1 and i.archived_at is null and i.occurred_at <= now()
+    union all
+    select 'lifecycle', 8, h.id::text,
+           case when h.field = 'acquisition_stage' then 'stage_changed' else 'status_changed' end,
+           h.changed_at, null, 'occurrence', h.actor_user_id,
+           h.field, case when h.is_override then 'override' when h.remediation_id is not null then 'remediation' end,
+           null, null, h.from_value, h.to_value
+      from public.property_lifecycle_history h
+     where h.property_id = $1 and h.changed_at <= now()
   )
   select x.source_type, x.source_id, x.kind, x.basis, x.actor_id, u.display_name as actor_name,
          x.code, x.status, x.amount, x.currency, x.title, x.secondary, x.event_ts,

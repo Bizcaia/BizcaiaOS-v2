@@ -27,6 +27,16 @@ import {
   type TimelineEntry,
   type Interaction,
   type InteractionType,
+  type PropertyRemediation,
+  type RemediationEvent,
+  type AcquisitionStatus,
+  type LifecycleConflictDetails,
+  backwardStageRoles,
+  demoStatusOperation,
+  forwardStageRoles,
+  isLifecycleConflict,
+  legacyStages,
+  stageOrder,
 } from '../api/operationsApi';
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
@@ -162,8 +172,6 @@ function allowedPropertyPatchKeys(role: OrganizationRole): Set<string> {
     case 'system_admin':
     case 'land_acquisition_manager':
       return new Set([
-        'acquisitionStage',
-        'acquisitionStatus',
         'titleNumber',
         'taxDeclaration',
         'lotNumber',
@@ -473,7 +481,10 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
                       <strong>{property.property_reference}</strong>
                       <small>{property.lot_number ?? 'No lot number'} · {property.municipality ?? 'Location pending'}</small>
                     </div>
-                    <span>{stageLabels[property.acquisition_stage]}</span>
+                    <span>
+                      {stageLabels[property.acquisition_stage]}
+                      {legacyStages.includes(property.acquisition_stage) && ' · Needs review'}
+                    </span>
                     <b>{property.readiness_percent}%</b>
                   </button>
                 ))}
@@ -491,6 +502,11 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
                 onClose={() => setSelected(null)}
                 onSaved={async () => {
                   setSelected(null);
+                  await load();
+                }}
+                onLifecycleChanged={async () => {
+                  // Reload the authoritative property; the drawer stays open (L-07).
+                  setSelected(await operationsApi.getProperty(selected.id));
                   await load();
                 }}
               />
@@ -543,6 +559,7 @@ function PropertyDrawer({
   canManageOwners,
   onClose,
   onSaved,
+  onLifecycleChanged,
 }: {
   property: Property;
   members: Member[];
@@ -553,9 +570,10 @@ function PropertyDrawer({
   canManageOwners: boolean;
   onClose: () => void;
   onSaved: () => Promise<void>;
+  onLifecycleChanged: () => Promise<void>;
 }) {
   const allowed = allowedPropertyPatchKeys(role);
-  const [stage, setStage] = useState(property.acquisition_stage);
+  const [conflict, setConflict] = useState<LifecycleConflictDetails | null>(null);
   const [readiness, setReadiness] = useState(String(property.readiness_percent));
   const [risk, setRisk] = useState(property.risk);
   const [legalStatus, setLegalStatus] = useState(property.legal_status);
@@ -587,16 +605,12 @@ function PropertyDrawer({
         <h2>{property.property_reference}</h2>
         <p>{property.municipality}, {property.province}{property.barangay ? ` · ${property.barangay}` : ''}</p>
         <p className="drawer-meta">{property.project_code} — {property.project_name}</p>
-        {allowed.has('acquisitionStage') && (
-          <label>
-            Acquisition stage
-            <select value={stage} onChange={(event) => setStage(event.target.value as AcquisitionStage)}>
-              {Object.entries(stageLabels).map(([key, label]) => (
-                <option key={key} value={key}>{label}</option>
-              ))}
-            </select>
-          </label>
-        )}
+        <p className="drawer-meta" aria-label="Current lifecycle">
+          Stage <b>{stageLabels[property.acquisition_stage]}</b> · Status{' '}
+          <b>{statusLabels[property.acquisition_status as AcquisitionStatus] ?? property.acquisition_status}</b>
+        </p>
+        {conflict && <LifecycleConflictBanner conflict={conflict} />}
+        <LifecycleControls property={property} role={role} onChanged={onLifecycleChanged} onConflict={setConflict} />
         {allowed.has('readinessPercent') && (
           <label>
             Readiness %
@@ -669,8 +683,8 @@ function PropertyDrawer({
             disabled={saving}
             onClick={async () => {
               setSaving(true);
+              // Lifecycle fields change only through the Lifecycle controls (L-02, L-03, L-07).
               const payload: Record<string, unknown> = {};
-              if (allowed.has('acquisitionStage')) payload.acquisitionStage = stage;
               if (allowed.has('readinessPercent')) payload.readinessPercent = Number(readiness);
               if (allowed.has('risk')) payload.risk = risk;
               if (allowed.has('legalStatus')) payload.legalStatus = legalStatus;
@@ -811,7 +825,12 @@ function PropertyDrawer({
         <TaskBlock property={property} role={role} members={members} projects={projects} currentUserId={currentUserId} />
         <PaymentBlock property={property} role={role} />
         <AgreementSignaturesBlock property={property} role={role} />
-        <PropertyTimelineBlock property={property} />
+        <RemediationBlock property={property} role={role} onChanged={onLifecycleChanged} onConflict={setConflict} />
+        {/* Remounted after any lifecycle change, so the Timeline reloads with the new history. */}
+        <PropertyTimelineBlock
+          key={`${property.id}:${property.acquisition_stage}:${property.acquisition_status}`}
+          property={property}
+        />
       </aside>
     </div>
   );
@@ -1786,6 +1805,424 @@ function AgreementSignaturesBlock({ property, role }: { property: Property; role
 const TIMELINE_PAGE_SIZE = 50;
 
 /** Date-only entries stay date-only; recorded-basis entries say so. */
+const remediationRoles: OrganizationRole[] = ['system_admin', 'land_acquisition_manager', 'supervisor'];
+
+const remediationStateLabels: Record<string, string> = {
+  NOT_REVIEWED: 'Not reviewed',
+  UNDER_REVIEW: 'Under review',
+  REQUIRES_ESCALATION: 'Requires escalation',
+  RESOLVED: 'Resolved',
+};
+
+const remediationActionLabels: Record<RemediationEvent['action'], string> = {
+  review_started: 'Review started',
+  escalated: 'Escalated',
+  returned_to_review: 'Returned to review',
+  resolved: 'Resolved',
+  reopened: 'Reopened',
+};
+
+/**
+ * Legacy stage remediation (L-06): the only way a legacy stage value is
+ * corrected. The server enforces every rule; this block only offers the step
+ * that fits the current state and shows the server's refusal.
+ */
+function RemediationBlock({
+  property,
+  role,
+  onChanged,
+  onConflict,
+}: {
+  property: Property;
+  role: OrganizationRole;
+  onChanged: () => Promise<void>;
+  onConflict: (conflict: LifecycleConflictDetails | null) => void;
+}) {
+  const [cycles, setCycles] = useState<PropertyRemediation[]>([]);
+  const [documents, setDocuments] = useState<PropertyDocument[]>([]);
+  const [interactions, setInteractions] = useState<Interaction[]>([]);
+  const [reason, setReason] = useState('');
+  const [evidence, setEvidence] = useState('');
+  const [reference, setReference] = useState('');
+  const [resultingStage, setResultingStage] = useState<AcquisitionStage>('identified');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const canAct = remediationRoles.includes(role);
+  const latest = cycles.length > 0 ? cycles[cycles.length - 1] : undefined;
+  const state = latest ? latest.state : 'NOT_REVIEWED';
+  const isLegacy = legacyStages.includes(property.acquisition_stage);
+
+  const refresh = async () => {
+    setCycles(await operationsApi.listPropertyRemediations(property.id));
+  };
+
+  useEffect(() => {
+    void refresh().catch((cause) => setError(cause instanceof Error ? cause.message : 'Unable to load remediation'));
+    if (canAct) {
+      void operationsApi.listDocuments(property.id).then(setDocuments).catch(() => setDocuments([]));
+      void operationsApi.listInteractions(property.id).then(setInteractions).catch(() => setInteractions([]));
+    }
+  }, [property.id]);
+
+  if (!isLegacy && cycles.length === 0) return null;
+
+  // Only a resolution changes the property (its stage), so only then is the
+  // drawer's own reload used; other steps refresh the cycles in place.
+  const run = async (action: () => Promise<unknown>, propertyChanged = false) => {
+    setError('');
+    onConflict(null);
+    setSaving(true);
+    try {
+      await action();
+      setReason('');
+      setEvidence('');
+      setReference('');
+      if (propertyChanged) {
+        await onChanged();
+        return;
+      }
+      await refresh();
+    } catch (cause) {
+      if (isLifecycleConflict(cause)) {
+        // A stale stage (D-X1): reload the property rather than show old values.
+        onConflict(cause.details);
+        await onChanged();
+      } else {
+        setError(cause instanceof Error ? cause.message : 'Unable to update the remediation');
+      }
+      // Whatever the refusal, show the cycles as they now are (L-07).
+      await refresh().catch(() => undefined);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Required to resolve (Q-1) and escalate (Q-3); optional to return to review (Q-4) and reopen (Q-5).
+  const reasonField = (optional = false) => (
+    <label>
+      {optional ? 'Remediation reason (optional)' : 'Remediation reason'}
+      <input value={reason} onChange={(event) => setReason(event.target.value)} />
+    </label>
+  );
+
+  return (
+    <section className="owner-block" aria-label="Legacy remediation">
+      <h3>Legacy remediation</h3>
+      {isLegacy && (
+        <p>
+          <strong>Needs review</strong> · This property is on the legacy stage {stageLabels[property.acquisition_stage]}. It can only be
+          corrected here, with a reason and supporting evidence.
+        </p>
+      )}
+      <p>
+        Remediation state <b>{remediationStateLabels[state]}</b>
+        {latest ? ` · cycle ${latest.cycle}` : ''}
+      </p>
+      {error && <p className="form-error">{error}</p>}
+      {cycles.length > 0 && (
+        <ul className="owner-list" aria-label="Remediation cycles">
+          {cycles.map((cycle) => (
+            <li key={cycle.id}>
+              <strong>
+                Cycle {cycle.cycle} · {remediationStateLabels[cycle.state]}
+              </strong>
+              {cycle.resulting_stage && (
+                <small>
+                  {stageLabels[cycle.stage_at_open as AcquisitionStage] ?? cycle.stage_at_open} →{' '}
+                  {stageLabels[cycle.resulting_stage as AcquisitionStage] ?? cycle.resulting_stage}
+                </small>
+              )}
+              <small>{(cycle.events ?? []).map((event) => remediationActionLabels[event.action]).join(' → ')}</small>
+            </li>
+          ))}
+        </ul>
+      )}
+      {canAct && state === 'NOT_REVIEWED' && (
+        <button type="button" disabled={saving} onClick={() => void run(() => operationsApi.startRemediation(property.id))}>
+          Start review
+        </button>
+      )}
+      {canAct && state === 'UNDER_REVIEW' && (
+        <>
+          <label>
+            Corrected stage
+            <select value={resultingStage} onChange={(event) => setResultingStage(event.target.value as AcquisitionStage)}>
+              {Object.entries(stageLabels)
+                .filter(([key]) => !legacyStages.includes(key as AcquisitionStage))
+                .map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+            </select>
+          </label>
+          {reasonField()}
+          <label>
+            Supporting evidence
+            <textarea value={evidence} onChange={(event) => setEvidence(event.target.value)} />
+          </label>
+          <label>
+            Evidence reference (optional)
+            <select value={reference} onChange={(event) => setReference(event.target.value)}>
+              <option value="">No reference</option>
+              {documents.map((document) => (
+                <option key={document.id} value={`document:${document.id}`}>Document: {document.title}</option>
+              ))}
+              {interactions.map((interaction) => (
+                <option key={interaction.id} value={`interaction:${interaction.id}`}>
+                  Interaction: {interactionTypeLabels[interaction.interaction_type]} {new Date(interaction.occurred_at).toLocaleDateString()}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() =>
+              void run(() =>
+                operationsApi.resolveRemediation(property.id, {
+                  resultingStage,
+                  expectedStage: property.acquisition_stage,
+                  reason,
+                  evidence,
+                  evidenceDocumentId: reference.startsWith('document:') ? reference.slice('document:'.length) : null,
+                  evidenceInteractionId: reference.startsWith('interaction:') ? reference.slice('interaction:'.length) : null,
+                }),
+                true,
+              )
+            }
+          >
+            Resolve
+          </button>
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => void run(() => operationsApi.escalateRemediation(property.id, { reason }))}
+          >
+            Escalate (evidence insufficient)
+          </button>
+        </>
+      )}
+      {canAct && state === 'REQUIRES_ESCALATION' && (
+        <>
+          {reasonField(true)}
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => void run(() => operationsApi.returnRemediationToReview(property.id, { reason }))}
+          >
+            Return to review
+          </button>
+        </>
+      )}
+      {canAct && state === 'RESOLVED' && (
+        <>
+          {reasonField(true)}
+          <button type="button" disabled={saving} onClick={() => void run(() => operationsApi.reopenRemediation(property.id, { reason }))}>
+            Reopen
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
+
+const statusLabels: Record<AcquisitionStatus, string> = {
+  active: 'Active',
+  on_hold: 'On hold',
+  withdrawn: 'Withdrawn',
+  complete: 'Complete',
+};
+
+const overrideRuleLabels: Record<string, string> = {
+  completion_stage_condition: 'completion away from Payment / closing',
+  on_hold_completion: 'completion from on hold',
+  withdrawn_reversal: 'reversing a withdrawal',
+  complete_reversal: 'reversing a completion',
+};
+
+const lifecycleFieldLabels: Record<LifecycleConflictDetails['field'], string> = {
+  acquisition_stage: 'acquisition stage',
+  acquisition_status: 'acquisition status',
+};
+
+function lifecycleValueLabel(field: LifecycleConflictDetails['field'], value: string) {
+  return field === 'acquisition_stage'
+    ? stageLabels[value as AcquisitionStage] ?? value
+    : statusLabels[value as AcquisitionStatus] ?? value;
+}
+
+/** The conflict banner (S-25): the field, its current value, and the value this screen showed. */
+function LifecycleConflictBanner({ conflict }: { conflict: LifecycleConflictDetails }) {
+  return (
+    <p className="form-error" role="alert">
+      Not saved: the {lifecycleFieldLabels[conflict.field]} changed to{' '}
+      <b>{lifecycleValueLabel(conflict.field, conflict.current)}</b> while this screen showed{' '}
+      <b>{lifecycleValueLabel(conflict.field, conflict.expected)}</b>. The property has been reloaded; review it and try again.
+    </p>
+  );
+}
+
+/**
+ * Stage and status controls (L-07). They offer only what the role may attempt
+ * (a mirror of the lifecycle rules; the database decides), always send the
+ * value this screen shows as the expected value (D-X1), and after any change
+ * or conflict reload the property instead of assuming a result.
+ */
+function LifecycleControls({
+  property,
+  role,
+  onChanged,
+  onConflict,
+}: {
+  property: Property;
+  role: OrganizationRole;
+  onChanged: () => Promise<void>;
+  onConflict: (conflict: LifecycleConflictDetails | null) => void;
+}) {
+  const currentStage = property.acquisition_stage;
+  const currentStatus = property.acquisition_status as AcquisitionStatus;
+  const isLegacy = legacyStages.includes(currentStage);
+  const currentIndex = stageOrder.indexOf(currentStage);
+  const stageTargets = isLegacy
+    ? []
+    : stageOrder.filter((target, index) =>
+        index > currentIndex ? forwardStageRoles.has(role) : index < currentIndex ? backwardStageRoles.has(role) : false,
+      );
+  const statusTargets = (Object.keys(statusLabels) as AcquisitionStatus[]).filter(
+    (target) => target !== currentStatus && demoStatusOperation(currentStatus, target, currentStage).roles.has(role),
+  );
+  const [targetStage, setTargetStage] = useState<AcquisitionStage | ''>('');
+  const [stageReason, setStageReason] = useState('');
+  const [stageOverride, setStageOverride] = useState(false);
+  const [targetStatus, setTargetStatus] = useState<AcquisitionStatus | ''>('');
+  const [statusReason, setStatusReason] = useState('');
+  const [statusOverride, setStatusOverride] = useState(false);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  // A reloaded property starts the controls afresh.
+  useEffect(() => {
+    setTargetStage('');
+    setStageReason('');
+    setStageOverride(false);
+    setTargetStatus('');
+    setStatusReason('');
+    setStatusOverride(false);
+  }, [property.id, currentStage, currentStatus]);
+
+  if (stageTargets.length === 0 && statusTargets.length === 0) return null;
+
+  const statusRules = targetStatus ? demoStatusOperation(currentStatus, targetStatus, currentStage).rules : [];
+  const backward = targetStage !== '' && stageOrder.indexOf(targetStage) < currentIndex;
+
+  const submit = async (action: () => Promise<unknown>) => {
+    setError('');
+    onConflict(null);
+    setSaving(true);
+    try {
+      await action();
+      await onChanged();
+    } catch (cause) {
+      if (isLifecycleConflict(cause)) {
+        onConflict(cause.details);
+        await onChanged();
+      } else {
+        setError(cause instanceof Error ? cause.message : 'The lifecycle change could not be saved');
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="owner-block" aria-label="Lifecycle">
+      <h3>Lifecycle</h3>
+      {error && <p className="form-error">{error}</p>}
+      {stageTargets.length > 0 && (
+        <>
+          <label>
+            Acquisition stage
+            <select value={targetStage} onChange={(event) => setTargetStage(event.target.value as AcquisitionStage | '')}>
+              <option value="">{stageLabels[currentStage]} (current)</option>
+              {stageTargets.map((target) => (
+                <option key={target} value={target}>{stageLabels[target]}</option>
+              ))}
+            </select>
+          </label>
+          {targetStage !== '' && (
+            <label>
+              {backward ? 'Reason for stage change' : 'Reason for stage change (optional)'}
+              <input value={stageReason} onChange={(event) => setStageReason(event.target.value)} />
+            </label>
+          )}
+          {targetStage !== '' && currentStage === 'negotiation' && backwardStageRoles.has(role) && (
+            <label>
+              <input type="checkbox" checked={stageOverride} onChange={(event) => setStageOverride(event.target.checked)} />
+              Use the negotiation exception (leave negotiation while a negotiation is open or paused)
+            </label>
+          )}
+          <button
+            type="button"
+            disabled={saving || targetStage === ''}
+            onClick={() =>
+              void submit(() =>
+                operationsApi.transitionPropertyStage(property.id, {
+                  targetStage: targetStage as AcquisitionStage,
+                  expectedStage: currentStage,
+                  reason: stageReason || null,
+                  ...(stageOverride ? { override: true } : {}),
+                }),
+              )
+            }
+          >
+            Change stage
+          </button>
+        </>
+      )}
+      {statusTargets.length > 0 && (
+        <>
+          <label>
+            Acquisition status
+            <select value={targetStatus} onChange={(event) => setTargetStatus(event.target.value as AcquisitionStatus | '')}>
+              <option value="">{statusLabels[currentStatus]} (current)</option>
+              {statusTargets.map((target) => (
+                <option key={target} value={target}>{statusLabels[target]}</option>
+              ))}
+            </select>
+          </label>
+          {targetStatus !== '' && (
+            <label>
+              Reason for status change
+              <input value={statusReason} onChange={(event) => setStatusReason(event.target.value)} />
+            </label>
+          )}
+          {statusRules.length > 0 && (
+            <label>
+              <input type="checkbox" checked={statusOverride} onChange={(event) => setStatusOverride(event.target.checked)} />
+              Override: {statusRules.map((rule) => overrideRuleLabels[rule] ?? rule).join(', ')}
+            </label>
+          )}
+          <button
+            type="button"
+            disabled={saving || targetStatus === ''}
+            onClick={() =>
+              void submit(() =>
+                operationsApi.transitionPropertyStatus(property.id, {
+                  targetStatus: targetStatus as AcquisitionStatus,
+                  expectedStatus: currentStatus,
+                  reason: statusReason || null,
+                  ...(statusOverride ? { override: true } : {}),
+                }),
+              )
+            }
+          >
+            Change status
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
+
 function timelineWhen(entry: TimelineEntry) {
   const when = entry.precision === 'date' ? entry.occurred_at : new Date(entry.occurred_at).toLocaleString();
   return entry.basis === 'recorded' ? `Recorded ${when}` : when;

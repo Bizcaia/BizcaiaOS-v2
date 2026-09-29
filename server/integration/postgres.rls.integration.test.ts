@@ -92,6 +92,13 @@ describe('PostgreSQL property workflow security', () => {
         '009_payments.sql',
         '010_agreement_signatures.sql',
         '011_interactions.sql',
+        '012_property_lifecycle_history.sql',
+        '013_property_stage_transitions.sql',
+        '014_property_status_transitions.sql',
+        '015_lifecycle_negotiation_exception.sql',
+        '016_property_creation_rules.sql',
+        '017_legacy_stage_remediation.sql',
+        '018_lifecycle_optimistic_concurrency.sql',
       ]);
     } finally {
       await admin.end();

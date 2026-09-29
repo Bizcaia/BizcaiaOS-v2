@@ -40,7 +40,7 @@ export type Property = {
   province: string | null;
   barangay: string | null;
   acquisition_stage: AcquisitionStage;
-  acquisition_status: string;
+  acquisition_status: AcquisitionStatus;
   assigned_negotiator_id: string | null;
   assigned_manager_id: string | null;
   legal_status: string;
@@ -222,7 +222,9 @@ export type TimelineKind =
   | 'payment_recorded'
   | 'payment_paid'
   | 'agreement_signed'
-  | 'interaction';
+  | 'interaction'
+  | 'stage_changed'
+  | 'status_changed';
 
 export type TimelineSourceType =
   | 'negotiation_event'
@@ -231,7 +233,8 @@ export type TimelineSourceType =
   | 'task'
   | 'payment'
   | 'agreement_signature'
-  | 'interaction';
+  | 'interaction'
+  | 'lifecycle';
 
 export type InteractionType = 'call' | 'meeting' | 'site_visit' | 'message' | 'other';
 
@@ -328,6 +331,43 @@ declare global {
   }
 }
 
+/** The details of a D-X1 lifecycle conflict (S-25): the field and its current and stale values. */
+export type LifecycleConflictDetails = {
+  conflict: 'lifecycle';
+  field: 'acquisition_stage' | 'acquisition_status';
+  current: string;
+  expected: string;
+};
+
+/** An API refusal with its HTTP status and error code (and details for a lifecycle conflict). */
+export class OperationsApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+    readonly details?: LifecycleConflictDetails,
+  ) {
+    super(message);
+    this.name = 'OperationsApiError';
+  }
+}
+
+/** True when an operation was refused because the screen was stale (409 lifecycle_conflict). */
+export function isLifecycleConflict(error: unknown): error is OperationsApiError & { details: LifecycleConflictDetails } {
+  return error instanceof OperationsApiError && error.code === 'lifecycle_conflict' && !!error.details;
+}
+
+/** Mirrors the 40001 conflict the lifecycle functions raise for a stale expected value. */
+function demoLifecycleConflict(field: LifecycleConflictDetails['field'], current: string, expected: string): never {
+  const label = field === 'acquisition_stage' ? 'acquisition stage' : 'acquisition status';
+  throw new OperationsApiError(
+    `The ${label} is now ${current} (this screen showed ${expected}); reload before retrying`,
+    409,
+    'lifecycle_conflict',
+    { conflict: 'lifecycle', field, current, expected },
+  );
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!apiBase) throw new Error('Live API mode is not configured');
   const auth = window.__BIZCAIAOS_AUTH__;
@@ -343,7 +383,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (response.status === 204) return undefined as T;
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error?.message ?? 'Request failed');
+  if (!response.ok) {
+    throw new OperationsApiError(
+      payload.error?.message ?? 'Request failed',
+      response.status,
+      payload.error?.code ?? 'request_failed',
+      payload.error?.details,
+    );
+  }
   return payload.data as T;
 }
 
@@ -385,9 +432,9 @@ async function downloadRequest(path: string): Promise<{ blob: Blob; filename: st
   return { blob, filename };
 }
 
+// acquisition_stage and acquisition_status are absent: they change only through
+// transitionPropertyStage (L-02) and transitionPropertyStatus (L-03).
 const propertyPatchColumns: Record<string, string> = {
-  acquisitionStage: 'acquisition_stage',
-  acquisitionStatus: 'acquisition_status',
   titleNumber: 'title_number',
   taxDeclaration: 'tax_declaration',
   lotNumber: 'lot_number',
@@ -522,6 +569,230 @@ let demoAgreementSignatures: AgreementSignature[] = [];
 
 let demoInteractions: Interaction[] = [];
 
+/** Mirrors public.property_lifecycle_history: one row per stage or status change, append-only. */
+type DemoLifecycleHistory = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  field: 'acquisition_stage' | 'acquisition_status';
+  from_value: string | null;
+  to_value: string;
+  reason: string | null;
+  actor_user_id: string | null;
+  changed_at: string;
+  is_override: boolean;
+  overridden_rules: string[] | null;
+  remediation_id: string | null;
+};
+
+let demoLifecycleHistory: DemoLifecycleHistory[] = [];
+
+/** Mirrors acquisition_stage_position(): normal stages in workflow order; legacy values have none. */
+export const stageOrder: AcquisitionStage[] = [
+  'identified',
+  'initial_contact',
+  'owner_validation',
+  'property_validation',
+  'documentation',
+  'negotiation',
+  'commercial_review',
+  'legal_review',
+  'agreement_preparation',
+  'signing',
+  'payment_closing',
+];
+
+export const forwardStageRoles = new Set(['negotiator', 'supervisor', 'land_acquisition_manager', 'system_admin']);
+export const backwardStageRoles = new Set(['supervisor', 'land_acquisition_manager', 'system_admin']);
+const negotiationExceptionRoles = new Set(['supervisor', 'land_acquisition_manager', 'system_admin']);
+
+/** Mirrors can_read_property() for the demo actor. */
+function demoCanReadProperty(property: Property): boolean {
+  const member = demoActorMembership();
+  if (!member || member.organization_id !== property.organization_id) return false;
+  if (member.role === 'supervisor') {
+    const project = demoProjects.find((entry) => entry.id === property.project_id);
+    return property.assigned_manager_id === DEMO_ACTOR_ID || project?.manager_user_id === DEMO_ACTOR_ID;
+  }
+  if (member.role === 'negotiator') return property.assigned_negotiator_id === DEMO_ACTOR_ID;
+  return true;
+}
+
+/** Mirrors record_property_lifecycle_history(): initial values on create, each changed value on update. */
+function recordDemoLifecycleHistory(
+  previous: Property | null,
+  next: Property,
+  reason: string | null = null,
+  overrideRules: string[] | null = null,
+  remediationId: string | null = null,
+) {
+  const changedAt = new Date().toISOString();
+  for (const field of ['acquisition_stage', 'acquisition_status'] as const) {
+    const fromValue = previous ? previous[field] : null;
+    if (previous && fromValue === next[field]) continue;
+    // Only the field a transition changes carries its override rules; creation never does.
+    const rules = previous ? overrideRules : null;
+    demoLifecycleHistory.push({
+      id: crypto.randomUUID(),
+      organization_id: next.organization_id,
+      property_id: next.id,
+      field,
+      from_value: fromValue,
+      to_value: next[field],
+      reason,
+      actor_user_id: DEMO_ACTOR_ID,
+      changed_at: changedAt,
+      is_override: rules != null,
+      overridden_rules: rules,
+      remediation_id: previous && field === 'acquisition_stage' ? remediationId : null,
+    });
+  }
+}
+
+/** Legacy stage remediation (L-06): one row per review cycle. Mirrors property_stage_remediations. */
+export type RemediationState = 'UNDER_REVIEW' | 'REQUIRES_ESCALATION' | 'RESOLVED';
+
+export type RemediationEvent = {
+  id: string;
+  remediation_id: string;
+  action: 'review_started' | 'escalated' | 'returned_to_review' | 'resolved' | 'reopened';
+  from_state: string | null;
+  to_state: string;
+  reason: string | null;
+  actor_user_id: string;
+  occurred_at: string;
+};
+
+export type PropertyRemediation = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  cycle: number;
+  legacy_value: 'on_hold' | 'withdrawn' | 'acquisition_complete';
+  stage_at_open: string;
+  state: RemediationState;
+  opened_by_user_id: string;
+  opened_at: string;
+  resolved_by_user_id: string | null;
+  resolved_at: string | null;
+  resulting_stage: string | null;
+  resolution_reason: string | null;
+  evidence: string | null;
+  evidence_document_id: string | null;
+  evidence_interaction_id: string | null;
+  events?: RemediationEvent[];
+};
+
+export type RemediationQueueItem = {
+  property_id: string;
+  property_reference: string;
+  acquisition_stage: AcquisitionStage;
+  acquisition_status: AcquisitionStatus;
+  remediation_id: string | null;
+  cycle: number | null;
+  legacy_value: string | null;
+  state: RemediationState | 'NOT_REVIEWED';
+};
+
+export type ResolveRemediationInput = {
+  resultingStage: AcquisitionStage;
+  /** The stage the caller's screen showed (D-X1). */
+  expectedStage: AcquisitionStage;
+  reason?: string | null;
+  evidence?: string | null;
+  evidenceDocumentId?: string | null;
+  evidenceInteractionId?: string | null;
+};
+
+export const legacyStages: AcquisitionStage[] = ['on_hold', 'withdrawn', 'acquisition_complete'];
+
+let demoRemediations: PropertyRemediation[] = [];
+let demoRemediationEvents: RemediationEvent[] = [];
+
+const remediationRoles = new Set(['supervisor', 'land_acquisition_manager', 'system_admin']);
+
+/** Mirrors authorize_property_stage_remediation(): visibility (not found), then the N-1 remediation roles. */
+function demoAuthorizeRemediation(propertyId: string): Property {
+  const property = demoProperties.find((entry) => entry.id === propertyId);
+  if (!property || !demoCanReadProperty(property)) throw new Error('Property not found');
+  if (!remediationRoles.has(demoActorMembership()?.role ?? '')) {
+    throw new Error("You do not have permission to remediate this property's legacy stage");
+  }
+  return property;
+}
+
+function demoLatestRemediation(propertyId: string, expectedState: RemediationState) {
+  const latest = demoRemediations
+    .filter((entry) => entry.property_id === propertyId)
+    .sort((a, b) => b.cycle - a.cycle)[0];
+  if (!latest || latest.state !== expectedState) throw new Error(`No remediation cycle of this property is ${expectedState}`);
+  return latest;
+}
+
+function demoRemediationEvent(
+  remediation: PropertyRemediation,
+  action: RemediationEvent['action'],
+  fromState: string | null,
+  toState: string,
+  reason: string | null,
+) {
+  demoRemediationEvents.push({
+    id: crypto.randomUUID(),
+    remediation_id: remediation.id,
+    action,
+    from_state: fromState,
+    to_state: toState,
+    reason,
+    actor_user_id: DEMO_ACTOR_ID,
+    occurred_at: new Date().toISOString(),
+  });
+}
+
+function demoMoveRemediation(
+  propertyId: string,
+  fromState: RemediationState,
+  toState: RemediationState,
+  action: RemediationEvent['action'],
+  reason: string | null | undefined,
+  reasonRequired: boolean,
+) {
+  demoAuthorizeRemediation(propertyId);
+  const remediation = demoLatestRemediation(propertyId, fromState);
+  // A blank optional reason is none (Q-4, Q-5); escalation requires one (Q-3).
+  const cleanReason = reason?.trim() || null;
+  if (reasonRequired && !cleanReason) throw new Error('A reason is required to escalate this remediation');
+  remediation.state = toState;
+  demoRemediationEvent(remediation, action, fromState, toState, cleanReason);
+  return { ...remediation };
+}
+
+export type AcquisitionStatus = 'active' | 'on_hold' | 'withdrawn' | 'complete';
+
+const normalStatusRoles = new Set(['negotiator', 'supervisor', 'land_acquisition_manager', 'system_admin']);
+const controlledStatusRoles = new Set(['supervisor', 'land_acquisition_manager', 'system_admin']);
+const completeReversalRoles = new Set(['land_acquisition_manager', 'system_admin']);
+
+/** Mirrors the N-2 operation rows in transition_property_status(). */
+export function demoStatusOperation(from: string, to: AcquisitionStatus, stage: AcquisitionStage) {
+  let roles = controlledStatusRoles;
+  let reasonRequired = false;
+  const rules: string[] = [];
+  if ((from === 'active' && to === 'on_hold') || (from === 'on_hold' && to === 'active')) {
+    roles = normalStatusRoles;
+  } else if (to === 'withdrawn' && (from === 'active' || from === 'on_hold')) {
+    reasonRequired = true;
+  } else if (from === 'on_hold' && to === 'complete') {
+    rules.push('on_hold_completion');
+  } else if (from === 'withdrawn') {
+    rules.push('withdrawn_reversal');
+  } else if (from === 'complete') {
+    roles = completeReversalRoles;
+    rules.push('complete_reversal');
+  }
+  if (to === 'complete' && stage !== 'payment_closing') rules.push('completion_stage_condition');
+  return { roles, reasonRequired: reasonRequired || rules.length > 0, rules };
+}
+
 const interactionRoles = new Set(['system_admin', 'land_acquisition_manager', 'supervisor', 'negotiator']);
 const interactionTypes = new Set<InteractionType>(['call', 'meeting', 'site_visit', 'message', 'other']);
 
@@ -642,7 +913,39 @@ const timelineSourceRank: Record<TimelineSourceType, number> = {
   payment: 5,
   agreement_signature: 6,
   interaction: 7,
+  lifecycle: 8,
 };
+
+// Stage labels mirror the property screens; legacy stage values keep their display names.
+const timelineStageLabels: Record<string, string> = {
+  identified: 'Identified',
+  initial_contact: 'Initial contact',
+  owner_validation: 'Owner validation',
+  property_validation: 'Property validation',
+  documentation: 'Documentation',
+  negotiation: 'Negotiation',
+  commercial_review: 'Commercial review',
+  legal_review: 'Legal review',
+  agreement_preparation: 'Agreement preparation',
+  signing: 'Signing',
+  payment_closing: 'Payment / closing',
+  acquisition_complete: 'Complete',
+  on_hold: 'On hold',
+  withdrawn: 'Withdrawn',
+};
+
+const timelineStatusLabels: Record<string, string> = {
+  active: 'Active',
+  on_hold: 'On hold',
+  withdrawn: 'Withdrawn',
+  complete: 'Complete',
+};
+
+function timelineLifecycleSummary(noun: string, labels: Record<string, string>, fromValue: string | null, toValue: string) {
+  const to = labels[toValue] ?? toValue;
+  // The reason recorded with a change is never part of the summary.
+  return fromValue == null ? `${noun} set to ${to}` : `${noun} changed from ${labels[fromValue] ?? fromValue} to ${to}`;
+}
 
 const timelineInteractionTypeLabels: Record<InteractionType, string> = {
   call: 'Call',
@@ -807,6 +1110,26 @@ function demoPropertyTimeline(property: Property, timeZone: string, page: { limi
       });
     }
   }
+  // Lifecycle history is visible wherever the property is.
+  for (const history of demoLifecycleHistory) {
+    if (history.property_id !== property.id || !reached(history.changed_at)) continue;
+    const isStage = history.field === 'acquisition_stage';
+    add({
+      kind: isStage ? 'stage_changed' : 'status_changed',
+      source_type: 'lifecycle',
+      source_id: history.id,
+      occurred_at: new Date(history.changed_at).toISOString(),
+      precision: 'timestamp',
+      basis: 'occurrence',
+      actor: demoTimelineActor(history.actor_user_id),
+      // An override is shown as such; its reason and rules stay out of the summary.
+      summary: `${
+        isStage
+          ? timelineLifecycleSummary('Acquisition stage', timelineStageLabels, history.from_value, history.to_value)
+          : timelineLifecycleSummary('Acquisition status', timelineStatusLabels, history.from_value, history.to_value)
+      }${history.is_override ? ' (override)' : history.remediation_id ? ' (legacy remediation)' : ''}`,
+    });
+  }
 
   // Same keys as the server: calendar day (organization timezone) desc,
   // date-only after that day's timestamps (desc), timestamp desc, tie rank,
@@ -947,6 +1270,29 @@ export function resetOperationsDemoState() {
       payment_status: 'not_started',
       readiness_percent: 42,
       risk: 'high',
+    },
+    // A pre-existing record still on a legacy stage value, awaiting remediation (L-06).
+    {
+      id: '70000000-0000-4000-8000-000000000004',
+      organization_id: demoOrg,
+      project_id: projectId,
+      property_reference: 'NCP-00077',
+      title_number: null,
+      tax_declaration: 'TD-077',
+      lot_number: 'Lot 77',
+      area_hectares: 1.4,
+      municipality: 'Calamba',
+      province: 'Laguna',
+      barangay: 'Makiling',
+      acquisition_stage: 'withdrawn',
+      acquisition_status: 'active',
+      assigned_negotiator_id: null,
+      assigned_manager_id: null,
+      legal_status: 'unknown',
+      documentation_status: 'missing',
+      payment_status: 'not_started',
+      readiness_percent: 0,
+      risk: 'medium',
     },
   ].map((property) => decorateProperty(property as Property));
   demoOwners = [
@@ -1096,6 +1442,11 @@ export function resetOperationsDemoState() {
   demoAgreementSignatures = [];
   // No seeded interactions, so the seeded Timeline stays as documented.
   demoInteractions = [];
+  // No backfill: seeded properties have no lifecycle history until they change.
+  demoLifecycleHistory = [];
+  // No seeded remediation cycles: the seed has no legacy-stage properties.
+  demoRemediations = [];
+  demoRemediationEvents = [];
 }
 
 resetOperationsDemoState();
@@ -1217,6 +1568,10 @@ export const operationsApi = {
 
   async createProperty(input: CreatePropertyInput) {
     if (operationsApiMode === 'live') return request<Property>('/ops/properties', { method: 'POST', body: JSON.stringify(input) });
+    // Mirrors enforce_property_creation_rules() (P-6, L-05): identified is the only creation stage.
+    if (input.acquisitionStage !== undefined && input.acquisitionStage !== 'identified') {
+      throw new Error(`A property can only be created in the identified stage (requested ${input.acquisitionStage})`);
+    }
     const project = demoProjects.find((entry) => entry.id === input.projectId);
     if (!project || project.organization_id !== input.organizationId) {
       throw new Error('Property project must belong to the same organization');
@@ -1234,7 +1589,7 @@ export const operationsApi = {
       municipality: input.municipality ?? null,
       province: input.province ?? null,
       barangay: input.barangay ?? null,
-      acquisition_stage: input.acquisitionStage ?? 'identified',
+      acquisition_stage: 'identified',
       acquisition_status: 'active',
       assigned_negotiator_id: input.assignedNegotiatorId ?? null,
       assigned_manager_id: input.assignedManagerId ?? null,
@@ -1245,6 +1600,7 @@ export const operationsApi = {
       risk: (input.risk ?? 'medium') as 'low' | 'medium' | 'high',
     });
     demoProperties = [property, ...demoProperties];
+    recordDemoLifecycleHistory(null, property);
     return property;
   },
 
@@ -1254,12 +1610,278 @@ export const operationsApi = {
     }
     const index = demoProperties.findIndex((property) => property.id === id);
     if (index < 0) throw new Error('Property not found');
+    if (input.acquisitionStage !== undefined) {
+      throw new Error('Use a stage transition to change the acquisition stage');
+    }
+    if (input.acquisitionStatus !== undefined) {
+      throw new Error('Use a status transition to change the acquisition status');
+    }
     const mapped = Object.fromEntries(
       Object.entries(input).map(([key, value]) => [propertyPatchColumns[key] ?? key, value]),
     );
     const next = { ...demoProperties[index], ...mapped } as Property;
     assertAssignmentRoles(next.organization_id, next.assigned_negotiator_id, next.assigned_manager_id);
+    const previous = demoProperties[index];
     demoProperties[index] = decorateProperty(next);
+    recordDemoLifecycleHistory(previous, demoProperties[index]);
+    return demoProperties[index];
+  },
+
+  /** Mirrors transition_property_stage(): the only path that changes the stage. */
+  async transitionPropertyStage(
+    id: string,
+    input: { targetStage: AcquisitionStage; expectedStage: AcquisitionStage; reason?: string | null; override?: boolean },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<Property>(`/ops/properties/${id}/stage-transitions`, { method: 'POST', body: JSON.stringify(input) });
+    }
+    const index = demoProperties.findIndex((property) => property.id === id);
+    if (index < 0 || !demoCanReadProperty(demoProperties[index])) throw new Error('Property not found');
+    const previous = demoProperties[index];
+    if (input.expectedStage !== previous.acquisition_stage) {
+      demoLifecycleConflict('acquisition_stage', previous.acquisition_stage, input.expectedStage);
+    }
+    if (input.targetStage === previous.acquisition_stage) return previous;
+    const fromPosition = stageOrder.indexOf(previous.acquisition_stage);
+    const toPosition = stageOrder.indexOf(input.targetStage);
+    if (fromPosition < 0) {
+      throw new Error(`The current stage ${previous.acquisition_stage} is a legacy value and can only be resolved through remediation`);
+    }
+    if (toPosition < 0) throw new Error(`The stage ${input.targetStage} is a legacy value and cannot be selected`);
+    const role = demoActorMembership()?.role ?? '';
+    const reason = input.reason?.trim() || null;
+    if (toPosition > fromPosition) {
+      if (!forwardStageRoles.has(role)) throw new Error('You do not have permission to move this property to a later stage');
+    } else {
+      if (!backwardStageRoles.has(role)) throw new Error('You do not have permission to move this property to an earlier stage');
+      if (!reason) throw new Error('A reason is required to move a property to an earlier stage');
+    }
+    // Mirrors the negotiation exception (L-04): an open or paused negotiation,
+    // archived or not, blocks leaving negotiation unless deliberately overridden.
+    const rules: string[] = [];
+    if (
+      previous.acquisition_stage === 'negotiation' &&
+      demoNegotiations.some((negotiation) => negotiation.property_id === id && (negotiation.status === 'open' || negotiation.status === 'paused'))
+    ) {
+      rules.push('negotiation_unresolved_exit');
+    }
+    if (rules.length > 0) {
+      if (!negotiationExceptionRoles.has(role)) {
+        throw new Error('You do not have permission to leave negotiation while a negotiation is open or paused');
+      }
+      if (!reason) throw new Error('A reason is required to leave negotiation while a negotiation is open or paused');
+      if (!input.override) {
+        throw new Error('Leaving negotiation while a negotiation is open or paused requires an override (negotiation_unresolved_exit)');
+      }
+    } else if (input.override) {
+      throw new Error(`No override applies to moving this property from ${previous.acquisition_stage} to ${input.targetStage}`);
+    }
+    demoProperties[index] = decorateProperty({ ...previous, acquisition_stage: input.targetStage });
+    recordDemoLifecycleHistory(previous, demoProperties[index], reason, rules.length > 0 ? rules : null);
+    return demoProperties[index];
+  },
+
+  /** Mirrors transition_property_status(): the only path that changes the status. */
+  /** Mirrors the remediation queue: legacy-stage properties and open cycles, NOT_REVIEWED when no cycle exists. */
+  async listRemediationQueue(organizationId: string) {
+    if (operationsApiMode === 'live') {
+      return request<RemediationQueueItem[]>(`/ops/remediations?${new URLSearchParams({ organizationId })}`);
+    }
+    return demoProperties
+      .filter((property) => property.organization_id === organizationId && demoCanReadProperty(property))
+      .map((property): RemediationQueueItem | null => {
+        const latest = demoRemediations.filter((entry) => entry.property_id === property.id).sort((a, b) => b.cycle - a.cycle)[0];
+        const open = latest && latest.state !== 'RESOLVED';
+        if (!legacyStages.includes(property.acquisition_stage) && !open) return null;
+        return {
+          property_id: property.id,
+          property_reference: property.property_reference,
+          acquisition_stage: property.acquisition_stage,
+          acquisition_status: property.acquisition_status,
+          remediation_id: latest?.id ?? null,
+          cycle: latest?.cycle ?? null,
+          legacy_value: latest?.legacy_value ?? null,
+          state: latest?.state ?? 'NOT_REVIEWED',
+        };
+      })
+      .filter((item): item is RemediationQueueItem => item !== null)
+      .sort((a, b) => a.property_reference.localeCompare(b.property_reference));
+  },
+
+  /** The remediation cycles of a property, oldest first, each with its events. */
+  async listPropertyRemediations(propertyId: string) {
+    if (operationsApiMode === 'live') return request<PropertyRemediation[]>(`/ops/properties/${propertyId}/remediations`);
+    const property = demoProperties.find((entry) => entry.id === propertyId);
+    if (!property || !demoCanReadProperty(property)) throw new Error('Property not found');
+    return demoRemediations
+      .filter((entry) => entry.property_id === propertyId)
+      .sort((a, b) => a.cycle - b.cycle)
+      .map((entry) => ({ ...entry, events: demoRemediationEvents.filter((event) => event.remediation_id === entry.id) }));
+  },
+
+  /** Mirrors start_property_stage_remediation(): NOT_REVIEWED -> UNDER_REVIEW for a legacy-stage property. */
+  async startRemediation(propertyId: string) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/start`, { method: 'POST', body: '{}' });
+    }
+    const property = demoAuthorizeRemediation(propertyId);
+    if (!legacyStages.includes(property.acquisition_stage)) {
+      throw new Error(`The stage ${property.acquisition_stage} is not a legacy value; there is nothing to remediate`);
+    }
+    if (demoRemediations.some((entry) => entry.property_id === propertyId)) {
+      throw new Error('This property already has a remediation cycle; continue or reopen it');
+    }
+    const remediation: PropertyRemediation = {
+      id: crypto.randomUUID(),
+      organization_id: property.organization_id,
+      property_id: propertyId,
+      cycle: 1,
+      legacy_value: property.acquisition_stage as PropertyRemediation['legacy_value'],
+      stage_at_open: property.acquisition_stage,
+      state: 'UNDER_REVIEW',
+      opened_by_user_id: DEMO_ACTOR_ID,
+      opened_at: new Date().toISOString(),
+      resolved_by_user_id: null,
+      resolved_at: null,
+      resulting_stage: null,
+      resolution_reason: null,
+      evidence: null,
+      evidence_document_id: null,
+      evidence_interaction_id: null,
+    };
+    demoRemediations.push(remediation);
+    demoRemediationEvent(remediation, 'review_started', 'NOT_REVIEWED', 'UNDER_REVIEW', null);
+    return { ...remediation };
+  },
+
+  /** Mirrors escalate_property_stage_remediation(): insufficient evidence (R-8); the stage is kept. */
+  async escalateRemediation(propertyId: string, input: { reason?: string | null }) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/escalate`, { method: 'POST', body: JSON.stringify(input) });
+    }
+    return demoMoveRemediation(propertyId, 'UNDER_REVIEW', 'REQUIRES_ESCALATION', 'escalated', input.reason, true);
+  },
+
+  /** Mirrors return_property_stage_remediation_to_review(): escalation resolution. */
+  async returnRemediationToReview(propertyId: string, input: { reason?: string | null }) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/return-to-review`, {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+    }
+    return demoMoveRemediation(propertyId, 'REQUIRES_ESCALATION', 'UNDER_REVIEW', 'returned_to_review', input.reason, false);
+  },
+
+  /** Mirrors resolve_property_stage_remediation(): reason and evidence (Q-1), references, and integrity (P-12). */
+  async resolveRemediation(propertyId: string, input: ResolveRemediationInput) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/resolve`, { method: 'POST', body: JSON.stringify(input) });
+    }
+    const property = demoAuthorizeRemediation(propertyId);
+    if (input.expectedStage !== property.acquisition_stage) {
+      demoLifecycleConflict('acquisition_stage', property.acquisition_stage, input.expectedStage);
+    }
+    const remediation = demoLatestRemediation(propertyId, 'UNDER_REVIEW');
+    const reason = input.reason?.trim() || null;
+    const evidence = input.evidence?.trim() || null;
+    if (!reason) throw new Error('A reason is required to resolve a legacy stage');
+    if (!evidence) throw new Error('Supporting evidence is required to resolve a legacy stage');
+    if (input.evidenceDocumentId && input.evidenceInteractionId) {
+      throw new Error('Reference either a document or an interaction as evidence, not both');
+    }
+    if (input.evidenceDocumentId && !demoDocuments.some((entry) => entry.id === input.evidenceDocumentId && entry.property_id === propertyId)) {
+      throw new Error('The evidence document must belong to this property');
+    }
+    if (
+      input.evidenceInteractionId &&
+      !demoInteractions.some((entry) => entry.id === input.evidenceInteractionId && entry.property_id === propertyId)
+    ) {
+      throw new Error('The evidence interaction must belong to this property');
+    }
+    if (!stageOrder.includes(input.resultingStage)) {
+      throw new Error(`The stage ${input.resultingStage} is a legacy value and cannot be the corrected stage`);
+    }
+    if (
+      input.resultingStage !== 'negotiation' &&
+      demoNegotiations.some((entry) => entry.property_id === propertyId && (entry.status === 'open' || entry.status === 'paused'))
+    ) {
+      throw new Error('A property with an open or paused negotiation can only be resolved to negotiation');
+    }
+    Object.assign(remediation, {
+      state: 'RESOLVED',
+      resolved_by_user_id: DEMO_ACTOR_ID,
+      resolved_at: new Date().toISOString(),
+      resulting_stage: input.resultingStage,
+      resolution_reason: reason,
+      evidence,
+      evidence_document_id: input.evidenceDocumentId ?? null,
+      evidence_interaction_id: input.evidenceInteractionId ?? null,
+    });
+    demoRemediationEvent(remediation, 'resolved', 'UNDER_REVIEW', 'RESOLVED', reason);
+    if (property.acquisition_stage !== input.resultingStage) {
+      const index = demoProperties.findIndex((entry) => entry.id === propertyId);
+      demoProperties[index] = decorateProperty({ ...property, acquisition_stage: input.resultingStage });
+      recordDemoLifecycleHistory(property, demoProperties[index], reason, null, remediation.id);
+    }
+    return { ...remediation };
+  },
+
+  /** Mirrors reopen_property_stage_remediation(): a new cycle; the resolved one is kept (R-7). */
+  async reopenRemediation(propertyId: string, input: { reason?: string | null }) {
+    if (operationsApiMode === 'live') {
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/reopen`, { method: 'POST', body: JSON.stringify(input) });
+    }
+    const property = demoAuthorizeRemediation(propertyId);
+    const previous = demoLatestRemediation(propertyId, 'RESOLVED');
+    // The reason is optional (Q-5); a blank one is none.
+    const reason = input.reason?.trim() || null;
+    const remediation: PropertyRemediation = {
+      ...previous,
+      id: crypto.randomUUID(),
+      cycle: previous.cycle + 1,
+      stage_at_open: property.acquisition_stage,
+      state: 'UNDER_REVIEW',
+      opened_by_user_id: DEMO_ACTOR_ID,
+      opened_at: new Date().toISOString(),
+      resolved_by_user_id: null,
+      resolved_at: null,
+      resulting_stage: null,
+      resolution_reason: null,
+      evidence: null,
+      evidence_document_id: null,
+      evidence_interaction_id: null,
+    };
+    demoRemediations.push(remediation);
+    demoRemediationEvent(remediation, 'reopened', 'RESOLVED', 'UNDER_REVIEW', reason);
+    return { ...remediation };
+  },
+
+  async transitionPropertyStatus(
+    id: string,
+    input: { targetStatus: AcquisitionStatus; expectedStatus: AcquisitionStatus; reason?: string | null; override?: boolean },
+  ) {
+    if (operationsApiMode === 'live') {
+      return request<Property>(`/ops/properties/${id}/status-transitions`, { method: 'POST', body: JSON.stringify(input) });
+    }
+    const index = demoProperties.findIndex((property) => property.id === id);
+    if (index < 0 || !demoCanReadProperty(demoProperties[index])) throw new Error('Property not found');
+    const previous = demoProperties[index];
+    const from = previous.acquisition_status;
+    if (input.expectedStatus !== from) demoLifecycleConflict('acquisition_status', from, input.expectedStatus);
+    const to = input.targetStatus;
+    if (to === from) return previous;
+    const operation = demoStatusOperation(from, to, previous.acquisition_stage);
+    const role = demoActorMembership()?.role ?? '';
+    const reason = input.reason?.trim() || null;
+    if (!operation.roles.has(role)) throw new Error(`You do not have permission to change this property from ${from} to ${to}`);
+    if (operation.reasonRequired && !reason) throw new Error(`A reason is required to change this property from ${from} to ${to}`);
+    if (operation.rules.length > 0 && !input.override) {
+      throw new Error(`Changing this property from ${from} to ${to} requires an override (${operation.rules.join(', ')})`);
+    }
+    if (operation.rules.length === 0 && input.override) throw new Error(`No override applies to changing this property from ${from} to ${to}`);
+    demoProperties[index] = decorateProperty({ ...previous, acquisition_status: to });
+    recordDemoLifecycleHistory(previous, demoProperties[index], reason, operation.rules.length > 0 ? operation.rules : null);
     return demoProperties[index];
   },
 
