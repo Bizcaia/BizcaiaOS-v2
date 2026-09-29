@@ -797,4 +797,169 @@ describe('operationsApi demo adapter', () => {
     await operationsApi.getPropertyTimeline(signatureProperty, { limit: 2, offset: 1 });
     expect(await snapshot()).toBe(before);
   });
+
+  // Interactions (Gate A): the demo mirrors the database guard and the
+  // Timeline branch. The demo actor is always system_admin, so role denial
+  // and supervisor/negotiator scope are proven in the mocked and PostgreSQL suites.
+  it('records, lists, and archives an interaction with server-derived fields', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const created = await operationsApi.createInteraction(signatureProperty, {
+      interactionType: 'site_visit',
+      notes: '  Walked the boundary with the owner.  ',
+      ownerId: rosa,
+    });
+    expect(created).toMatchObject({
+      property_id: signatureProperty,
+      owner_id: rosa,
+      owner_name: 'Rosa Mendoza',
+      interaction_type: 'site_visit',
+      notes: 'Walked the boundary with the owner.',
+      recorded_by_user_id: alex,
+      recorded_by_name: 'Alex Villanueva',
+      archived_at: null,
+    });
+    expect((await operationsApi.listInteractions(signatureProperty)).map((row) => row.id)).toEqual([created.id]);
+
+    const archived = await operationsApi.archiveInteraction(created.id);
+    expect(archived.archived_at).not.toBeNull();
+    expect(archived).toMatchObject({ notes: 'Walked the boundary with the owner.', interaction_type: 'site_visit' });
+    expect((await operationsApi.archiveInteraction(created.id)).archived_at).toBe(archived.archived_at);
+    expect(await operationsApi.listInteractions(signatureProperty)).toEqual([]);
+    await expect(operationsApi.archiveInteraction('c0000000-0000-4000-8000-00000000dead')).rejects.toThrow(/not found/);
+  });
+
+  it('accepts exactly the five locked types and rejects note, follow_up, and blank or oversized notes', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    for (const interactionType of ['call', 'meeting', 'site_visit', 'message', 'other'] as const) {
+      await operationsApi.createInteraction(emptyProperty, { interactionType, notes: 'x'.repeat(4000) });
+    }
+    for (const interactionType of ['note', 'follow_up', 'offer']) {
+      await expect(
+        operationsApi.createInteraction(emptyProperty, { interactionType: interactionType as 'call', notes: 'x' }),
+      ).rejects.toThrow(/validation/);
+    }
+    for (const notes of ['', ' \n\t ', 'x'.repeat(4001)]) {
+      await expect(operationsApi.createInteraction(emptyProperty, { interactionType: 'call', notes })).rejects.toThrow(/validation/);
+    }
+    expect(await operationsApi.listInteractions(emptyProperty)).toHaveLength(5);
+  });
+
+  it('keeps the owner optional and requires a supplied owner to be linked to the property', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const stranger = await operationsApi.createOwner({
+      organizationId: '2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f',
+      ownerType: 'individual',
+      displayName: 'Not Linked Here',
+    });
+    expect((await operationsApi.createInteraction(signatureProperty, { interactionType: 'call', notes: 'x' })).owner_id).toBeNull();
+    await expect(
+      operationsApi.createInteraction(signatureProperty, { interactionType: 'call', notes: 'x', ownerId: stranger.id }),
+    ).rejects.toThrow(/existing owner/);
+    await expect(
+      operationsApi.createInteraction(emptyProperty, { interactionType: 'call', notes: 'x', ownerId: rosa }),
+    ).rejects.toThrow(/existing owner/);
+  });
+
+  it('rejects a future occurredAt with zero tolerance and stamps the current time when omitted', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    await expect(
+      operationsApi.createInteraction(emptyProperty, {
+        interactionType: 'call',
+        notes: 'x',
+        occurredAt: new Date(Date.now() + 1000).toISOString(),
+      }),
+    ).rejects.toThrow(/future/);
+    await expect(
+      operationsApi.createInteraction(emptyProperty, { interactionType: 'call', notes: 'x', occurredAt: '2026-09-01 10:00' }),
+    ).rejects.toThrow(/validation/);
+    const past = await operationsApi.createInteraction(emptyProperty, {
+      interactionType: 'call',
+      notes: 'x',
+      occurredAt: '2026-01-15T09:30:00.000Z',
+    });
+    expect(past.occurred_at).toBe('2026-01-15T09:30:00.000Z');
+    const before = Date.now();
+    const stamped = await operationsApi.createInteraction(emptyProperty, { interactionType: 'call', notes: 'x' });
+    expect(new Date(stamped.occurred_at).getTime()).toBeGreaterThanOrEqual(before);
+    expect(new Date(stamped.occurred_at).getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('adds interactions to the Timeline at rank 7 with structured summaries, no notes, and no archived entries', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    // Same instant as the seeded task created at 2026-09-20T00:00Z: the task (rank 4) sorts first.
+    const call = await operationsApi.createInteraction(signatureProperty, {
+      interactionType: 'call',
+      notes: 'Owner shared a private family matter',
+      ownerId: rosa,
+      occurredAt: '2026-09-20T00:00:00.000Z',
+    });
+    const visit = await operationsApi.createInteraction(signatureProperty, {
+      interactionType: 'site_visit',
+      notes: 'Gate code 4471',
+      occurredAt: '2026-09-21T00:00:00.000Z',
+    });
+    const archived = await operationsApi.createInteraction(signatureProperty, {
+      interactionType: 'meeting',
+      notes: 'Archived meeting',
+      occurredAt: '2026-09-22T00:00:00.000Z',
+    });
+    await operationsApi.archiveInteraction(archived.id);
+
+    const entries = await operationsApi.getPropertyTimeline(signatureProperty);
+    const order = entries.map((entry) => entry.source_id);
+    expect(order.slice(0, 4)).toEqual([
+      visit.id,
+      'a1000000-0000-4000-8000-000000000001',
+      'b1000000-0000-4000-8000-000000000002',
+      call.id,
+    ]);
+    expect(entries.find((entry) => entry.source_id === call.id)).toEqual({
+      id: `interaction:${call.id}:interaction`,
+      kind: 'interaction',
+      source_type: 'interaction',
+      source_id: call.id,
+      occurred_at: '2026-09-20T00:00:00.000Z',
+      precision: 'timestamp',
+      basis: 'occurrence',
+      actor: { id: alex, display_name: 'Alex Villanueva' },
+      summary: 'Call with Rosa Mendoza',
+      archived: false,
+    });
+    expect(entries.find((entry) => entry.source_id === visit.id)?.summary).toBe('Site visit');
+    expect(order).not.toContain(archived.id);
+    const serialized = JSON.stringify(entries);
+    expect(serialized).not.toContain('private family matter');
+    expect(serialized).not.toContain('Gate code');
+  });
+
+  it('keeps an interaction after its owner is unlinked and allows many per property and per owner', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    for (const interactionType of ['call', 'call', 'message'] as const) {
+      await operationsApi.createInteraction(signatureProperty, { interactionType, notes: 'x', ownerId: rosa });
+    }
+    await operationsApi.unlinkPropertyOwner(signatureProperty, rosa);
+    const listed = await operationsApi.listInteractions(signatureProperty);
+    expect(listed.filter((row) => row.owner_id === rosa)).toHaveLength(3);
+    expect(listed.every((row) => row.owner_name === 'Rosa Mendoza')).toBe(true);
+    const summaries = (await operationsApi.getPropertyTimeline(signatureProperty)).map((entry) => entry.summary);
+    expect(summaries.filter((summary) => summary === 'Call with Rosa Mendoza')).toHaveLength(2);
+  });
+
+  it('changes no lifecycle field or other vertical when recording and archiving interactions', async () => {
+    const { operationsApi } = await import('./operationsApi');
+    const snapshot = async () =>
+      JSON.stringify([
+        await operationsApi.getProperty(signatureProperty),
+        await operationsApi.listNegotiations('2cb1ec8c-2fc4-47b9-99ec-bb1e7d64a91f', { propertyId: signatureProperty }),
+        await operationsApi.listDocuments(signatureProperty, { includeArchived: true }),
+        await operationsApi.listTasks(signatureProperty, { includeArchived: true }),
+        await operationsApi.listPayments(signatureProperty, { includeArchived: true }),
+        await operationsApi.listAgreementSignatures(signatureProperty, { includeArchived: true }),
+        await operationsApi.listPropertyOwners(signatureProperty),
+      ]);
+    const before = await snapshot();
+    const created = await operationsApi.createInteraction(signatureProperty, { interactionType: 'meeting', notes: 'x', ownerId: rosa });
+    await operationsApi.archiveInteraction(created.id);
+    expect(await snapshot()).toBe(before);
+  });
 });

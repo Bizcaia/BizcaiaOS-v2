@@ -214,6 +214,23 @@ export const archiveAgreementSignatureSchema = z.object({
   archived: z.literal(true),
 });
 
+export const interactionTypeSchema = z.enum(['call', 'meeting', 'site_visit', 'message', 'other']);
+
+// organization_id, property_id, and recorded_by_user_id are derived
+// server-side. occurredAt defaults to the server clock; a supplied future
+// value is rejected by the database (zero tolerance).
+export const createInteractionSchema = z.object({
+  interactionType: interactionTypeSchema,
+  notes: z.string().trim().min(1).max(4000),
+  occurredAt: z.string().datetime().optional(),
+  ownerId: z.uuid().nullable().optional(),
+});
+
+// Interactions are immutable; the only permitted change is archiving.
+export const archiveInteractionSchema = z.object({
+  archived: z.literal(true),
+});
+
 // Same limit/offset convention as propertyListQuerySchema. There is
 // deliberately no includeArchived: archived records never appear.
 export const propertyTimelineQuerySchema = z.object({

@@ -93,7 +93,8 @@ describe('OpsApp property workflow', () => {
     await user.click(screen.getByRole('button', { name: 'Create and link owner' }));
 
     await waitFor(() => {
-      expect(screen.getByText('River Estate')).toBeVisible();
+      // The owner list entry; the name also appears as an Interaction owner option.
+      expect(screen.getByText('River Estate', { selector: 'strong' })).toBeVisible();
       expect(screen.getByText(/Estate · Primary · 100%/)).toBeVisible();
     });
   });
@@ -525,5 +526,81 @@ describe('OpsApp property workflow', () => {
       { limit: 50, offset: 50 },
     ]);
     spy.mockRestore();
+  });
+
+  function actAs(role: string) {
+    apiMocks.getMe.mockResolvedValue({
+      id: members[0].user_id,
+      email: members[0].email,
+      displayName: members[0].display_name,
+      organizations: [{ ...organization, role }],
+    });
+  }
+
+  async function openInteractions() {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+    const heading = await screen.findByRole('heading', { name: 'Interactions' });
+    return { user, section: heading.closest('section')! };
+  }
+
+  it('records an interaction before the negotiation block and shows it without notes in the Timeline', async () => {
+    const { user, section } = await openInteractions();
+    const negotiation = screen.getByRole('heading', { name: 'Negotiation' }).closest('section')!;
+    expect(section.compareDocumentPosition(negotiation) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(await within(section).findByText('No interactions recorded yet.')).toBeVisible();
+
+    const record = within(section).getByRole('button', { name: 'Record interaction' });
+    expect(record).toBeDisabled();
+    const ownerOptions = within(within(section).getByLabelText('Interaction owner')).getAllByRole('option');
+    expect(ownerOptions.map((option) => option.textContent)).toEqual(['No specific owner', 'Rosa Mendoza']);
+    expect(
+      within(within(section).getByLabelText('Interaction type')).getAllByRole('option').map((option) => option.textContent),
+    ).toEqual(['Call', 'Meeting', 'Site visit', 'Message', 'Other interaction']);
+
+    await user.selectOptions(within(section).getByLabelText('Interaction type'), 'site_visit');
+    await user.selectOptions(within(section).getByLabelText('Interaction owner'), '80000000-0000-4000-8000-000000000001');
+    await user.type(within(section).getByLabelText('Interaction notes'), 'Walked the eastern boundary');
+    await user.click(record);
+
+    const entry = (await within(section).findByText('Site visit with Rosa Mendoza')).closest('li')!;
+    expect(within(entry).getByText('Walked the eastern boundary')).toBeVisible();
+    expect(within(entry).getByText(/Recorded by Alex Villanueva/)).toBeVisible();
+
+    const timeline = screen.getByRole('heading', { name: 'Timeline' }).closest('section')!;
+    await user.click(within(timeline).getByRole('button', { name: 'Refresh timeline' }));
+    expect(await within(timeline).findByText('Site visit with Rosa Mendoza')).toBeVisible();
+    expect(within(timeline).queryByText(/Walked the eastern boundary/)).not.toBeInTheDocument();
+
+    await user.click(within(section).getByRole('button', { name: /^Archive Site visit with Rosa Mendoza from / }));
+    expect(await within(section).findByText('No interactions recorded yet.')).toBeVisible();
+  });
+
+  it('shows the server error for a future occurred time and records nothing', async () => {
+    const { user, section } = await openInteractions();
+    fireEvent.change(within(section).getByLabelText(/Occurred at/), { target: { value: '2999-01-01T10:00' } });
+    await user.type(within(section).getByLabelText('Interaction notes'), 'Planned meeting');
+    await user.click(within(section).getByRole('button', { name: 'Record interaction' }));
+    expect(await within(section).findByText(/occurred_at is in the future/)).toHaveClass('form-error');
+    expect(within(section).getByText('No interactions recorded yet.')).toBeVisible();
+  });
+
+  it.each(['supervisor', 'negotiator', 'land_acquisition_manager'])('shows the interaction block to %s', async (role) => {
+    actAs(role);
+    const { section } = await openInteractions();
+    expect(within(section).getByRole('button', { name: 'Record interaction' })).toBeInTheDocument();
+  });
+
+  it.each(['legal_documentation', 'finance', 'viewer'])('hides the interaction block from %s', async (role) => {
+    actAs(role);
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+    expect(await screen.findByRole('heading', { name: 'Timeline' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Interactions' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Interaction notes')).not.toBeInTheDocument();
   });
 });
