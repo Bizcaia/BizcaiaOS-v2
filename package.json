@@ -18,7 +18,8 @@
     "test": "npm run test:frontend && npm run test:api",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down",
-    "db:reset": "docker compose down -v && docker compose up -d --wait && npm run db:migrate",
+    "db:reset": "docker compose down -v && docker compose up -d --wait && npm run db:provision-app-role && npm run db:migrate",
+    "db:provision-app-role": "tsx server/provisionAppRole.ts",
     "db:migrate": "tsx server/migrate.ts",
     "test:integration": "vitest run server/integration --environment node"
   },
