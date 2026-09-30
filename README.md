@@ -28,11 +28,14 @@ This starts Postgres 16 on `POSTGRES_PORT` (default 5432) with a persistent Dock
 
 `DATABASE_MIGRATE_URL` must use the **owner/migrate** role. Migrations run as that role.
 
-### 4. Run migrations
+### 4. Create the application role and run migrations
 ```bash
+npm run db:provision-app-role
 npm run db:migrate
 ```
-Applies `database/001` through `database/006` in order, records them in `public.schema_migrations`, creates the application role, and grants table/function privileges.
+`db:provision-app-role` is for local databases only. It creates `POSTGRES_APP_USER` with `POSTGRES_APP_PASSWORD` when the role does not exist, and never alters an existing role. In other environments the database operator creates and manages the application role.
+
+`db:migrate` applies the numbered files in `database/` in order, records them in `public.schema_migrations`, and grants table/function privileges to the application role. It never creates the application role or changes its password, so it needs only `DATABASE_MIGRATE_URL` (and `POSTGRES_APP_USER` when the role is not `bizcaiaos_app`). Before writing anything it runs a read-only preflight and stops if the application role is missing, cannot log in, has SUPERUSER or BYPASSRLS, or owns tables; if the migration role cannot create in `public` or does not own the existing tables; or if `schema_migrations` is not a prefix of the registered list.
 
 Re-running the command is safe. Failure stops the process and does not record the failed file.
 
@@ -61,7 +64,7 @@ Requires Docker Postgres up and migrated. These tests are excluded from `npm tes
 npm run db:down
 npm run db:reset
 ```
-`db:reset` destroys the Docker volume, starts a new cluster, and re-runs migrations.
+`db:reset` destroys the Docker volume, starts a new cluster, creates the application role, and re-runs migrations.
 
 ## Run from the repository root
 
@@ -78,6 +81,7 @@ Copy `.env.example` to `.env` and fill in local values. Do not commit `.env`.
 | `npm run dev` | Vite UI (default http://localhost:5173) |
 | `npm run dev:api` | Express API (default http://localhost:8787) |
 | `npm run db:up` | Start local PostgreSQL |
+| `npm run db:provision-app-role` | Create the local application role if missing (local only) |
 | `npm run db:migrate` | Apply numbered SQL migrations |
 | `npm run db:reset` | Wipe local volume and re-migrate |
 | `npm run db:down` | Stop local PostgreSQL |
