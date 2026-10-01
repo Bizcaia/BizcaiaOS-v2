@@ -184,6 +184,41 @@ where they exist, every `anon`/`authenticated` privilege in `public`; because
 its default-privilege change applies to the role that runs it, migrations
 must always run as `bizcaiaos_migrator`.
 
+### Migration history boundary (`schema_migrations`)
+
+`public.schema_migrations` is migration metadata.
+
+- **Who uses it:** only the migration runner and the read-only R1 verifier
+  read it, and both connect as the migration role.
+- **Ownership:** the runner creates it, so the migration role owns it.
+- **`bizcaiaos_app` needs no access:** no API code, migration, or RLS policy
+  reads it.
+
+The boundary is enforced in two places:
+
+- `db:migrate` revokes all application-role access to it in the transaction
+  that creates it. Each run also clears anything an earlier runner left
+  behind.
+- `db:migrate` applies the application grants as **one transaction**. The
+  grant on "all tables" also covers `schema_migrations`, so it commits only
+  together with the revoke that follows it. No other session ever sees the
+  application role holding migration history, and a run that fails during the
+  grants rolls them all back. Re-running `db:migrate` then applies nothing new
+  and completes the grants.
+
+Tested on disposable PostgreSQL by
+`server/integration/postgres.migrationGrants.integration.test.ts`:
+
+- effective privileges (`has_table_privilege` for SELECT, INSERT, UPDATE,
+  DELETE, TRUNCATE, REFERENCES, TRIGGER) and explicit grants
+  (`information_schema.role_table_grants`);
+- checked from a second connection after every grant statement, after an
+  injected mid-grant failure, and after the run.
+
+R1's `R1-DB-APP-PRIVILEGES` check also fails if the application role holds any
+privilege on the table. Nothing here is specific to Supabase. Real staging and
+production remain `NOT_VERIFIED`.
+
 ## Migration promotion
 
 ```text
