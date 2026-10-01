@@ -22,6 +22,7 @@
     "db:provision-app-role": "tsx server/provisionAppRole.ts",
     "db:migrate": "tsx server/migrate.ts",
     "config:check": "tsx server/config/environmentContract.ts",
+    "staging:preflight": "tsx server/config/stagingPreflight.ts",
     "test:integration": "vitest run server/integration --environment node"
   },
   "dependencies": {
