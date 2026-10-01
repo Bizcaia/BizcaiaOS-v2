@@ -189,7 +189,7 @@ must always run as `bizcaiaos_migrator`.
 ```text
 LOCAL VALIDATION (PostgreSQL 16 and 17, full integration suite)
       ↓
-STAGING MIGRATION (operator, bizcaiaos_migrator, after a backup)
+STAGING MIGRATION (separately authorized; operator, bizcaiaos_migrator, after a backup)
       ↓
 STAGING VALIDATION (privilege checks, smoke tests, recovery rehearsal)
       ↓
@@ -200,8 +200,10 @@ Each environment runs the same command twice: the first run applies every
 pending migration, the second must apply none.
 
 After the first staging migration, verify the following. The
-[staging runbook](staging-provisioning.md) gives the exact steps, and
-`deploy/sql/` holds read-only SQL for each check:
+[staging runbook](staging-provisioning.md) gives the exact steps,
+`deploy/sql/` holds read-only SQL for each check, and the R1 verifier
+(`npm run db:verify-boundary`, [below](#boundary-verification-r1)) checks
+items 1–8 in one read-only run:
 
 1. `select current_user` on `DATABASE_MIGRATE_URL` is `bizcaiaos_migrator`.
 2. `schema_migrations` holds `001`–`019`, `019` exactly once.
@@ -220,6 +222,206 @@ After the first staging migration, verify the following. The
    modify provider-owned objects.
 8. RLS is enabled on all 18 tables with all 49 policies present.
 9. The Data API is off and returns no endpoints.
+10. Supabase Auth email/password sign-in still works with the Data API off,
+    and the API accepts the resulting token (`/api/v1/me` returns 200).
+
+## Boundary verification (R1)
+
+`npm run db:verify-boundary` is the R1 verifier. It collects evidence that an
+environment follows the accepted architecture: the browser signs in with
+Supabase Auth and reaches data only through the BizcaiaOS API, the API
+connects as `bizcaiaos_app`, migrations stay with `bizcaiaos_migrator`, the
+Supabase Data API is not a data path, and Migration 019 and RLS hold.
+
+- **R1 = READ-ONLY VERIFICATION.**
+- **R1 DOES NOT PROVISION.**
+- **R1 DOES NOT MIGRATE.**
+- **R1 DOES NOT DEPLOY.**
+- **R1 DOES NOT MODIFY DATABASE STATE.**
+
+R1 creates nothing: no role, database, table, function, privilege, user, or
+test data. It calls no Supabase, Render, or DNS API, and never prints a
+password, key, token, or credential-bearing URL.
+
+Running R1 does not authorize migration, deployment, provisioning, or any
+production change. Each of those needs its own owner authorization.
+
+### How the three tools relate
+
+They share one implementation of the environment rules:
+`server/config/environmentContract.ts`, plus the shared helpers in
+`server/config/stagingPreflight.ts` (the privileged-variable list and the
+URL TLS rule). R1 reuses both rather than repeating them.
+
+```text
+config:check
+    → environment contract validation
+      (one environment and scope at a time; offline)
+        ↓
+staging:preflight
+    → offline environment/provisioning readiness validation
+      (the whole staging file is consistent; offline)
+        ↓
+db:verify-boundary (R1)
+    → repository + configuration + optional read-only database boundary verification
+      ├─ repository checks ....... offline, always
+      ├─ configuration checks .... offline, with --env-file
+      └─ database checks ......... read-only PostgreSQL, only with --database
+```
+
+- **Offline checks contact nothing:** no Supabase, Render, DNS, network, or
+  database. This is tested: offline mode opens no socket or connection.
+- **`--database` enables read-only PostgreSQL verification:** one catalog
+  snapshot in a `READ ONLY` transaction that is rolled back, over the
+  connection you supply.
+- **R1 does not perform migrations.** It imports only the data-only
+  migration manifest, never the migration runner.
+- **R1 does not deploy.**
+- **R1 does not provision.**
+- **R1 does not modify infrastructure,** database state, Supabase, Render, or
+  DNS.
+
+Workflow, where each arrow is a separate, owner-authorized step:
+
+```text
+config:check → staging:preflight → db:verify-boundary → staging provisioning
+             → staging verification (runbook, db:verify-boundary --database) → production readiness
+```
+
+R1 results never authorize a later step.
+
+### Infrastructure state
+
+R1 does not change this state:
+
+```text
+SUPABASE_STAGING = NOT_CREATED
+SUPABASE_PRO     = NOT_ENABLED
+PITR             = NOT_ENABLED
+RENDER           = NOT_PROVISIONED
+DNS              = NOT_CONFIGURED
+PRODUCTION       = NOT_TOUCHED
+```
+
+No staging or production boundary has been `VERIFIED`, because neither
+environment exists. Verification state by kind of evidence:
+
+| Evidence | What it can show | State today |
+|---|---|---|
+| Offline (repository + a synthetic or filled-in configuration file) | the code's wiring and the file's consistency | evidence about the repository and the file only; never about an environment |
+| Disposable PostgreSQL (local container, Supabase-like setup) | that the migrations and R1 behave as designed | development validation only; **not** staging verification |
+| Real staging | the staging boundary | `NOT_VERIFIED` (staging does not exist) |
+| Real production | the production boundary | `NOT_VERIFIED` (production does not exist) |
+
+Each check in the
+[staging verification checklist](staging-verification-checklist.md) records
+exactly one of `VERIFIED`, `NOT_VERIFIED`, or `NOT_APPLICABLE`. A row becomes
+`VERIFIED` only from evidence taken on the real environment.
+
+### Commands
+
+```bash
+# Offline: repository only, or repository plus a filled-in configuration file
+npm run db:verify-boundary
+npm run db:verify-boundary -- --target staging --env-file <file outside the repository> [--other-ref <production ref>]
+
+# With a database: read-only catalog checks over DATABASE_MIGRATE_URL (or --database-url-env NAME)
+npm run db:verify-boundary -- --target staging --env-file <file> --database --strict
+```
+
+R1 imports only the data-only migration manifest
+(`server/migrations/migrationManifest.ts`), never the migration runner, and it
+does **not** read `.env`. The database connection comes only from the shell
+environment, and only with `--database`. For staging and production, connect
+as `bizcaiaos_migrator`. A connection as `bizcaiaos_app` is reported as wrong
+verification access, because that role cannot read `schema_migrations`.
+
+### What R1 verifies
+
+| Boundary | Evidence (runs when) | Checks |
+|---|---|---|
+| Repository | this checkout's files (always; offline) | `R1-REPO-MIGRATION-CHAIN` (`001`..N, in order, matching `database/`), `R1-REPO-MIGRATION-019` (present, registered, still revokes `PUBLIC` execute), `R1-REPO-RLS-MODEL` (tables and policies the migrations define: the expected state for the database), `R1-REPO-DATA-PATH` (Supabase client only in the sign-in module; no Data API, storage, realtime, or functions paths; no Supabase client in the API), `R1-REPO-AUTH-WIRING` (the API verifies issuer, audience, and JWKS from configuration; email/password sign-in only) |
+| Configuration | the supplied file, not the deployed services (`--env-file` with `--target staging` or `production`; offline) | `R1-CFG-CONTRACT` (the `config:check` rules per section; `staging:preflight` for staging), `R1-CFG-PROJECT` (frontend URL, issuer, JWKS, API database, and migration database are one Supabase project), `R1-CFG-ENVIRONMENT` (hosts match the target; no staging/production leakage; `--other-ref` names the other environment's project), `R1-CFG-PUBLIC-SECRETS` (no secret, connection string, Supabase secret, or `service_role` key in the Static Site), `R1-CFG-APP-ROLE` (`DATABASE_URL` is `bizcaiaos_app`, not the migration role), `R1-CFG-API-TLS` (`DATABASE_SSL=require`; no `sslmode=disable`/`no-verify`, `ssl=0`, or `uselibpqcompat` without `verify-full` in `DATABASE_URL`), `R1-CFG-PRIVILEGED-CREDENTIALS` (no `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET`, Supabase secret key, `service_role` JWT, private key, or local postgres password in the API or migration sections), `R1-CFG-MIGRATION-SEPARATION` (no migration credentials on the API; migrations as `bizcaiaos_migrator` on a session port), `R1-CFG-DATA-API` (no configured URL makes the Data API a data path) |
+| Database | one read-only catalog snapshot (`--database`) | `R1-DB-IDENTITY` (read-only transaction; staging/production connect as `bizcaiaos_migrator`), `R1-DB-ROLES` (no SUPERUSER, CREATEROLE, CREATEDB, or BYPASSRLS), `R1-DB-MIGRATIONS`, `R1-DB-OWNER`, `R1-DB-APP-PRIVILEGES`, `R1-DB-PUBLIC`, `R1-DB-ANON`, `R1-DB-AUTHENTICATED`, `R1-DB-FUTURE-FUNCTIONS` (from `pg_default_acl`; nothing is created), `R1-DB-TRUSTED-FUNCTIONS`, `R1-DB-RLS` (every table and policy the migrations define, RLS enabled, nothing unexpected); recorded only: `R1-DB-DEFAULT-ACLS`, `R1-DB-SERVICE-ROLE` (read, never changed), `R1-DB-EXTENSIONS` |
+| Provider settings | Supabase project settings (manual) | `R1-PROVIDER-DATA-API`, `R1-PROVIDER-AUTH-SETTINGS`: always `NOT_VERIFIED`. Check them with the runbook (section B2; section C, steps 5 and 6) |
+
+Local configuration stays with `config:check --target local`, which is
+deliberately permissive (no TLS required). R1's configuration checks apply to
+staging and production files.
+
+### What R1 does not verify
+
+- The hosted Data API switch and Auth settings.
+- Live sign-in and token rejection (runbook step 19).
+- Render's disk, instance count, and environment as deployed. R1 checks the
+  file you supply, not what Render holds.
+- DNS and TLS certificates.
+- Recovery (PITR, snapshots).
+
+Its repository checks are static evidence of the wiring, not runtime proof.
+
+### Status vocabulary and evidence
+
+| Status | Meaning |
+|---|---|
+| `VERIFIED` | R1 observed the evidence and the boundary holds, **within that boundary's scope**: a `VERIFIED` repository says nothing about deployed infrastructure |
+| `FAIL` | R1 observed the evidence and the boundary does not hold (a finding) |
+| `NOT_VERIFIED` | the evidence was not available. Examples: `NOT_VERIFIED — DATABASE_CONNECTION_REQUIRED`, `NOT_VERIFIED — CONFIGURATION_FILE_REQUIRED`, a provider setting, or a catalog the connection may not read. R1 reports the limitation; it never elevates privileges |
+| `NOT_APPLICABLE` | the subject does not exist (for example, no Supabase roles on plain PostgreSQL) |
+| `INFO` | recorded evidence only |
+
+The report ends with one state per boundary (repository, configuration,
+database, provider settings), then `RESULT: NO_FINDINGS` or
+`RESULT: FINDINGS (<check ids>)`. `--json` emits the same as JSON for the
+staging record.
+
+Each `FAIL` or `NOT_VERIFIED` names a remediation category:
+
+| Category | Meaning |
+|---|---|
+| `repository` | fix the code or migrations in Git |
+| `configuration` | fix the environment file or the Render/operator variables named |
+| `migration` | apply or reconcile migrations, separately authorized |
+| `database-roles`, `database-privileges`, `rls` | an operator corrects the roles, grants, or policies, separately authorized; R1 never does |
+| `provider-settings` | check the Supabase dashboard |
+| `verification-access` | rerun with the migration/operator connection |
+
+Exit codes:
+
+- `0`: no findings.
+- `1`: findings. Any `FAIL` counts; with `--strict`, so does a required check
+  that is still `NOT_VERIFIED`. The two provider checks are never required.
+- `2`: a usage or configuration error. Examples: bad arguments, an unreadable
+  `--env-file`, `--database` without a connection, or a connection or query
+  that fails. In each case nothing is changed.
+
+### How the database checks stay read-only
+
+1. **Allowlist:** R1 can send only a frozen allowlist of catalog `SELECT`s
+   plus `begin` and `rollback`; any other statement is refused before it
+   reaches the database.
+2. **Database-enforced:** everything runs inside `BEGIN TRANSACTION ISOLATION
+   LEVEL REPEATABLE READ READ ONLY`, which PostgreSQL enforces (a write fails
+   with `25006`). R1 stops unless the database confirms
+   `transaction_read_only = on`, and always rolls back.
+3. **Tests:**
+   - the allowlist;
+   - the exact statements sent to a real database;
+   - the `25006` refusal;
+   - an unchanged catalog fingerprint (functions, relations, roles, policies,
+     default privileges) after a run on a disposable database;
+   - no connection at all in offline mode;
+   - an import graph that never reaches the migration runner or `.env`
+     loading.
+
+### When to run it
+
+| When | Command | Expect |
+|---|---|---|
+| Before staging provisioning (gate A) | `--target staging --env-file <file>` | Repository and configuration `VERIFIED`; database and provider settings `NOT_VERIFIED` |
+| After staging configuration and migrations (step 11) | `--target staging --env-file <file> --database --strict` | `RESULT: NO_FINDINGS`; only provider settings `NOT_VERIFIED` (checked by hand) |
+| Before production launch | `--target production --env-file <file> --other-ref <staging ref>` | Configuration `VERIFIED`; no staging leakage |
+| After production migration and deployment (separately authorized) | `--target production --env-file <file> --other-ref <staging ref> --database --strict` | `RESULT: NO_FINDINGS` |
 
 ## Render
 
@@ -280,11 +482,12 @@ both environments.
 
 **Supabase** (per environment): organization billing plan · project creation
 (region; staging and production in the same region) · compute · PITR and
-retention · Auth: email/password on, public sign-ups off, anonymous and phone
-off, asymmetric JWT signing keys, Site URL and redirect allowlist · Data API
-off · roles `bizcaiaos_migrator` and `bizcaiaos_app` · migration connection ·
-`npm run config:check -- --scope migration` · migrations `001`–`019` twice ·
-the verification list above · sign-in smoke test.
+retention · Auth: email provider on, "Allow new users to sign up" off,
+anonymous and phone off, asymmetric JWT signing keys, Site URL and redirect
+allowlist · Data API off · roles `bizcaiaos_migrator` and `bizcaiaos_app` ·
+migration connection · `npm run config:check -- --scope migration` ·
+migrations `001`–`019` twice · `npm run db:verify-boundary` and the
+verification list above · sign-in smoke test with the Data API off.
 
 **Render** (per environment): Static Site · Web Service (one instance, paid
 plan) · persistent disk · environment variables and secrets ·
