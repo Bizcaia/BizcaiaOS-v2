@@ -98,13 +98,20 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => 
       ? 'An internal server error occurred'
       : String(errorRecord.message ?? 'Request failed');
 
+  // A 5xx never carries the internal error's code (database, network, JWKS,
+  // file system): one stable public code. The full error is logged below.
+  const publicCode =
+    status >= 500
+      ? 'internal_server_error'
+      : databaseCode ?? (status === 401 ? 'unauthorized' : status === 403 ? 'forbidden' : 'request_failed');
+
   if (status >= 500) {
     console.error(error);
   }
 
   response.status(status).json({
     error: {
-      code: databaseCode ?? (status === 401 ? 'unauthorized' : status === 403 ? 'forbidden' : 'request_failed'),
+      code: publicCode,
       message: safeMessage,
     },
   });
