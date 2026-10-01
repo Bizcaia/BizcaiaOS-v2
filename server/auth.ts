@@ -47,6 +47,42 @@ function bearerToken(request: Request): string {
   return authorization.slice('Bearer '.length).trim();
 }
 
+/**
+ * jose error codes caused by the presented token itself: malformed, bad
+ * signature, a key or algorithm the JWKS does not offer, expired, or the wrong
+ * issuer or audience. These are the client's credential problem (401). JWKS
+ * retrieval failures (ERR_JWKS_TIMEOUT, ERR_JWKS_INVALID) and anything else
+ * are not listed: they stay server errors.
+ */
+const TOKEN_REJECTION_CODES = new Set([
+  'ERR_JWS_INVALID',
+  'ERR_JWT_INVALID',
+  'ERR_JWS_SIGNATURE_VERIFICATION_FAILED',
+  'ERR_JWT_EXPIRED',
+  'ERR_JWT_CLAIM_VALIDATION_FAILED',
+  'ERR_JOSE_ALG_NOT_ALLOWED',
+  'ERR_JOSE_NOT_SUPPORTED',
+  'ERR_JWKS_NO_MATCHING_KEY',
+  'ERR_JWKS_MULTIPLE_MATCHING_KEYS',
+]);
+
+export function isTokenRejection(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && TOKEN_REJECTION_CODES.has(code);
+}
+
+/** Verifies the token; a token the client got wrong becomes a 401 without jose's details. */
+async function verifyToken(token: string, keySet: ReturnType<typeof createRemoteJWKSet>, issuer: string, audience: string) {
+  try {
+    return await jwtVerify(token, keySet, { issuer, audience });
+  } catch (cause) {
+    if (!isTokenRejection(cause)) throw cause;
+    const error = new Error('Invalid or expired access token', { cause }) as Error & { status?: number };
+    error.status = 401;
+    throw error;
+  }
+}
+
 function requiredStringClaim(
   payload: JWTPayload,
   key: 'sub' | 'email',
@@ -68,7 +104,7 @@ export async function authenticate(
   try {
     const token = bearerToken(request);
     const { issuer, audience, keySet } = authConfiguration();
-    const verified = await jwtVerify(token, keySet, { issuer, audience });
+    const verified = await verifyToken(token, keySet, issuer, audience);
     const subject = requiredStringClaim(verified.payload, 'sub');
     const email = requiredStringClaim(verified.payload, 'email').toLowerCase();
     const displayName =
