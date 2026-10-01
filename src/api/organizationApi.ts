@@ -1,3 +1,5 @@
+import { unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
+
 export type OrganizationRole =
   | 'system_admin'
   | 'land_acquisition_manager'
@@ -70,6 +72,13 @@ export class OrganizationApiError extends Error {
   ) {
     super(message);
     this.name = 'OrganizationApiError';
+  }
+}
+
+/** Mirrors the API's 400 validation_error for a request-body key it does not accept. */
+function rejectUnknownDemoKeys(input: object, operation: RequestBodyOperation) {
+  if (unknownRequestKeys(input, operation).length) {
+    throw new OrganizationApiError('Request validation failed', 400, 'validation_error');
   }
 }
 
@@ -161,6 +170,7 @@ export const organizationApi = {
         method: 'POST', body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'onboardOrganization');
     await pause();
     return { organizationId: demoOrganization.id, userId: demoMembers[0].user_id, role: 'system_admin' as const };
   },
@@ -175,6 +185,7 @@ export const organizationApi = {
     if (organizationApiMode === 'live') {
       return request<Organization>(`/organizations/${organizationId}`, { method: 'PATCH', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'updateOrganization');
     await pause();
     if (input.name !== undefined) demoOrganization.name = input.name;
     if (input.legalName !== undefined) demoOrganization.legal_name = input.legalName;
@@ -196,6 +207,7 @@ export const organizationApi = {
         { method: 'PATCH', body: JSON.stringify(input) },
       );
     }
+    rejectUnknownDemoKeys(input, 'updateMember');
     await pause();
     demoMembers = demoMembers.map((member) => member.user_id === userId ? { ...member, role: input.role ?? member.role, is_active: input.isActive ?? member.is_active } : member);
     const member = demoMembers.find((entry) => entry.user_id === userId)!;
@@ -228,6 +240,7 @@ export const organizationApi = {
         deliveryRequired: payload.deliveryRequired,
       };
     }
+    rejectUnknownDemoKeys(input, 'createInvitation');
     await pause();
     const invitation: Invitation = { id: crypto.randomUUID(), organization_id: organizationId, email: input.email.toLowerCase(), role: input.role, status: 'pending', expires_at: new Date(Date.now() + (input.expiresInHours ?? 72) * 3_600_000).toISOString(), created_at: new Date().toISOString() };
     demoInvitations = [invitation, ...demoInvitations];

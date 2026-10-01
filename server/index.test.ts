@@ -117,6 +117,26 @@ describe('API foundation', () => {
       expect(transactionQuery).toHaveBeenCalledTimes(1);
     });
   });
+
+  it('refuses an unknown request-body key with 400 validation_error before onboarding anything', async () => {
+    await withApi(async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/v1/organizations/onboard`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-test-token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Valid Org', slug: 'valid-org', timezone: 'Asia/Manila', plan: 'enterprise' }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: {
+          code: 'validation_error',
+          message: 'Request validation failed',
+          details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['plan'], path: [] })],
+        },
+      });
+      // Only the signed-in user sync ran; bootstrap_organization was never called.
+      expect(transactionQuery).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 describe('error responses', () => {

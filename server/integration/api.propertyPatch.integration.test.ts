@@ -168,13 +168,17 @@ describe('property PATCH against real PostgreSQL', () => {
     expect(await stored()).toEqual(before);
   });
 
-  it('an empty body, or only ignored keys, changes nothing', async () => {
+  it('an empty body changes nothing; immutable or unknown keys are refused and change nothing', async () => {
     await resetRisk('high');
     const before = await stored();
     expect((await patch('lam', {})).status).toBe(200);
-    expect(
-      (await patch('lam', { organizationId: ids['org-adminB'], projectId: randomUUID(), propertyReference: 'MOVED', unknownField: 1 })).status,
-    ).toBe(200);
+    const refused = await patch('lam', { organizationId: ids['org-adminB'], projectId: randomUUID(), propertyReference: 'MOVED', unknownField: 1, risk: 'low' });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toMatchObject({
+      code: 'validation_error',
+      details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['organizationId', 'projectId', 'propertyReference', 'unknownField'] })],
+    });
+    // The valid key in the same request is not applied either.
     expect(await stored()).toEqual(before);
   });
 

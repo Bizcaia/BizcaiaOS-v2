@@ -967,12 +967,17 @@ describe('property workflow API', () => {
       await withApi(async (baseUrl) => {
         expect((await postProperty(baseUrl, {})).status).toBe(201);
         expect((await postProperty(baseUrl, { propertyReference: 'NCP-L05B', acquisitionStage: 'identified' })).status).toBe(201);
-        // An unknown status field is not part of the creation contract and is dropped.
-        expect((await postProperty(baseUrl, { propertyReference: 'NCP-L05C', acquisitionStatus: 'complete' })).status).toBe(201);
+        // A status field is not part of the creation contract: it is refused, never sent.
+        const withStatus = await postProperty(baseUrl, { propertyReference: 'NCP-L05C', acquisitionStatus: 'complete' });
+        expect(withStatus.status).toBe(400);
+        expect((await withStatus.json()).error).toMatchObject({
+          code: 'validation_error',
+          details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['acquisitionStatus'] })],
+        });
       });
       const inserts = propertyInserts();
-      expect(inserts).toHaveLength(3);
-      expect(inserts.map(([, params]) => (params as unknown[])[10])).toEqual(['identified', 'identified', 'identified']);
+      expect(inserts).toHaveLength(2);
+      expect(inserts.map(([, params]) => (params as unknown[])[10])).toEqual(['identified', 'identified']);
       expect(inserts.every(([sql]) => !/acquisition_status/.test(String(sql)))).toBe(true);
     });
 
@@ -1409,8 +1414,24 @@ describe('property workflow API', () => {
       const form = new FormData();
       form.set('category', 'title_deed');
       form.set('title', 'Original Title');
-      form.set('storageProvider', 's3'); // must be ignored -- not a real field
       form.set('file', new File(['title deed contents'], 'title.pdf', { type: 'application/pdf' }));
+
+      // A client-supplied storage field is not part of the contract: refused before anything is stored.
+      const withStorageField = new FormData();
+      for (const [key, value] of form.entries()) withStorageField.set(key, value);
+      withStorageField.set('storageProvider', 's3');
+      const refused = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, {
+        method: 'POST',
+        headers: AUTH_NO_CONTENT_TYPE,
+        body: withStorageField,
+      });
+      expect(refused.status).toBe(400);
+      expect((await refused.json()).error).toMatchObject({
+        code: 'validation_error',
+        details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['storageProvider'] })],
+      });
+      expect(storagePutMock).not.toHaveBeenCalled();
+      expect(store.documents).toHaveLength(0);
 
       const response = await fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}/documents`, {
         method: 'POST',
@@ -2280,13 +2301,24 @@ describe('property workflow API', () => {
       const unarchive = await fetch(url, { method: 'PATCH', headers: AUTH, body: JSON.stringify({ archived: false }) });
       expect(unarchive.status).toBe(400);
 
+      // Immutable fields sent alongside the archive are refused, and nothing changes, not even the archive.
       const archiveWithExtras = await fetch(url, {
         method: 'PATCH',
         headers: AUTH,
         body: JSON.stringify({ archived: true, ownerId: OWNER_A2, signedOn: '2020-01-01', documentId: EXECUTED_DOC_A2 }),
       });
-      const body = await archiveWithExtras.json();
-      expect(archiveWithExtras.status).toBe(200);
+      expect(archiveWithExtras.status).toBe(400);
+      expect((await archiveWithExtras.json()).error).toMatchObject({
+        code: 'validation_error',
+        details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['ownerId', 'signedOn', 'documentId'] })],
+      });
+      expect(store.agreementSignatures.find((signature) => signature.id === created.data.id)).toMatchObject({
+        owner_id: OWNER_A, signed_on: '2026-09-20', document_id: EXECUTED_DOC_A, archived_at: null,
+      });
+
+      const archived = await fetch(url, { method: 'PATCH', headers: AUTH, body: JSON.stringify({ archived: true }) });
+      const body = await archived.json();
+      expect(archived.status).toBe(200);
       expect(body.data).toMatchObject({ owner_id: OWNER_A, signed_on: '2026-09-20', document_id: EXECUTED_DOC_A });
       expect(body.data.archived_at).not.toBeNull();
     });
@@ -2690,13 +2722,22 @@ describe('property workflow API', () => {
 
   it('derives organization, property, and recorder on the server and defaults occurredAt to the server clock', async () => {
     await withApi(async (baseUrl) => {
-      const response = await postInteraction(baseUrl, {
+      // Client-supplied server-derived fields are refused before anything is written.
+      const refused = await postInteraction(baseUrl, {
         interactionType: 'call',
         notes: 'Server derives the rest',
         organizationId: ORG_B,
         propertyId: PROPERTY_B,
         recordedByUserId: NEGOTIATOR_ID,
       });
+      expect(refused.status).toBe(400);
+      expect((await refused.json()).error).toMatchObject({
+        code: 'validation_error',
+        details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['organizationId', 'propertyId', 'recordedByUserId'] })],
+      });
+      expect(store.interactions).toHaveLength(0);
+
+      const response = await postInteraction(baseUrl, { interactionType: 'call', notes: 'Server derives the rest' });
       expect(response.status).toBe(201);
     });
     expect(store.interactions[0]).toMatchObject({ organization_id: ORG_A, property_id: PROPERTY_A, recorded_by_user_id: USER_ID });
@@ -2731,7 +2772,16 @@ describe('property workflow API', () => {
       expect((await archiveInteraction(baseUrl, id, { archived: false })).status).toBe(400);
       expect((await archiveInteraction(baseUrl, id, { notes: 'Rewritten' })).status).toBe(400);
 
-      const first = await (await archiveInteraction(baseUrl, id, { archived: true, notes: 'Rewritten', interactionType: 'call' })).json();
+      // Immutable fields sent alongside the archive are refused, and the interaction is neither archived nor rewritten.
+      const withExtras = await archiveInteraction(baseUrl, id, { archived: true, notes: 'Rewritten', interactionType: 'call' });
+      expect(withExtras.status).toBe(400);
+      expect((await withExtras.json()).error).toMatchObject({
+        code: 'validation_error',
+        details: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['notes', 'interactionType'] })],
+      });
+      expect(store.interactions[0]).toMatchObject({ notes: 'Original', interaction_type: 'meeting', archived_at: null });
+
+      const first = await (await archiveInteraction(baseUrl, id)).json();
       expect(first.data).toMatchObject({ notes: 'Original', interaction_type: 'meeting' });
       const again = await (await archiveInteraction(baseUrl, id)).json();
       expect(again.data.archived_at).toBe(first.data.archived_at);

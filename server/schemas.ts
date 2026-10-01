@@ -22,7 +22,9 @@ export const organizationInvitationParamsSchema = organizationIdParamsSchema.ext
   invitationId: z.uuid(),
 });
 
-export const onboardOrganizationSchema = z.object({
+// Request bodies are strict objects: an unknown top-level key is refused with
+// 400 validation_error (issue code unrecognized_keys). `settings` stays free-form.
+export const onboardOrganizationSchema = z.strictObject({
   name: z.string().trim().min(2).max(120),
   slug: z
     .string()
@@ -34,7 +36,7 @@ export const onboardOrganizationSchema = z.object({
 });
 
 export const updateOrganizationSchema = z
-  .object({
+  .strictObject({
     name: z.string().trim().min(2).max(120).optional(),
     legalName: z.string().trim().max(160).nullable().optional(),
     timezone: z.string().trim().min(1).max(80).optional(),
@@ -44,7 +46,7 @@ export const updateOrganizationSchema = z
     message: 'At least one organization field is required',
   });
 
-export const createInvitationSchema = z.object({
+export const createInvitationSchema = z.strictObject({
   email: z.preprocess(
     (value) => (typeof value === 'string' ? value.trim().toLowerCase() : value),
     z.email(),
@@ -53,12 +55,12 @@ export const createInvitationSchema = z.object({
   expiresInHours: z.number().int().min(1).max(24 * 14).default(72),
 });
 
-export const acceptInvitationSchema = z.object({
+export const acceptInvitationSchema = z.strictObject({
   token: z.string().min(32).max(512),
 });
 
 export const updateMembershipSchema = z
-  .object({
+  .strictObject({
     role: organizationRoleSchema.optional(),
     isActive: z.boolean().optional(),
   })
