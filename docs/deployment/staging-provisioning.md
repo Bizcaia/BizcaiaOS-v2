@@ -101,9 +101,6 @@ Repository gate, all on the exact `main` commit to be deployed:
    Expect: repository and configuration `VERIFIED`. Database and provider
    checks are `NOT_VERIFIED` until section C. See
    [Boundary verification (R1)](production-readiness.md#boundary-verification-r1).
-5. Recommended before the token-rejection smoke test (step 19): fix the
-   known finding that invalid tokens return HTTP 500 instead of 401. That fix
-   needs its own authorization.
 
 ## B. Supabase staging project (G1, G2)
 
@@ -233,7 +230,7 @@ Record a UTC timestamp and the evidence for every step in the checklist.
 | 16 | Future-function default privileges | POST-8 (read from `pg_default_acl`; nothing is created) | `t`, `f`, `t` |
 | 17 | Full integration suite | `npm run test:integration` against a **disposable PostgreSQL 17** at the same commit. **Never against staging**: the suite creates roles and databases and writes fixtures | All tests pass. Record the count and commit SHA |
 | 18 | Application smoke tests (after D and E) | `curl -s https://api-staging.<domain>/health`. Open `https://staging.<domain>`. Browser network panel | `{"status":"ok"}`; frontend loads; all data requests go to `https://api-staging.<domain>/api/v1`; the only Supabase requests are to `/auth/v1`; no database credentials in the bundle; CORS allows `https://staging.<domain>` only |
-| 19 | Auth sign-in smoke test | Sign in as the staging admin; call `/api/v1/me`; sign out. Tampered, wrong-issuer, and wrong-audience tokens against `/api/v1/me` | Sign-in works with the Data API off; `/api/v1/me` returns `200` for the right user; bad tokens are refused with no data (401 once the known 500 finding is fixed); after sign-out, requests without a token return `401`. Write-path tests (onboarding, organization isolation with a second user, documents) need G6 |
+| 19 | Auth sign-in smoke test | Sign in as the staging admin; call `/api/v1/me`; sign out. Tampered, wrong-issuer, and wrong-audience tokens against `/api/v1/me` | Sign-in works with the Data API off; `/api/v1/me` returns `200` for the right user; bad tokens are refused with `401` and no data; after sign-out, requests without a token return `401`. Write-path tests (onboarding, organization isolation with a second user, documents) need G6 |
 | 20 | Record the staging baseline | Staging record (below) | Complete record stored with the owner's operations records, not in Git |
 
 The R1 verifier (`npm run db:verify-boundary`) covers steps 12 to 16 and the
