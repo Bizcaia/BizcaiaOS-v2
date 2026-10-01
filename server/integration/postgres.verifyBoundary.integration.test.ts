@@ -74,11 +74,15 @@ describe('R1 read-only boundary verifier (real database)', () => {
       return url.toString();
     };
     const adminUrl = (db: string | null) => urlFor(requireDatabaseEnv().migrateUrl, db);
+    // pg_roles is cluster-wide: parallel suites create and drop their fixture
+    // roles (zz_*, and anon/authenticated on plain PostgreSQL) at any moment,
+    // so those are left out. Every other role, including the application and
+    // migration roles, stays in.
     const fingerprint = (client: pg.Client) => client.query<{ hash: string }>(`
       select md5(string_agg(entry, '|' order by entry)) as hash from (
         select 'p' || oid || coalesce(proacl::text, '') as entry from pg_proc
         union all select 'c' || oid || relrowsecurity || coalesce(relacl::text, '') from pg_class
-        union all select 'r' || oid || rolname from pg_roles
+        union all select 'r' || oid || rolname from pg_roles where rolname not in ('anon', 'authenticated') and left(rolname, 3) <> 'zz_'
         union all select 'y' || oid || polname from pg_policy
         union all select 'd' || oid || defaclacl::text from pg_default_acl) entries`).then((result) => result.rows[0].hash);
 
