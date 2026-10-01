@@ -1109,6 +1109,80 @@ describe('property workflow API', () => {
     });
   });
 
+  describe('property PATCH leaves an omitted risk unchanged', () => {
+    const propertyUpdates = () =>
+      actorQuery.mock.calls.filter(([sql]) => /update public\.properties/i.test(String(sql)));
+    const patchProperty = (baseUrl: string, body: unknown) =>
+      fetch(`${baseUrl}/api/v1/ops/properties/${PROPERTY_A}`, { method: 'PATCH', headers: AUTH, body: JSON.stringify(body) });
+
+    it('does not supply a risk the request did not send', async () => {
+      const { updatePropertySchema } = await import('./operationsSchemas.js');
+      expect(updatePropertySchema.parse({})).toEqual({});
+      expect(updatePropertySchema.parse({ legalStatus: 'clear' })).toEqual({ legalStatus: 'clear' });
+      expect(updatePropertySchema.parse({ risk: 'high' })).toEqual({ risk: 'high' });
+    });
+
+    it.each(['system_admin', 'land_acquisition_manager', 'supervisor'] as const)(
+      'a %s update of another field does not write risk',
+      async (role) => {
+        store.role = role;
+        await withApi(async (baseUrl) => {
+          expect((await patchProperty(baseUrl, { readinessPercent: 55 })).status).toBe(200);
+        });
+        expect(propertyUpdates()).toHaveLength(1);
+        expect(String(propertyUpdates()[0][0])).toMatch(/readiness_percent/);
+        expect(String(propertyUpdates()[0][0])).not.toMatch(/risk/);
+      },
+    );
+
+    it.each([
+      ['legal_documentation', { legalStatus: 'clear', documentationStatus: 'in_review' }, /legal_status/],
+      ['finance', { paymentStatus: 'in_progress' }, /payment_status/],
+    ] as const)('lets %s update its own fields without touching risk', async (role, body, column) => {
+      store.role = role;
+      await withApi(async (baseUrl) => {
+        expect((await patchProperty(baseUrl, body)).status).toBe(200);
+      });
+      expect(propertyUpdates()).toHaveLength(1);
+      expect(String(propertyUpdates()[0][0])).toMatch(column);
+      expect(String(propertyUpdates()[0][0])).not.toMatch(/risk/);
+    });
+
+    it.each(['legal_documentation', 'finance', 'negotiator', 'viewer'] as const)('still refuses an explicit risk from %s', async (role) => {
+      store.role = role;
+      await withApi(async (baseUrl) => {
+        expect((await patchProperty(baseUrl, { risk: 'high' })).status).toBe(403);
+      });
+      expect(propertyUpdates()).toHaveLength(0);
+    });
+
+    it('still writes an explicit risk', async () => {
+      store.role = 'land_acquisition_manager';
+      await withApi(async (baseUrl) => {
+        expect((await patchProperty(baseUrl, { risk: 'low' })).status).toBe(200);
+      });
+      expect(propertyUpdates()).toHaveLength(1);
+      expect(String(propertyUpdates()[0][0])).toMatch(/set risk=\$1 where/);
+      expect(propertyUpdates()[0][1]).toEqual(['low', PROPERTY_A]);
+    });
+
+    it.each([null, 0, '', 'critical', 'HIGH'])('rejects risk %j with 400 before any update', async (risk) => {
+      store.role = 'land_acquisition_manager';
+      await withApi(async (baseUrl) => {
+        expect((await patchProperty(baseUrl, { risk })).status).toBe(400);
+      });
+      expect(propertyUpdates()).toHaveLength(0);
+    });
+
+    it('treats an empty body as no change', async () => {
+      store.role = 'land_acquisition_manager';
+      await withApi(async (baseUrl) => {
+        expect((await patchProperty(baseUrl, {})).status).toBe(200);
+      });
+      expect(propertyUpdates()).toHaveLength(0);
+    });
+  });
+
   it('creates an owner as an allowed role', async () => {
     store.role = 'land_acquisition_manager';
     await withApi(async (baseUrl) => {
