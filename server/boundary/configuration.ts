@@ -7,7 +7,7 @@
  * never values. Nothing is contacted.
  */
 import { validateEnvironment, type Finding } from '../config/environmentContract.js';
-import { databaseProjectRef, parseSectionedEnv, stagingPreflight, type Section } from '../config/stagingPreflight.js';
+import { databaseProjectRef, FORBIDDEN, insecureTlsParameter, parseSectionedEnv, stagingPreflight, type Section } from '../config/stagingPreflight.js';
 import { check, NOT_VERIFIED_CONFIGURATION, type Check } from './checks.js';
 
 export type DeployTarget = 'staging' | 'production';
@@ -29,6 +29,8 @@ const CHECK_TITLES = {
   'R1-CFG-ENVIRONMENT': 'Hosts and project belong to the target environment (no staging/production leakage)',
   'R1-CFG-PUBLIC-SECRETS': 'Public frontend (Static Site) variables hold no secret credentials',
   'R1-CFG-APP-ROLE': 'API database connection uses the application role',
+  'R1-CFG-API-TLS': 'API database connection requires TLS with certificate verification',
+  'R1-CFG-PRIVILEGED-CREDENTIALS': 'No privileged Supabase or database credential on the API runtime or in the migration session',
   'R1-CFG-MIGRATION-SEPARATION': 'Migration credentials stay out of the runtime API; migrations use the migration role',
   'R1-CFG-DATA-API': 'No configured URL makes the Supabase Data API an application data path',
 } as const;
@@ -89,7 +91,7 @@ export function configurationChecks(contents: string, options: { target: DeployT
   const findings = [...parsed.findings, ...contractFindings(sections, options.target, options.otherRef)];
   const lines = [...new Set(findings.map((finding) => `${finding.level === 'error' ? '' : 'warning: '}[${finding.section}] ${finding.variable}: ${finding.message}`))];
   const errors = findings.filter((finding) => finding.level === 'error').length;
-  checks.push(check('R1-CFG-CONTRACT', CHECK_TITLES['R1-CFG-CONTRACT'], errors ? 'FAIL' : 'PASS',
+  checks.push(check('R1-CFG-CONTRACT', CHECK_TITLES['R1-CFG-CONTRACT'], errors ? 'FAIL' : 'VERIFIED',
     lines.length ? lines : [`${options.target} contract: 0 errors, 0 warnings`], 'configuration'));
 
   // R1-CFG-PROJECT
@@ -105,7 +107,7 @@ export function configurationChecks(contents: string, options: { target: DeployT
   if (unidentified.length) projectEvidence.push(`not a Supabase project URL: ${unidentified.join(', ')}`);
   if (missing.length) projectEvidence.push(`not set: ${missing.join(', ')}`);
   checks.push(check('R1-CFG-PROJECT', CHECK_TITLES['R1-CFG-PROJECT'],
-    refs.length > 1 || unidentified.length || !refs.length ? 'FAIL' : missing.length ? 'NOT_VERIFIED' : 'PASS',
+    refs.length > 1 || unidentified.length || !refs.length ? 'FAIL' : missing.length ? 'NOT_VERIFIED' : 'VERIFIED',
     refs.length > 1 ? ['values point at more than one Supabase project', ...projectEvidence] : projectEvidence, 'configuration'));
 
   // R1-CFG-ENVIRONMENT
@@ -133,7 +135,7 @@ export function configurationChecks(contents: string, options: { target: DeployT
       if (ref === options.otherRef) leaks.push(`${name} points at the other environment's Supabase project (--other-ref)`);
     }
   }
-  checks.push(check('R1-CFG-ENVIRONMENT', CHECK_TITLES['R1-CFG-ENVIRONMENT'], leaks.length ? 'FAIL' : 'PASS',
+  checks.push(check('R1-CFG-ENVIRONMENT', CHECK_TITLES['R1-CFG-ENVIRONMENT'], leaks.length ? 'FAIL' : 'VERIFIED',
     leaks.length ? leaks : [
       `frontend ${prefixes.frontend}<domain> and API ${prefixes.api}<domain> share one domain`,
       options.otherRef ? 'no value points at the other environment\'s Supabase project' : 'no --other-ref supplied: cross-project leakage checked by host names only',
@@ -147,18 +149,45 @@ export function configurationChecks(contents: string, options: { target: DeployT
     else if (raw.startsWith('sb_secret_')) exposed.push(`${name} holds a Supabase secret key`);
     else if (decodeJwtRole(raw) === 'service_role') exposed.push(`${name} holds a service_role key`);
   }
-  checks.push(check('R1-CFG-PUBLIC-SECRETS', CHECK_TITLES['R1-CFG-PUBLIC-SECRETS'], exposed.length ? 'FAIL' : 'PASS',
+  checks.push(check('R1-CFG-PUBLIC-SECRETS', CHECK_TITLES['R1-CFG-PUBLIC-SECRETS'], exposed.length ? 'FAIL' : 'VERIFIED',
     exposed.length ? exposed : [`${Object.keys(frontend).length} frontend variables: no secret names, connection strings, secret or service_role keys`], 'configuration'));
 
   // R1-CFG-APP-ROLE
   const appRole = api.POSTGRES_APP_USER || migration.POSTGRES_APP_USER || DEFAULT_APP_ROLE;
   const apiRole = databaseRole(api.DATABASE_URL);
   checks.push(check('R1-CFG-APP-ROLE', CHECK_TITLES['R1-CFG-APP-ROLE'],
-    apiRole === appRole ? 'PASS' : 'FAIL',
+    apiRole === appRole ? 'VERIFIED' : 'FAIL',
     !api.DATABASE_URL ? ['[api] DATABASE_URL is not set']
       : !apiRole ? ['[api] DATABASE_URL is not a postgres:// connection string']
         : apiRole === appRole ? [`[api] DATABASE_URL connects as ${appRole}`]
           : [apiRole === MIGRATOR_ROLE ? `[api] DATABASE_URL connects as the migration role ${MIGRATOR_ROLE}` : `[api] DATABASE_URL connects as ${apiRole}, not ${appRole}`],
+    'configuration'));
+
+  // R1-CFG-API-TLS (the contract's DATABASE_SSL rule plus the shared URL-parameter rule)
+  const tls: string[] = [];
+  if (api.DATABASE_SSL !== 'require') tls.push('[api] DATABASE_SSL is not "require"');
+  const insecure = insecureTlsParameter(api.DATABASE_URL);
+  if (insecure) tls.push(`[api] DATABASE_URL sets ${insecure}, which overrides DATABASE_SSL`);
+  checks.push(check('R1-CFG-API-TLS', CHECK_TITLES['R1-CFG-API-TLS'],
+    tls.length ? 'FAIL' : api.DATABASE_URL ? 'VERIFIED' : 'NOT_VERIFIED',
+    tls.length ? tls : api.DATABASE_URL
+      ? ['[api] DATABASE_SSL=require and DATABASE_URL has no TLS parameter that weakens verification']
+      : ['[api] DATABASE_URL not set: the connection is not checked'],
+    'configuration'));
+
+  // R1-CFG-PRIVILEGED-CREDENTIALS (frontend exposure is R1-CFG-PUBLIC-SECRETS)
+  const privileged: string[] = [];
+  for (const section of ['api', 'migration'] as const) {
+    for (const [name, raw] of Object.entries(sections[section])) {
+      if (FORBIDDEN.includes(name) || /SERVICE_ROLE|JWT_SECRET|SUPABASE_SECRET|SIGNING_KEY|PRIVATE_KEY/i.test(name)) {
+        privileged.push(`[${section}] ${name} is a privileged credential BizcaiaOS does not use at runtime`);
+      } else if (raw.startsWith('sb_secret_')) privileged.push(`[${section}] ${name} holds a Supabase secret key`);
+      else if (decodeJwtRole(raw) === 'service_role') privileged.push(`[${section}] ${name} holds a service_role key`);
+      else if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(raw)) privileged.push(`[${section}] ${name} holds a private key`);
+    }
+  }
+  checks.push(check('R1-CFG-PRIVILEGED-CREDENTIALS', CHECK_TITLES['R1-CFG-PRIVILEGED-CREDENTIALS'], privileged.length ? 'FAIL' : 'VERIFIED',
+    privileged.length ? privileged : [`no service_role, Supabase secret, JWT signing, private-key, or local postgres credentials in the API or migration sections`],
     'configuration'));
 
   // R1-CFG-MIGRATION-SEPARATION
@@ -175,7 +204,7 @@ export function configurationChecks(contents: string, options: { target: DeployT
     if (apiRole && migrationRole && apiRole === migrationRole) separation.push('DATABASE_URL and DATABASE_MIGRATE_URL use the same role');
   }
   checks.push(check('R1-CFG-MIGRATION-SEPARATION', CHECK_TITLES['R1-CFG-MIGRATION-SEPARATION'],
-    separation.length ? 'FAIL' : migration.DATABASE_MIGRATE_URL ? 'PASS' : 'NOT_VERIFIED',
+    separation.length ? 'FAIL' : migration.DATABASE_MIGRATE_URL ? 'VERIFIED' : 'NOT_VERIFIED',
     separation.length ? separation : migration.DATABASE_MIGRATE_URL
       ? [`no migration credentials in the frontend or API sections; [migration] DATABASE_MIGRATE_URL connects as ${MIGRATOR_ROLE} on a session port`]
       : ['no migration credentials in the frontend or API sections', '[migration] DATABASE_MIGRATE_URL not set: the migration role is not checked'],
@@ -189,7 +218,7 @@ export function configurationChecks(contents: string, options: { target: DeployT
     }
   }
   if (apiHost && /\.supabase\.(co|in)$/.test(apiHost)) dataPaths.push('[frontend] VITE_API_BASE_URL is a Supabase endpoint, not the BizcaiaOS API');
-  checks.push(check('R1-CFG-DATA-API', CHECK_TITLES['R1-CFG-DATA-API'], dataPaths.length ? 'FAIL' : 'PASS',
+  checks.push(check('R1-CFG-DATA-API', CHECK_TITLES['R1-CFG-DATA-API'], dataPaths.length ? 'FAIL' : 'VERIFIED',
     dataPaths.length ? dataPaths : ['VITE_API_BASE_URL is the BizcaiaOS API; no configured URL targets /rest, /graphql, /storage, /realtime, or /functions'],
     'configuration'));
 

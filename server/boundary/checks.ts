@@ -1,15 +1,18 @@
 /**
  * Shared result model for the R1 read-only boundary verifier.
  *
- * PASS / FAIL       the check observed the boundary and it holds / does not.
+ * VERIFIED          R1 observed the evidence and the boundary holds, within the
+ *                   check's scope (a repository check verifies the repository,
+ *                   never the deployed infrastructure).
+ * FAIL              R1 observed the evidence and the boundary does not hold.
  * NOT_VERIFIED      the evidence was not available (no configuration file, no
  *                   database connection, a provider setting R1 cannot observe,
  *                   or a catalog the connection may not read). Never a pass.
  * NOT_APPLICABLE    the subject does not exist here (e.g. no Supabase roles on
  *                   plain PostgreSQL).
- * INFO              recorded evidence only; neither pass nor fail.
+ * INFO              recorded evidence only; neither verified nor failed.
  */
-export type Status = 'PASS' | 'FAIL' | 'NOT_VERIFIED' | 'NOT_APPLICABLE' | 'INFO';
+export type Status = 'VERIFIED' | 'FAIL' | 'NOT_VERIFIED' | 'NOT_APPLICABLE' | 'INFO';
 
 /** Who has to act on a FAIL or NOT_VERIFIED, by kind of fix. */
 export type Remediation =

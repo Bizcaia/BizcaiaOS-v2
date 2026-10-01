@@ -8,7 +8,13 @@
  * Supabase Data API is not a data path, and Migration 019 and RLS hold.
  *
  * R1 = READ-ONLY VERIFICATION. It does not provision, migrate, deploy, or
- * modify database state, and it never prints a secret value.
+ * modify database state, and it never prints a secret value. It imports the
+ * data-only migration manifest, never the migration runner, and does not load
+ * .env: a database connection comes only from the shell environment and only
+ * with --database.
+ *
+ * Statuses: VERIFIED, FAIL, NOT_VERIFIED, NOT_APPLICABLE, INFO (server/boundary/checks.ts),
+ * also summarized per boundary (repository, configuration, database, provider settings).
  *
  *   repository checks      always (offline; this checkout's files)
  *   configuration checks   --env-file <file> with --target staging|production (offline)
@@ -17,7 +23,7 @@
  *
  * Usage: npm run db:verify-boundary -- [--target local|staging|production] [--env-file <file>]
  *          [--other-ref <project-ref>] [--database] [--database-url-env NAME] [--strict] [--json]
- * Exit:  0 no FAIL (and, with --strict, no required check NOT_VERIFIED); 1 otherwise; 2 usage or
+ * Exit:  0 no findings (no FAIL; with --strict, no required check NOT_VERIFIED); 1 findings; 2 usage or
  *        configuration error (bad arguments, unreadable file, missing or failed database connection).
  */
 import { readFileSync } from 'node:fs';
@@ -27,7 +33,7 @@ import { check, type Check, type Status } from './boundary/checks.js';
 import { configurationChecks, configurationNotSupplied, configurationSecrets, DEFAULT_APP_ROLE } from './boundary/configuration.js';
 import { databaseChecks, databaseNotConnected, type VerifyTarget } from './boundary/database.js';
 import { repositoryChecks } from './boundary/repository.js';
-import { MIGRATION_FILES } from './migrate.js';
+import { MIGRATION_FILES } from './migrations/migrationManifest.js';
 
 export type Options = {
   target: VerifyTarget;
@@ -90,15 +96,39 @@ function providerChecks(): Check[] {
   ];
 }
 
-export type Summary = { counts: Record<Status, number>; failing: string[]; result: 'PASS' | 'FAIL'; exitCode: 0 | 1 };
+/** The four evidence scopes. VERIFIED in one scope says nothing about another. */
+export const BOUNDARIES = [
+  { prefix: 'R1-REPO-', name: 'repository (static, this checkout)' },
+  { prefix: 'R1-CFG-', name: 'configuration (the supplied file, not the deployed services)' },
+  { prefix: 'R1-DB-', name: 'database (read-only catalog snapshot)' },
+  { prefix: 'R1-PROVIDER-', name: 'provider settings (Supabase project; manual)' },
+] as const;
+
+export type BoundaryState = 'VERIFIED' | 'FAIL' | 'NOT_VERIFIED' | 'NOT_APPLICABLE';
+
+/** FAIL if any check failed; NOT_VERIFIED if any check could not be observed; otherwise VERIFIED (or NOT_APPLICABLE when nothing applied). */
+export function boundaryState(checks: Check[]): BoundaryState {
+  if (checks.some((item) => item.status === 'FAIL')) return 'FAIL';
+  if (checks.some((item) => item.status === 'NOT_VERIFIED')) return 'NOT_VERIFIED';
+  return checks.some((item) => item.status === 'VERIFIED') ? 'VERIFIED' : 'NOT_APPLICABLE';
+}
+
+export type Summary = {
+  counts: Record<Status, number>;
+  boundaries: Array<{ boundary: string; state: BoundaryState }>;
+  failing: string[];
+  result: 'NO_FINDINGS' | 'FINDINGS';
+  exitCode: 0 | 1;
+};
 
 export function summarize(checks: Check[], strict: boolean): Summary {
-  const counts: Record<Status, number> = { PASS: 0, FAIL: 0, NOT_VERIFIED: 0, NOT_APPLICABLE: 0, INFO: 0 };
+  const counts: Record<Status, number> = { VERIFIED: 0, FAIL: 0, NOT_VERIFIED: 0, NOT_APPLICABLE: 0, INFO: 0 };
   for (const item of checks) counts[item.status] += 1;
   const failing = checks
     .filter((item) => item.status === 'FAIL' || (strict && item.required && item.status === 'NOT_VERIFIED'))
     .map((item) => item.id);
-  return { counts, failing, result: failing.length ? 'FAIL' : 'PASS', exitCode: failing.length ? 1 : 0 };
+  const boundaries = BOUNDARIES.map(({ prefix, name }) => ({ boundary: name, state: boundaryState(checks.filter((item) => item.id.startsWith(prefix))) }));
+  return { counts, boundaries, failing, result: failing.length ? 'FINDINGS' : 'NO_FINDINGS', exitCode: failing.length ? 1 : 0 };
 }
 
 export function formatReport(checks: Check[], summary: Summary, context: { options: Options; host: string | null }): string {
@@ -113,7 +143,9 @@ export function formatReport(checks: Check[], summary: Summary, context: { optio
     if (item.remediation) lines.push(`    remediation: ${item.remediation}${item.status === 'NOT_VERIFIED' && !item.required ? ' (not required by --strict)' : ''}`);
   }
   const { counts } = summary;
-  lines.push(`SUMMARY: PASS ${counts.PASS}, FAIL ${counts.FAIL}, NOT_VERIFIED ${counts.NOT_VERIFIED}, NOT_APPLICABLE ${counts.NOT_APPLICABLE}, INFO ${counts.INFO}`);
+  lines.push('BOUNDARIES:');
+  for (const { boundary, state } of summary.boundaries) lines.push(`    ${state.padEnd(14)} ${boundary}`);
+  lines.push(`SUMMARY: VERIFIED ${counts.VERIFIED}, FAIL ${counts.FAIL}, NOT_VERIFIED ${counts.NOT_VERIFIED}, NOT_APPLICABLE ${counts.NOT_APPLICABLE}, INFO ${counts.INFO}`);
   lines.push(`RESULT: ${summary.result}${summary.failing.length ? ` (${summary.failing.join(', ')})` : ''}`);
   return lines.join('\n');
 }

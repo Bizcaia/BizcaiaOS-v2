@@ -98,7 +98,7 @@ Repository gate, all on the exact `main` commit to be deployed:
    npm run db:verify-boundary -- --target staging --env-file <same file> [--other-ref <production project ref>]
    ```
 
-   Expect: repository and configuration checks `PASS`. Database and provider
+   Expect: repository and configuration `VERIFIED`. Database and provider
    checks are `NOT_VERIFIED` until section C. See
    [Boundary verification (R1)](production-readiness.md#boundary-verification-r1).
 5. Recommended before the token-rejection smoke test (step 19): fix the
@@ -225,7 +225,7 @@ Record a UTC timestamp and the evidence for every step in the checklist.
 | 8 | Confirm 019 applied exactly once | `psql "$DATABASE_MIGRATE_URL" -X -f deploy/sql/staging-post-migration.sql`, POST-2 | `recorded 19`, `m019 1`, last `019_revoke_public_function_execute.sql` |
 | 9 | Second migration pass | `npm run db:migrate` | Nothing applied |
 | 10 | Confirm zero applied | Output of step 9 | No `applied` lines; `migrations complete` |
-| 11 | Migration 019 security verification | Re-run `staging-post-migration.sql` and keep the full output. Then run R1: `npm run db:verify-boundary -- --target staging --env-file <file> --database --strict` (read-only; uses `DATABASE_MIGRATE_URL`) and keep its output (`--json` for the record) | Every "expect" line holds. R1 exits `0`: no `FAIL`, and only `R1-PROVIDER-DATA-API` and `R1-PROVIDER-AUTH-SETTINGS` are `NOT_VERIFIED` (steps 5 and 6) |
+| 11 | Migration 019 security verification | Re-run `staging-post-migration.sql` and keep the full output. Then run R1: `npm run db:verify-boundary -- --target staging --env-file <file> --database --strict` (read-only; uses `DATABASE_MIGRATE_URL` from the shell; R1 does not read `.env`) and keep its output (`--json` for the record) | Every "expect" line holds. R1 exits `0` (`RESULT: NO_FINDINGS`): no `FAIL`, and only `R1-PROVIDER-DATA-API` and `R1-PROVIDER-AUTH-SETTINGS` are `NOT_VERIFIED` (steps 5 and 6) |
 | 12 | `PUBLIC` cannot execute BizcaiaOS functions | POST-4 | No rows |
 | 13 | `anon` and `authenticated` have no unintended access | POST-5 | No rows. POST-10 records provider defaults; they apply only to objects the provider roles create, never to migrator-owned objects |
 | 14 | `bizcaiaos_app` works | `psql "$DATABASE_URL" -X -f deploy/sql/staging-app-role.sql`, plus POST-6 | APP-1 `bizcaiaos_app`, not superuser or bypassrls; APP-2 actor null, 0 visible rows; APP-3 `f, f`; POST-6 no rows |

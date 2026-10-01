@@ -20,7 +20,7 @@ const MIGRATION_019_SQL = `
 
 describe('R1 repository: migration chain', () => {
   it('passes a contiguous, registered, present chain', () => {
-    expect(checkMigrationChain(CHAIN, [...CHAIN, 'validate_sql.py']).status).toBe('PASS');
+    expect(checkMigrationChain(CHAIN, [...CHAIN, 'validate_sql.py']).status).toBe('VERIFIED');
   });
 
   it('detects gaps, order, duplicates, missing and unregistered files', () => {
@@ -37,7 +37,7 @@ describe('R1 repository: migration chain', () => {
 describe('R1 repository: Migration 019', () => {
   const chain = ['001_a.sql', MIGRATION_019];
   it('passes when 019 is registered, present, and still revokes PUBLIC execute', () => {
-    expect(checkMigration019(chain, chain, MIGRATION_019_SQL).status).toBe('PASS');
+    expect(checkMigration019(chain, chain, MIGRATION_019_SQL).status).toBe('VERIFIED');
   });
 
   it('fails when 019 is absent, unregistered, or no longer revokes', () => {
@@ -61,7 +61,7 @@ describe('R1 repository: RLS model', () => {
     const model = deriveRlsModel(files);
     expect([...model.tables].sort()).toEqual(['a', 'b']);
     expect([...model.policies].sort()).toEqual(['a.p1']);
-    expect(checkRepositoryRls(model).status).toBe('PASS');
+    expect(checkRepositoryRls(model).status).toBe('VERIFIED');
   });
 
   it('fails on a policy whose table never enables RLS, or an empty model', () => {
@@ -84,8 +84,8 @@ describe('R1 repository: data path and Auth wiring', () => {
   const ui: SourceFile = { path: 'src/api/operationsApi.ts', content: "fetch(`${apiBase}/ops/projects`); Array.from(rows);" };
 
   it('passes when Supabase is used for sign-in only and the API reaches data through PostgreSQL', () => {
-    expect(checkDataPath([auth, api, ui]).status).toBe('PASS');
-    expect(checkAuthWiring([auth, api, ui]).status).toBe('PASS');
+    expect(checkDataPath([auth, api, ui]).status).toBe('VERIFIED');
+    expect(checkAuthWiring([auth, api, ui]).status).toBe('VERIFIED');
   });
 
   it('fails when the Data API (or storage/functions) becomes an application data path', () => {

@@ -6,16 +6,33 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Check } from '../boundary/checks.js';
 import { databaseChecks, QUERIES, TRANSACTION } from '../boundary/database.js';
 import { repositoryChecks } from '../boundary/repository.js';
-import { MIGRATION_FILES, runMigrations } from '../migrate.js';
+import { runMigrations } from '../migrate.js';
+import { MIGRATION_FILES } from '../migrations/migrationManifest.js';
 import { requireDatabaseEnv } from './postgresHarness.js';
 
 // R1 against real PostgreSQL. Plain PostgreSQL has no Supabase roles, so
-// anon/authenticated are reported NOT_APPLICABLE. The negative control runs in
+// anon/authenticated are normally NOT_APPLICABLE. The negative control runs in
 // its own disposable database, which is dropped afterwards.
+//
+// Roles are cluster-wide, and the function-privilege suite runs in parallel and
+// briefly creates and drops anon/authenticated. While they exist R1 evaluates
+// them (correctly), and a role dropped in the middle of a snapshot makes the
+// catalog call fail (the CLI would exit 2, changing nothing). These tests
+// accept either role state and retry that one transient error.
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const appRole = process.env.POSTGRES_APP_USER?.trim() || 'bizcaiaos_app';
 const { rls } = repositoryChecks(ROOT, MIGRATION_FILES);
-const verify = (url: string) => databaseChecks(url, { target: 'local', appRole, registered: MIGRATION_FILES, rls });
+const API_ROLE_CHECKS = ['R1-DB-ANON', 'R1-DB-AUTHENTICATED'];
+async function verify(url: string): Promise<Check[]> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await databaseChecks(url, { target: 'local', appRole, registered: MIGRATION_FILES, rls });
+    } catch (error) {
+      const concurrentRoleDrop = (error as { code?: string }).code === '42704';
+      if (!concurrentRoleDrop || attempt === 5) throw error;
+    }
+  }
+}
 const statusOf = (checks: Check[]) => Object.fromEntries(checks.map((item) => [item.id, item.status]));
 const failed = (checks: Check[]) => checks.filter((item) => item.status === 'FAIL').map((item) => item.id);
 
@@ -39,18 +56,17 @@ describe('R1 read-only boundary verifier (real database)', () => {
     const checks = await verify(requireDatabaseEnv().migrateUrl);
     expect(failed(checks)).toEqual([]);
     expect(statusOf(checks)).toMatchObject({
-      'R1-DB-IDENTITY': 'PASS',
-      'R1-DB-ROLES': 'PASS',
-      'R1-DB-MIGRATIONS': 'PASS',
-      'R1-DB-OWNER': 'PASS',
-      'R1-DB-APP-PRIVILEGES': 'PASS',
-      'R1-DB-PUBLIC': 'PASS',
-      'R1-DB-FUTURE-FUNCTIONS': 'PASS',
-      'R1-DB-TRUSTED-FUNCTIONS': 'PASS',
-      'R1-DB-RLS': 'PASS',
-      'R1-DB-ANON': 'NOT_APPLICABLE',
-      'R1-DB-AUTHENTICATED': 'NOT_APPLICABLE',
+      'R1-DB-IDENTITY': 'VERIFIED',
+      'R1-DB-ROLES': 'VERIFIED',
+      'R1-DB-MIGRATIONS': 'VERIFIED',
+      'R1-DB-OWNER': 'VERIFIED',
+      'R1-DB-APP-PRIVILEGES': 'VERIFIED',
+      'R1-DB-PUBLIC': 'VERIFIED',
+      'R1-DB-FUTURE-FUNCTIONS': 'VERIFIED',
+      'R1-DB-TRUSTED-FUNCTIONS': 'VERIFIED',
+      'R1-DB-RLS': 'VERIFIED',
     });
+    for (const id of API_ROLE_CHECKS) expect(['NOT_APPLICABLE', 'VERIFIED'], id).toContain(statusOf(checks)[id]);
     expect(checks.find((item) => item.id === 'R1-DB-RLS')!.evidence[0]).toBe('expected 18 tables with RLS and 49 policies; found 18 with RLS and 49 policies');
   });
 
@@ -140,8 +156,12 @@ describe('R1 read-only boundary verifier (real database)', () => {
       });
 
       const checks = await verify(url);
-      expect(failed(checks).sort()).toEqual(['R1-DB-APP-PRIVILEGES', 'R1-DB-PUBLIC', 'R1-DB-RLS']);
       const evidence = (id: string) => checks.find((item) => item.id === id)!.evidence.join('\n');
+      // A PUBLIC grant also reaches anon/authenticated whenever those roles exist, and R1 reports that too.
+      for (const id of failed(checks).filter((check) => API_ROLE_CHECKS.includes(check))) {
+        expect(evidence(id)).toContain('can execute current_app_user_id()');
+      }
+      expect(failed(checks).filter((id) => !API_ROLE_CHECKS.includes(id)).sort()).toEqual(['R1-DB-APP-PRIVILEGES', 'R1-DB-PUBLIC', 'R1-DB-RLS']);
       expect(evidence('R1-DB-PUBLIC')).toContain('PUBLIC can execute: current_app_user_id()');
       expect(evidence('R1-DB-RLS')).toContain(`RLS disabled on: ${broken.table}`);
       expect(evidence('R1-DB-RLS')).toContain(`expected policy missing: ${broken.policy.table}.${broken.policy.name}`);

@@ -56,8 +56,8 @@ Operator: ______  Date (UTC): ______  Commit SHA: ______
 - [ ] Future-function default privileges verified (POST-8). Evidence: ______
 - [ ] RLS: 18 tables, 49 policies (POST-9). Evidence: ______
 - [ ] Full integration suite passed on disposable PostgreSQL 17 at this commit (step 17). Evidence: ______
-- [ ] R1 verifier, offline, before provisioning: repository and configuration `PASS` (gate A4). Evidence: ______
-- [ ] R1 verifier on staging with `--database --strict`: exit 0, no `FAIL`, only the two provider checks `NOT_VERIFIED` (step 11). Evidence: ______
+- [ ] R1 verifier, offline, before provisioning: repository and configuration `VERIFIED` (gate A4). Evidence: ______
+- [ ] R1 verifier on staging with `--database --strict`: exit 0 (`RESULT: NO_FINDINGS`), only the two provider checks `NOT_VERIFIED` (step 11). Evidence: ______
 
 ## Application
 

@@ -37,7 +37,7 @@ export function checkMigrationChain(registered: readonly string[], onDisk: reado
   return check(
     'R1-REPO-MIGRATION-CHAIN',
     'Migration chain: registered list is 001..N, in order, matching database/',
-    problems.length ? 'FAIL' : 'PASS',
+    problems.length ? 'FAIL' : 'VERIFIED',
     problems.length ? problems : [`${registered.length} migrations registered, contiguous; first ${registered[0]}, last ${registered.at(-1)}`],
     'repository',
   );
@@ -57,7 +57,7 @@ export function checkMigration019(registered: readonly string[], onDisk: readonl
   return check(
     'R1-REPO-MIGRATION-019',
     'Migration 019 (D-PROD-13 function privilege boundary) is present and registered',
-    problems.length ? 'FAIL' : 'PASS',
+    problems.length ? 'FAIL' : 'VERIFIED',
     problems.length ? problems : [`registered at position ${position + 1} of ${registered.length}; revokes PUBLIC EXECUTE now and by default`],
     'repository',
   );
@@ -97,7 +97,7 @@ export function checkRepositoryRls(model: RlsModel): Check {
   return check(
     'R1-REPO-RLS-MODEL',
     'RLS model defined by the migrations (expected state for the database check)',
-    inert.length || !model.tables.size ? 'FAIL' : 'PASS',
+    inert.length || !model.tables.size ? 'FAIL' : 'VERIFIED',
     inert.length
       ? inert.map((key) => `policy on a table without RLS enabled: ${key}`)
       : model.tables.size
@@ -131,7 +131,7 @@ export function checkDataPath(files: readonly SourceFile[]): Check {
   return check(
     'R1-REPO-DATA-PATH',
     'Static wiring: the browser uses Supabase for sign-in only; data goes through the BizcaiaOS API',
-    problems.length ? 'FAIL' : 'PASS',
+    problems.length ? 'FAIL' : 'VERIFIED',
     problems.length
       ? problems
       : [
@@ -165,7 +165,7 @@ export function checkAuthWiring(files: readonly SourceFile[]): Check {
   return check(
     'R1-REPO-AUTH-WIRING',
     'Static wiring: Supabase Auth is the identity provider; the API verifies tokens (issuer, audience, JWKS from configuration)',
-    problems.length ? 'FAIL' : 'PASS',
+    problems.length ? 'FAIL' : 'VERIFIED',
     problems.length
       ? problems
       : [

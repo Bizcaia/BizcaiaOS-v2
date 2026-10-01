@@ -17,8 +17,8 @@ describe('R1 configuration checks (offline, synthetic)', () => {
     for (const target of ['staging', 'production'] as const) {
       const checks = configurationChecks(toFile(syntheticConfig(target)), { target });
       expect(checks.map((item) => [item.id, item.status])).toEqual([
-        ['R1-CFG-CONTRACT', 'PASS'], ['R1-CFG-PROJECT', 'PASS'], ['R1-CFG-ENVIRONMENT', 'PASS'], ['R1-CFG-PUBLIC-SECRETS', 'PASS'],
-        ['R1-CFG-APP-ROLE', 'PASS'], ['R1-CFG-MIGRATION-SEPARATION', 'PASS'], ['R1-CFG-DATA-API', 'PASS'],
+        ['R1-CFG-CONTRACT', 'VERIFIED'], ['R1-CFG-PROJECT', 'VERIFIED'], ['R1-CFG-ENVIRONMENT', 'VERIFIED'], ['R1-CFG-PUBLIC-SECRETS', 'VERIFIED'],
+        ['R1-CFG-APP-ROLE', 'VERIFIED'], ['R1-CFG-API-TLS', 'VERIFIED'], ['R1-CFG-PRIVILEGED-CREDENTIALS', 'VERIFIED'], ['R1-CFG-MIGRATION-SEPARATION', 'VERIFIED'], ['R1-CFG-DATA-API', 'VERIFIED'],
       ]);
     }
   });
@@ -102,9 +102,53 @@ describe('R1 configuration checks (offline, synthetic)', () => {
     ].join('\n'));
   });
 
+  it('detects privileged credentials on the API runtime or in the migration session, for staging and production', () => {
+    const serviceRoleJwt = ['e30', Buffer.from(JSON.stringify({ role: 'service_role' })).toString('base64url'), 'c2ln'].join('.');
+    for (const target of ['staging', 'production'] as const) {
+      const checks = configurationChecks(edit(target, (c) => {
+        c.api.SUPABASE_SERVICE_ROLE_KEY = 'synthetic';
+        c.api.SUPABASE_JWT_SECRET = 'synthetic';
+        c.api.ANALYTICS_TOKEN = 'sb_secret_synthetic';
+        c.api.EXTRA_KEY = serviceRoleJwt;
+        c.migration.SIGNER = '-----BEGIN PRIVATE KEY-----synthetic';
+      }), { target });
+      expect(failed(checks), target).toContain('R1-CFG-PRIVILEGED-CREDENTIALS');
+      expect(evidence(checks, 'R1-CFG-PRIVILEGED-CREDENTIALS')).toBe([
+        '[api] SUPABASE_SERVICE_ROLE_KEY is a privileged credential BizcaiaOS does not use at runtime',
+        '[api] SUPABASE_JWT_SECRET is a privileged credential BizcaiaOS does not use at runtime',
+        '[api] ANALYTICS_TOKEN holds a Supabase secret key',
+        '[api] EXTRA_KEY holds a service_role key',
+        '[migration] SIGNER holds a private key',
+      ].join('\n'));
+    }
+  });
+
+  it('detects insecure API database transport for staging and production', () => {
+    for (const target of ['staging', 'production'] as const) {
+      for (const [parameter, expected] of [
+        ['?sslmode=disable', '[api] DATABASE_URL sets sslmode=disable, which overrides DATABASE_SSL'],
+        ['?sslmode=no-verify', '[api] DATABASE_URL sets sslmode=no-verify, which overrides DATABASE_SSL'],
+        ['?ssl=0', '[api] DATABASE_URL sets ssl=0, which overrides DATABASE_SSL'],
+        ['?uselibpqcompat=true&sslmode=require', '[api] DATABASE_URL sets uselibpqcompat=true without sslmode=verify-full, which overrides DATABASE_SSL'],
+      ]) {
+        const checks = configurationChecks(edit(target, (c) => {
+          c.api.DATABASE_URL += parameter;
+        }), { target });
+        expect(evidence(checks, 'R1-CFG-API-TLS'), `${target} ${parameter}`).toBe(expected);
+      }
+      const noSsl = configurationChecks(edit(target, (c) => {
+        delete c.api.DATABASE_SSL;
+      }), { target });
+      expect(evidence(noSsl, 'R1-CFG-API-TLS')).toBe('[api] DATABASE_SSL is not "require"');
+      expect(failed(configurationChecks(edit(target, (c) => {
+        c.api.DATABASE_URL += '?sslmode=verify-full&sslrootcert=/etc/secrets/ca.crt';
+      }), { target }))).toEqual([]);
+    }
+  });
+
   it('marks every configuration check NOT_VERIFIED when no file is supplied', () => {
     const checks = configurationNotSupplied();
-    expect(checks).toHaveLength(7);
+    expect(checks).toHaveLength(9);
     expect(checks.every((item) => item.status === 'NOT_VERIFIED' && item.required)).toBe(true);
     expect(checks[0].evidence[0]).toContain('NOT_VERIFIED — CONFIGURATION_FILE_REQUIRED');
   });

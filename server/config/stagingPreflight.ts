@@ -51,7 +51,7 @@ const ALIASES: Record<string, string> = {
 };
 
 /** Must never appear in a staging configuration (local-only or never-needed secrets). */
-const FORBIDDEN = ['POSTGRES_APP_PASSWORD', 'POSTGRES_PASSWORD', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'SUPABASE_JWT_SECRET'];
+export const FORBIDDEN = ['POSTGRES_APP_PASSWORD', 'POSTGRES_PASSWORD', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'SUPABASE_JWT_SECRET'];
 
 /** D-PROD-05: the Render persistent disk mount. */
 export const DISK_MOUNT = '/var/data';
@@ -114,6 +114,25 @@ function isPlaceholder(value: string) {
 }
 
 /** Supabase project reference of a database URL: pooler user "<role>.<ref>" or direct host "db.<ref>.supabase.co". */
+/**
+ * The TLS parameter in a postgres URL that weakens or disables certificate
+ * verification, or null. URL parameters override the pg `ssl` option, so they
+ * override DATABASE_SSL: sslmode outside require/verify-ca/verify-full,
+ * ssl=0, or uselibpqcompat=true (libpq semantics: require no longer verifies).
+ */
+export function insecureTlsParameter(databaseUrl: string | undefined): string | null {
+  const parameters = parseUrl(databaseUrl)?.searchParams;
+  if (!parameters) return null;
+  const sslmode = parameters.get('sslmode');
+  if (sslmode && !['require', 'verify-ca', 'verify-full'].includes(sslmode)) return `sslmode=${sslmode}`;
+  const ssl = parameters.get('ssl');
+  if (ssl === '0' || ssl === 'false') return `ssl=${ssl}`;
+  if (parameters.get('uselibpqcompat') === 'true' && !['verify-ca', 'verify-full'].includes(sslmode ?? '')) {
+    return 'uselibpqcompat=true without sslmode=verify-full';
+  }
+  return null;
+}
+
 export function databaseProjectRef(url: URL): string | null {
   const direct = /^db\.([a-z0-9]+)\.supabase\.co$/.exec(url.hostname);
   if (direct) return direct[1];
@@ -206,10 +225,10 @@ export function stagingPreflight(sections: Record<Section, Env>, options: { prod
     if (options.productionRef && ref === options.productionRef) error(section, name, 'points at the PRODUCTION Supabase project');
   }
 
-  // 5. TLS on the API connection: sslmode in DATABASE_URL overrides DATABASE_SSL.
-  const sslmode = parseUrl(api.DATABASE_URL)?.searchParams.get('sslmode');
-  if (sslmode && !['require', 'verify-ca', 'verify-full'].includes(sslmode)) {
-    error('api', 'DATABASE_URL', 'sslmode in the URL disables certificate verification; remove it or use verify-full');
+  // 5. TLS on the API connection: TLS parameters in DATABASE_URL override DATABASE_SSL.
+  const insecure = insecureTlsParameter(api.DATABASE_URL);
+  if (insecure) {
+    error('api', 'DATABASE_URL', `${insecure} in the URL weakens or disables certificate verification; remove it or use sslmode=verify-full`);
   }
 
   // 6. Render: port and persistent disk.

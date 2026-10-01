@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MIGRATION_FILES } from '../migrate.js';
+import { MIGRATION_FILES } from '../migrations/migrationManifest.js';
 import type { Check } from './checks.js';
 import { collectSnapshot, evaluate, QUERIES, TRANSACTION, TRUSTED_FUNCTIONS, withReadOnlySession, type Snapshot, type VerifyTarget } from './database.js';
 import type { RlsModel } from './repository.js';
@@ -72,9 +72,9 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
     const checks = run(supabaseSnapshot());
     expect(failed(checks)).toEqual([]);
     expect(statusOf(checks)).toMatchObject({
-      'R1-DB-IDENTITY': 'PASS', 'R1-DB-ROLES': 'PASS', 'R1-DB-MIGRATIONS': 'PASS', 'R1-DB-OWNER': 'PASS', 'R1-DB-APP-PRIVILEGES': 'PASS',
-      'R1-DB-PUBLIC': 'PASS', 'R1-DB-ANON': 'PASS', 'R1-DB-AUTHENTICATED': 'PASS', 'R1-DB-FUTURE-FUNCTIONS': 'PASS',
-      'R1-DB-TRUSTED-FUNCTIONS': 'PASS', 'R1-DB-RLS': 'PASS', 'R1-DB-DEFAULT-ACLS': 'INFO', 'R1-DB-SERVICE-ROLE': 'INFO',
+      'R1-DB-IDENTITY': 'VERIFIED', 'R1-DB-ROLES': 'VERIFIED', 'R1-DB-MIGRATIONS': 'VERIFIED', 'R1-DB-OWNER': 'VERIFIED', 'R1-DB-APP-PRIVILEGES': 'VERIFIED',
+      'R1-DB-PUBLIC': 'VERIFIED', 'R1-DB-ANON': 'VERIFIED', 'R1-DB-AUTHENTICATED': 'VERIFIED', 'R1-DB-FUTURE-FUNCTIONS': 'VERIFIED',
+      'R1-DB-TRUSTED-FUNCTIONS': 'VERIFIED', 'R1-DB-RLS': 'VERIFIED', 'R1-DB-DEFAULT-ACLS': 'INFO', 'R1-DB-SERVICE-ROLE': 'INFO',
     });
     expect(evidence(checks, 'R1-DB-ANON')).toContain('provider default in public (applies only to objects that role creates): postgres r');
   });
@@ -87,14 +87,14 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
     local.trustedGrants = local.trustedGrants.map((grant) => ({ ...grant, grantee: grant.grantee === OWNER ? 'local_owner' : grant.grantee }));
     const checks = run(local, 'local');
     expect(failed(checks)).toEqual([]);
-    expect(statusOf(checks)).toMatchObject({ 'R1-DB-ANON': 'NOT_APPLICABLE', 'R1-DB-AUTHENTICATED': 'NOT_APPLICABLE', 'R1-DB-OWNER': 'PASS' });
+    expect(statusOf(checks)).toMatchObject({ 'R1-DB-ANON': 'NOT_APPLICABLE', 'R1-DB-AUTHENTICATED': 'NOT_APPLICABLE', 'R1-DB-OWNER': 'VERIFIED' });
     // The same database judged as staging must connect as, and be owned by, bizcaiaos_migrator.
     expect(failed(run(local, 'staging'))).toEqual(expect.arrayContaining(['R1-DB-IDENTITY', 'R1-DB-ROLES', 'R1-DB-OWNER']));
   });
 
   it('negative control: a PUBLIC execute grant on a BizcaiaOS function fails (good state passes)', () => {
     const snapshot = supabaseSnapshot();
-    expect(statusOf(run(snapshot))['R1-DB-PUBLIC']).toBe('PASS');
+    expect(statusOf(run(snapshot))['R1-DB-PUBLIC']).toBe('VERIFIED');
     snapshot.functionExecute.public['can_read_property(uuid)'] = true;
     const checks = run(snapshot);
     expect(failed(checks)).toEqual(['R1-DB-PUBLIC']);

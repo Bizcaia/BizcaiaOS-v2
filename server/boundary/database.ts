@@ -192,7 +192,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
   if (!snapshot.identity.publicSchema) identityProblems.push('schema public does not exist');
   if (connectedAsApp) identityProblems.push(`connected as the application role ${app}: use the migration/operator connection for verification`);
   else if (deployed && user !== MIGRATOR_ROLE) identityProblems.push(`connected as ${user}: ${options.target} verification must connect as ${MIGRATOR_ROLE}`);
-  add('R1-DB-IDENTITY', identityProblems.length ? 'FAIL' : 'PASS', [
+  add('R1-DB-IDENTITY', identityProblems.length ? 'FAIL' : 'VERIFIED', [
     `database=${snapshot.identity.database} user=${user} server=${snapshot.identity.version.split(' on ')[0]}`,
     `transaction read only=${snapshot.identity.readOnly}`,
     ...identityProblems,
@@ -222,7 +222,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     if (deployed) roleProblems.push(`${MIGRATOR_ROLE}: role does not exist`);
     else roleEvidence.push(`${MIGRATOR_ROLE}: not present (local database; migrations ran as ${user})`);
   }
-  add('R1-DB-ROLES', roleProblems.length ? 'FAIL' : 'PASS', [...roleProblems, ...roleEvidence], 'database-roles');
+  add('R1-DB-ROLES', roleProblems.length ? 'FAIL' : 'VERIFIED', [...roleProblems, ...roleEvidence], 'database-roles');
 
   // R1-DB-MIGRATIONS
   if (snapshot.migrations === 'unreadable') {
@@ -234,7 +234,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     const exact = recorded.length === options.registered.length && recorded.every((id, index) => id === options.registered[index]);
     const missing = options.registered.filter((id) => !recorded.includes(id));
     const unknown = recorded.filter((id) => !options.registered.includes(id));
-    add('R1-DB-MIGRATIONS', exact ? 'PASS' : 'FAIL', [
+    add('R1-DB-MIGRATIONS', exact ? 'VERIFIED' : 'FAIL', [
       `recorded=${recorded.length} registered=${options.registered.length} latest=${recorded.at(-1) ?? '(none)'}`,
       ...missing.map((id) => `not applied: ${id}`),
       ...unknown.map((id) => `recorded but not registered: ${id}`),
@@ -249,7 +249,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
       ...snapshot.relations.filter((rel) => rel.owner !== owner).map((rel) => `${rel.name} (${rel.owner})`),
       ...bizFunctions.filter((fn) => fn.owner !== owner).map((fn) => `${fn.signature} (${fn.owner})`),
     ];
-    add('R1-DB-OWNER', foreign.length ? 'FAIL' : 'PASS', [
+    add('R1-DB-OWNER', foreign.length ? 'FAIL' : 'VERIFIED', [
       `expected owner=${owner}; relations=${snapshot.relations.length}; BizcaiaOS functions=${bizFunctions.length}`,
       ...foreign.slice(0, 20).map((item) => `not owned: ${item}`),
     ], 'database-privileges');
@@ -271,7 +271,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     if (notExecutable.length) problems.push(`cannot execute: ${notExecutable.map((fn) => fn.signature).join(', ')}`);
     const helpers = new Set(snapshot.policies.flatMap((policy) => policy.functions));
     if (!bizFunctions.length) problems.push('no BizcaiaOS functions found: the check would be vacuous');
-    add('R1-DB-APP-PRIVILEGES', problems.length ? 'FAIL' : 'PASS', problems.length ? problems.map((problem) => `${app} ${problem}`) : [
+    add('R1-DB-APP-PRIVILEGES', problems.length ? 'FAIL' : 'VERIFIED', problems.length ? problems.map((problem) => `${app} ${problem}`) : [
       `${app}: CRUD on ${appTables.length} tables, USAGE on ${sequences.length} sequences, executes all ${bizFunctions.length} BizcaiaOS functions incl. ${helpers.size} RLS helpers; no schema_migrations access`,
     ], 'database-privileges');
   }
@@ -279,7 +279,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
   // R1-DB-PUBLIC
   const publicExecutable = bizFunctions.filter((fn) => snapshot.functionExecute.public?.[fn.signature]);
   const publicRelations = snapshot.relations.filter((rel) => (snapshot.relationPrivileges.public?.[rel.name] ?? []).length);
-  add('R1-DB-PUBLIC', !bizFunctions.length || publicExecutable.length || publicRelations.length ? 'FAIL' : 'PASS', !bizFunctions.length
+  add('R1-DB-PUBLIC', !bizFunctions.length || publicExecutable.length || publicRelations.length ? 'FAIL' : 'VERIFIED', !bizFunctions.length
     ? ['no BizcaiaOS functions found in public: the check would be vacuous']
     : [
         `BizcaiaOS functions executable by PUBLIC: ${publicExecutable.length} of ${bizFunctions.length}; relations with PUBLIC privileges: ${publicRelations.length}`,
@@ -298,7 +298,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     const functionsHeld = bizFunctions.filter((fn) => snapshot.functionExecute[role]?.[fn.signature]);
     const ownerDefaults = owner ? snapshot.defaultAcls.filter((acl) => acl.role === owner && acl.grantee === role) : [];
     const providerDefaults = snapshot.defaultAcls.filter((acl) => acl.role !== owner && acl.grantee === role && acl.schema === 'public');
-    add(id, relationsHeld.length || functionsHeld.length || ownerDefaults.length ? 'FAIL' : 'PASS', [
+    add(id, relationsHeld.length || functionsHeld.length || ownerDefaults.length ? 'FAIL' : 'VERIFIED', [
       `relations with privileges: ${relationsHeld.length}; BizcaiaOS functions executable: ${functionsHeld.length}; default privileges from the migration owner: ${ownerDefaults.length}`,
       ...relationsHeld.slice(0, 20).map((rel) => `holds ${snapshot.relationPrivileges[role][rel.name].join(',')} on ${rel.name}`),
       ...functionsHeld.slice(0, 20).map((fn) => `can execute ${fn.signature}`),
@@ -313,7 +313,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     const globalDefaults = snapshot.defaultAcls.filter((acl) => acl.role === owner && acl.schema === '(all schemas)' && acl.type === 'f');
     const publicFuture = !globalDefaults.length || globalDefaults.some((acl) => acl.grantee === 'PUBLIC');
     const appFuture = snapshot.defaultAcls.some((acl) => acl.role === owner && acl.schema === 'public' && acl.type === 'f' && acl.grantee === app && acl.privilege === 'EXECUTE');
-    add('R1-DB-FUTURE-FUNCTIONS', publicFuture || !appFuture ? 'FAIL' : 'PASS', [
+    add('R1-DB-FUTURE-FUNCTIONS', publicFuture || !appFuture ? 'FAIL' : 'VERIFIED', [
       globalDefaults.length
         ? `global function default for ${owner}: ${publicFuture ? 'PUBLIC still executes' : 'no PUBLIC EXECUTE'}`
         : `no global function default for ${owner}: PostgreSQL's built-in PUBLIC EXECUTE applies`,
@@ -340,7 +340,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     if (unexpected.length) trustedProblems.push(`${name}: also executable by ${unexpected.join(', ')}`);
     if (!set.has(app)) trustedProblems.push(`${name}: ${app} cannot execute`);
   }
-  add('R1-DB-TRUSTED-FUNCTIONS', trustedProblems.length ? 'FAIL' : 'PASS',
+  add('R1-DB-TRUSTED-FUNCTIONS', trustedProblems.length ? 'FAIL' : 'VERIFIED',
     trustedProblems.length ? trustedProblems : [`${TRUSTED_FUNCTIONS.join(', ')}: executable only by their owner and ${app}`], 'database-privileges');
 
   // R1-DB-RLS (expected state derived from the repository's migrations)
@@ -357,7 +357,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
   const actual = new Set(snapshot.policies.map((policy) => `${policy.table}.${policy.name}`));
   for (const key of options.rls.policies) if (!actual.has(key)) rlsProblems.push(`expected policy missing: ${key}`);
   for (const key of actual) if (!options.rls.policies.has(key)) rlsProblems.push(`unexpected policy: ${key}`);
-  add('R1-DB-RLS', rlsProblems.length ? 'FAIL' : 'PASS', [
+  add('R1-DB-RLS', rlsProblems.length ? 'FAIL' : 'VERIFIED', [
     `expected ${options.rls.tables.size} tables with RLS and ${options.rls.policies.size} policies; found ${appTables.filter((rel) => rel.rls).length} with RLS and ${snapshot.policies.length} policies`,
     ...rlsProblems.slice(0, 30),
   ], 'rls');

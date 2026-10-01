@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseSectionedEnv, runPreflight, stagingPreflight, type Section } from './stagingPreflight.js';
+import { insecureTlsParameter, parseSectionedEnv, runPreflight, stagingPreflight, type Section } from './stagingPreflight.js';
 
 // Synthetic values only: no real project, domain, key, or password.
 const REF = 'stagingrefaaaaaaaaaa';
@@ -217,6 +217,12 @@ describe('staging provisioning preflight', () => {
       c.api.DATABASE_URL += '?sslmode=no-verify';
     });
     expect(errorsOf(urlOverride)).toEqual(['[api] DATABASE_URL']);
+    for (const parameter of ['?ssl=0', '?uselibpqcompat=true&sslmode=require']) {
+      expect(errorsOf(edit((c) => {
+        c.api.DATABASE_URL += parameter;
+      }))).toEqual(['[api] DATABASE_URL']);
+    }
+    expect(insecureTlsParameter(`${readyConfig().api.DATABASE_URL}?sslmode=verify-full`)).toBeNull();
     const migration = edit((c) => {
       c.migration.DATABASE_MIGRATE_URL = c.migration.DATABASE_MIGRATE_URL.replace('?sslmode=require', '');
     });
