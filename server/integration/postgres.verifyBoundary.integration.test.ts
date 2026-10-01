@@ -11,8 +11,8 @@ import { MIGRATION_FILES } from '../migrations/migrationManifest.js';
 import { requireDatabaseEnv } from './postgresHarness.js';
 
 // R1 against real PostgreSQL. Plain PostgreSQL has no Supabase roles, so
-// anon/authenticated are normally NOT_APPLICABLE. The negative control runs in
-// its own disposable database, which is dropped afterwards.
+// anon/authenticated are normally NOT_APPLICABLE. Every state-dependent test
+// runs in R1's own disposable database, which is dropped afterwards.
 //
 // Roles are cluster-wide, and the function-privilege suite runs in parallel and
 // briefly creates and drops anon/authenticated. While they exist R1 evaluates
@@ -47,45 +47,8 @@ async function withClient<T>(url: string, operation: (client: pg.Client) => Prom
 }
 
 describe('R1 read-only boundary verifier (real database)', () => {
-  beforeAll(async () => {
+  beforeAll(() => {
     requireDatabaseEnv();
-    await runMigrations();
-  }, 60_000);
-
-  it('reports no failures on a database migrated through the full chain', async () => {
-    const checks = await verify(requireDatabaseEnv().migrateUrl);
-    expect(failed(checks)).toEqual([]);
-    expect(statusOf(checks)).toMatchObject({
-      'R1-DB-IDENTITY': 'VERIFIED',
-      'R1-DB-ROLES': 'VERIFIED',
-      'R1-DB-MIGRATIONS': 'VERIFIED',
-      'R1-DB-OWNER': 'VERIFIED',
-      'R1-DB-APP-PRIVILEGES': 'VERIFIED',
-      'R1-DB-PUBLIC': 'VERIFIED',
-      'R1-DB-FUTURE-FUNCTIONS': 'VERIFIED',
-      'R1-DB-TRUSTED-FUNCTIONS': 'VERIFIED',
-      'R1-DB-RLS': 'VERIFIED',
-    });
-    for (const id of API_ROLE_CHECKS) expect(['NOT_APPLICABLE', 'VERIFIED'], id).toContain(statusOf(checks)[id]);
-    expect(checks.find((item) => item.id === 'R1-DB-RLS')!.evidence[0]).toBe('expected 18 tables with RLS and 49 policies; found 18 with RLS and 49 policies');
-  });
-
-  it('sends only the read-only transaction and allowlisted catalog SELECTs', async () => {
-    const sent: string[] = [];
-    const original = pg.Client.prototype.query;
-    const spy = vi.spyOn(pg.Client.prototype, 'query').mockImplementation(function (this: pg.Client, ...args: unknown[]) {
-      if (typeof args[0] === 'string') sent.push(args[0]);
-      return (original as (...input: unknown[]) => unknown).apply(this, args);
-    } as never);
-    try {
-      await verify(requireDatabaseEnv().migrateUrl);
-    } finally {
-      spy.mockRestore();
-    }
-    const allowed = new Set<string>([...Object.values(QUERIES), TRANSACTION.begin, TRANSACTION.end]);
-    expect(sent[0]).toBe(TRANSACTION.begin);
-    expect(sent.at(-1)).toBe(TRANSACTION.end);
-    expect(sent.filter((sql) => !allowed.has(sql))).toEqual([]);
   });
 
   it('runs inside a transaction PostgreSQL itself keeps read-only (a write attempt fails with 25006)', async () => {
@@ -98,18 +61,19 @@ describe('R1 read-only boundary verifier (real database)', () => {
     });
   });
 
-  it('reports the application-role connection as wrong verification access, without failing to run', async () => {
-    const checks = await verify(requireDatabaseEnv().url);
-    expect(statusOf(checks)).toMatchObject({ 'R1-DB-IDENTITY': 'FAIL', 'R1-DB-MIGRATIONS': 'NOT_VERIFIED', 'R1-DB-OWNER': 'NOT_VERIFIED' });
-  });
-
-  describe('negative control in a disposable database', () => {
+  // Everything that depends on database state runs in R1's own disposable
+  // database: other suites re-run db:migrate on the shared database in
+  // parallel, and the runner's grants pass through transient states (see
+  // grantApplicationPrivileges in server/migrate.ts) that R1 would, correctly,
+  // report.
+  describe('in its own disposable database', () => {
     const database = `zz_r1_db_${randomUUID().slice(0, 8)}`;
-    const urlFor = (db: string | null) => {
-      const url = new URL(requireDatabaseEnv().migrateUrl);
+    const urlFor = (base: string, db: string | null) => {
+      const url = new URL(base);
       if (db) url.pathname = `/${db}`;
       return url.toString();
     };
+    const adminUrl = (db: string | null) => urlFor(requireDatabaseEnv().migrateUrl, db);
     const fingerprint = (client: pg.Client) => client.query<{ hash: string }>(`
       select md5(string_agg(entry, '|' order by entry)) as hash from (
         select 'p' || oid || coalesce(proacl::text, '') as entry from pg_proc
@@ -119,9 +83,9 @@ describe('R1 read-only boundary verifier (real database)', () => {
         union all select 'd' || oid || defaclacl::text from pg_default_acl) entries`).then((result) => result.rows[0].hash);
 
     beforeAll(async () => {
-      await withClient(urlFor(null), (admin) => admin.query(`create database ${database}`));
+      await withClient(adminUrl(null), (admin) => admin.query(`create database ${database}`));
       const previous = process.env.DATABASE_MIGRATE_URL;
-      process.env.DATABASE_MIGRATE_URL = urlFor(database);
+      process.env.DATABASE_MIGRATE_URL = adminUrl(database);
       try {
         await runMigrations();
       } finally {
@@ -130,11 +94,53 @@ describe('R1 read-only boundary verifier (real database)', () => {
     }, 120_000);
 
     afterAll(async () => {
-      await withClient(urlFor(null), (admin) => admin.query(`drop database if exists ${database} with (force)`));
+      await withClient(adminUrl(null), (admin) => admin.query(`drop database if exists ${database} with (force)`));
     }, 60_000);
 
+    it('reports no failures on a database migrated through the full chain', async () => {
+      const checks = await verify(adminUrl(database));
+      expect(failed(checks)).toEqual([]);
+      expect(statusOf(checks)).toMatchObject({
+        'R1-DB-IDENTITY': 'VERIFIED',
+        'R1-DB-ROLES': 'VERIFIED',
+        'R1-DB-MIGRATIONS': 'VERIFIED',
+        'R1-DB-OWNER': 'VERIFIED',
+        'R1-DB-APP-PRIVILEGES': 'VERIFIED',
+        'R1-DB-PUBLIC': 'VERIFIED',
+        'R1-DB-FUTURE-FUNCTIONS': 'VERIFIED',
+        'R1-DB-TRUSTED-FUNCTIONS': 'VERIFIED',
+        'R1-DB-RLS': 'VERIFIED',
+      });
+      for (const id of API_ROLE_CHECKS) expect(['NOT_APPLICABLE', 'VERIFIED'], id).toContain(statusOf(checks)[id]);
+      expect(checks.find((item) => item.id === 'R1-DB-RLS')!.evidence[0]).toBe('expected 18 tables with RLS and 49 policies; found 18 with RLS and 49 policies');
+    });
+
+    it('sends only the read-only transaction and allowlisted catalog SELECTs', async () => {
+      const sent: string[] = [];
+      const original = pg.Client.prototype.query;
+      const spy = vi.spyOn(pg.Client.prototype, 'query').mockImplementation(function (this: pg.Client, ...args: unknown[]) {
+        if (typeof args[0] === 'string') sent.push(args[0]);
+        return (original as (...input: unknown[]) => unknown).apply(this, args);
+      } as never);
+      try {
+        await verify(adminUrl(database));
+      } finally {
+        spy.mockRestore();
+      }
+      const allowed = new Set<string>([...Object.values(QUERIES), TRANSACTION.begin, TRANSACTION.end]);
+      expect(sent[0]).toBe(TRANSACTION.begin);
+      expect(sent.at(-1)).toBe(TRANSACTION.end);
+      expect(sent.filter((sql) => !allowed.has(sql))).toEqual([]);
+    });
+
+    it('reports the application-role connection as wrong verification access, without failing to run', async () => {
+      const checks = await verify(urlFor(requireDatabaseEnv().url, database));
+      expect(statusOf(checks)).toMatchObject({ 'R1-DB-IDENTITY': 'FAIL', 'R1-DB-MIGRATIONS': 'NOT_VERIFIED', 'R1-DB-OWNER': 'NOT_VERIFIED' });
+    });
+
+    // Last: it breaks the boundary in this database on purpose.
     it('GOOD state passes and verification leaves the catalog unchanged; BAD grants and RLS changes fail', async () => {
-      const url = urlFor(database);
+      const url = adminUrl(database);
       const before = await withClient(url, fingerprint);
       expect(failed(await verify(url))).toEqual([]);
       expect(await withClient(url, fingerprint)).toBe(before);

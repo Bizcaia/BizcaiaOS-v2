@@ -248,18 +248,38 @@ production change. Each of those needs its own owner authorization.
 
 ### How the three tools relate
 
-They share one implementation of the environment rules
-(`server/config/environmentContract.ts`). R1 reuses it rather than repeating
-it.
+They share one implementation of the environment rules:
+`server/config/environmentContract.ts`, plus the shared helpers in
+`server/config/stagingPreflight.ts` (the privileged-variable list and the
+URL TLS rule). R1 reuses both rather than repeating them.
 
 ```text
 config:check
-    ↓  environment configuration correctness (per environment and scope)
+    → environment contract validation
+      (one environment and scope at a time; offline)
+        ↓
 staging:preflight
-    ↓  environment/staging readiness (the whole staging file is consistent)
-db:verify-boundary  (R1)
-    ↓  read-only security/boundary evidence (repository, configuration, database)
+    → offline environment/provisioning readiness validation
+      (the whole staging file is consistent; offline)
+        ↓
+db:verify-boundary (R1)
+    → repository + configuration + optional read-only database boundary verification
+      ├─ repository checks ....... offline, always
+      ├─ configuration checks .... offline, with --env-file
+      └─ database checks ......... read-only PostgreSQL, only with --database
 ```
+
+- **Offline checks contact nothing:** no Supabase, Render, DNS, network, or
+  database. This is tested: offline mode opens no socket or connection.
+- **`--database` enables read-only PostgreSQL verification:** one catalog
+  snapshot in a `READ ONLY` transaction that is rolled back, over the
+  connection you supply.
+- **R1 does not perform migrations.** It imports only the data-only
+  migration manifest, never the migration runner.
+- **R1 does not deploy.**
+- **R1 does not provision.**
+- **R1 does not modify infrastructure,** database state, Supabase, Render, or
+  DNS.
 
 Workflow, where each arrow is a separate, owner-authorized step:
 
@@ -284,7 +304,19 @@ PRODUCTION       = NOT_TOUCHED
 ```
 
 No staging or production boundary has been `VERIFIED`, because neither
-environment exists.
+environment exists. Verification state by kind of evidence:
+
+| Evidence | What it can show | State today |
+|---|---|---|
+| Offline (repository + a synthetic or filled-in configuration file) | the code's wiring and the file's consistency | evidence about the repository and the file only; never about an environment |
+| Disposable PostgreSQL (local container, Supabase-like setup) | that the migrations and R1 behave as designed | development validation only; **not** staging verification |
+| Real staging | the staging boundary | `NOT_VERIFIED` (staging does not exist) |
+| Real production | the production boundary | `NOT_VERIFIED` (production does not exist) |
+
+Each check in the
+[staging verification checklist](staging-verification-checklist.md) records
+exactly one of `VERIFIED`, `NOT_VERIFIED`, or `NOT_APPLICABLE`. A row becomes
+`VERIFIED` only from evidence taken on the real environment.
 
 ### Commands
 

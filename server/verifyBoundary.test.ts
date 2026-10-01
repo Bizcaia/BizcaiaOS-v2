@@ -137,29 +137,58 @@ describe('R1 verifier CLI', () => {
     expect(redact('a secret b', ['secret'])).toBe('a [REDACTED] b');
   });
 
-  it('offline mode opens no network or database connection (real database module, no stub)', async () => {
-    const socket = vi.spyOn(net.Socket.prototype, 'connect');
-    const client = vi.spyOn(pg.Client.prototype, 'connect');
-    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+  /** Blocks and records every network/database connection attempt for the duration of `run`. */
+  async function withConnectionsBlocked<T>(run: (attempts: string[]) => Promise<T>): Promise<T> {
+    const attempts: string[] = [];
+    const block = (kind: string) => () => {
+      attempts.push(kind);
+      throw Object.assign(new Error(`R1 test: ${kind} blocked`), { code: 'R1_TEST_BLOCKED' });
+    };
+    const spies = [
+      vi.spyOn(net.Socket.prototype, 'connect').mockImplementation(block('socket') as never),
+      vi.spyOn(pg.Client.prototype, 'connect').mockImplementation(block('pg.Client.connect') as never),
+      vi.spyOn(globalThis, 'fetch').mockImplementation(block('fetch') as never),
+    ];
     try {
-      for (const argv of [[], ['--json'], ['--target', 'production', '--env-file', 'f', '--strict']]) {
+      return await run(attempts);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  }
+
+  it('offline mode makes no network or database connection, and the offline checks still run (real database module, no stub)', async () => {
+    await withConnectionsBlocked(async (attempts) => {
+      for (const argv of [[], ['--json'], ['--target', 'staging', '--env-file', 'f'], ['--target', 'production', '--env-file', 'f', '--strict']]) {
         const output: string[] = [];
         await runVerifier(argv, {
           root: ROOT,
+          // A connection string is present on purpose: offline mode must still not use it.
           env: { DATABASE_MIGRATE_URL: DATABASE_URL_VALUE },
-          readFile: () => toFile(syntheticConfig('production')),
+          readFile: () => toFile(syntheticConfig(argv.includes('production') ? 'production' : 'staging')),
           log: (text) => output.push(text),
         });
-        expect(output.join('\n')).toContain('DATABASE_CONNECTION_REQUIRED');
+        const text = output.join('\n');
+        expect(text, argv.join(' ')).toContain('DATABASE_CONNECTION_REQUIRED');
+        expect(text, argv.join(' ')).toMatch(/R1-REPO-MIGRATION-CHAIN/);
+        if (argv.includes('--env-file')) expect(text).toMatch(/\[VERIFIED\] R1-CFG-PROJECT/);
       }
-      expect(socket).not.toHaveBeenCalled();
-      expect(client).not.toHaveBeenCalled();
-      expect(fetchSpy).not.toHaveBeenCalled();
-    } finally {
-      socket.mockRestore();
-      client.mockRestore();
-      fetchSpy.mockRestore();
-    }
+      expect(attempts).toEqual([]);
+    });
+  });
+
+  it('the offline guard is sensitive: a database run is caught as a connection attempt', async () => {
+    await withConnectionsBlocked(async (attempts) => {
+      const output: string[] = [];
+      const code = await runVerifier(['--database'], {
+        root: ROOT,
+        env: { DATABASE_MIGRATE_URL: DATABASE_URL_VALUE },
+        readFile: () => '',
+        log: (text) => output.push(text),
+      });
+      expect(attempts).toContain('pg.Client.connect');
+      expect(code).toBe(2);
+      expect(output.join('\n')).toBe('the read-only database verification could not complete (R1_TEST_BLOCKED); no change was made');
+    });
   });
 
   it('import safety: R1 never imports the migration runner or any module that loads .env', () => {
@@ -179,7 +208,14 @@ describe('R1 verifier CLI', () => {
     for (const reached of ['server/migrations/migrationManifest.ts', 'server/boundary/database.ts', 'server/config/environmentContract.ts']) {
       expect(graph).toContain(reached);
     }
-    for (const forbidden of ['server/migrate.ts', 'server/loadEnv.ts', 'server/database.ts', 'server/provisionAppRole.ts', 'server/index.ts']) {
+    for (const forbidden of [
+      'server/migrate.ts', // migration runner (also loads .env)
+      'server/loadEnv.ts', // .env loading
+      'server/database.ts', // API connection pool and transactions
+      'server/provisionAppRole.ts', // creates roles
+      'server/index.ts', 'server/routes.ts', 'server/operationsRoutes.ts', 'server/auth.ts', // API runtime
+      'server/storage/documentStorage.ts', 'server/storage/localDiskDocumentStorage.ts', // file writes
+    ]) {
       expect(graph, forbidden).not.toContain(forbidden);
     }
     for (const path of graph) {
