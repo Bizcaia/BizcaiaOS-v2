@@ -108,13 +108,27 @@ VITE_API_BASE_URL=http://localhost:8787/api/v1
 
 Live mode loads the authenticated user's first active organization from `/api/v1/me`. It never uses the demo organization UUID. If the user has no organization, the existing onboarding flow is shown.
 
-Live mode still requires a JWT access token from `window.__BIZCAIAOS_AUTH__` and server JWKS settings. No identity provider is wired in this baseline.
+### Sign-in (Supabase Auth)
+
+Live mode signs users in with Supabase Auth using email and password. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` (public values only) and the server's `AUTH_*` values for the same Supabase project:
+
+```
+AUTH_ISSUER=https://<project-ref>.supabase.co/auth/v1
+AUTH_AUDIENCE=authenticated
+AUTH_JWKS_URL=https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
+```
+
+The Supabase project must use asymmetric JWT signing keys; the API cannot verify legacy HS256 tokens. Users must sign in with an email address, because the API requires a non-empty `email` claim.
+
+There is no public sign-up in the app: accounts are created by an administrator, and public sign-ups should be disabled in the Supabase Auth settings. After sign-in, the app passes the Supabase access token to the API through `window.__BIZCAIAOS_AUTH__`; the frontend never reads data from Supabase directly.
+
+Without the two `VITE_SUPABASE_*` values, live mode has no sign-in and API calls fail with "Authentication provider is not connected". Staging and production Supabase values are supplied separately at deployment.
 
 ## Environment variables
 
 See `.env.example`.
 
-Frontend: `VITE_API_BASE_URL`, `VITE_ANALYTICS_ENDPOINT`, `VITE_ANALYTICS_WEBSITE_ID`
+Frontend: `VITE_API_BASE_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, `VITE_ANALYTICS_ENDPOINT`, `VITE_ANALYTICS_WEBSITE_ID`
 
 API: `API_PORT`, `CORS_ORIGIN`, `DATABASE_URL`, `DATABASE_MIGRATE_URL`, `DATABASE_POOL_SIZE`, `DATABASE_SSL`, `AUTH_JWKS_URL`, `AUTH_ISSUER`, `AUTH_AUDIENCE`, `POSTGRES_*`
 

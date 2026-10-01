@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, FolderKanban, LayoutDashboard, Map, Plus, Search, ShieldCheck } from 'lucide-react';
+import { ArrowLeft, FolderKanban, LayoutDashboard, LogOut, Map, Plus, Search, ShieldCheck } from 'lucide-react';
 import { organizationApi, organizationApiMode, type Member, type OrganizationRole } from '../api/organizationApi';
 import {
   DEMO_ORGANIZATION_ID,
@@ -40,6 +40,8 @@ import {
 } from '../api/operationsApi';
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
+import AuthGate from '../auth/AuthGate';
+import { getSupabaseAuth } from '../auth/supabaseAuth';
 
 const stageLabels: Record<AcquisitionStage, string> = {
   identified: 'Identified',
@@ -199,7 +201,17 @@ function allowedPropertyPatchKeys(role: OrganizationRole): Set<string> {
   }
 }
 
+// C-01: in live mode with Supabase Auth configured, the workspace (and its
+// /me request) mounts only once the user is signed in. Demo mode is unchanged.
 export default function OpsApp({ onExit }: { onExit: () => void }) {
+  return (
+    <AuthGate auth={getSupabaseAuth()} onCancel={onExit}>
+      {({ signOut }) => <OpsWorkspace onExit={onExit} onSignOut={signOut} />}
+    </AuthGate>
+  );
+}
+
+function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: () => Promise<void> }) {
   const [tab, setTab] = useState<OpsTab>('dashboard');
   const [properties, setProperties] = useState<Property[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -358,6 +370,11 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
             <ShieldCheck size={17} /> Team & access
           </button>
         </nav>
+        {onSignOut && (
+          <button className="ops-exit" onClick={() => void onSignOut()}>
+            <LogOut size={16} /> Sign out
+          </button>
+        )}
         <button className="ops-exit" onClick={onExit}>
           <ArrowLeft size={16} /> Website
         </button>
