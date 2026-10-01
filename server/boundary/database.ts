@@ -253,9 +253,29 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     add('R1-DB-APP-MEMBERSHIP', 'FAIL', [`${app} does not exist`], 'database-roles');
   } else {
     const objectOwners = new Set([...snapshot.relations, ...bizFunctions].map((item) => item.owner).filter((name) => name !== app));
+    type Membership = Snapshot['memberships'][number];
     const option = (value: boolean | null) => (value === null ? 'n/a' : String(value));
-    const describe = (membership: Snapshot['memberships'][number]) =>
-      `${app} is a member of ${membership.role} via ${membership.path.join(' -> ')} (inherit=${option(membership.inherit)} set=${option(membership.setOption)} admin=${membership.admin})`;
+    const options = (membership: Membership) =>
+      `inherit=${option(membership.inherit)} set=${option(membership.setOption)} admin=${membership.admin}`;
+    // The options are those of one grant: the last link of the path.
+    const describe = (membership: Membership) => {
+      const via = `${app} is a member of ${membership.role} via ${membership.path.join(' -> ')}`;
+      if (membership.path.length === 1) return `${via} (${options(membership)})`;
+      return `${via} (last link ${membership.path.at(-2)} -> ${membership.role}: ${options(membership)})`;
+    };
+    // What the membership allows today; the check fails on the membership itself either way.
+    const consequence = (membership: Membership) => {
+      if (membership.path.length > 1) {
+        return 'nested: what the application role can do depends on every link in the path; the membership is forbidden whatever the options';
+      }
+      if (membership.inherit === null || membership.setOption === null) {
+        return 'INHERIT and SET are not recorded per membership before PostgreSQL 16, where any member can SET ROLE to the role';
+      }
+      if (membership.inherit && membership.setOption) return `${app} inherits this role's privileges and can SET ROLE to it`;
+      if (membership.inherit) return `${app} inherits this role's privileges but cannot SET ROLE to it`;
+      if (membership.setOption) return `${app} can SET ROLE to it but does not inherit its privileges`;
+      return `${app} neither inherits its privileges nor can SET ROLE to it today; the membership is still forbidden, because widening its options would open both`;
+    };
     const forbidden = snapshot.memberships.flatMap((membership) => {
       const reasons = [
         (membership.role === MIGRATOR_ROLE || membership.role === owner) && 'the migration owner',
@@ -264,7 +284,7 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
         membership.bypassRls && 'BYPASSRLS',
         PRIVILEGED_PREDEFINED_ROLES.includes(membership.role) && 'privileged predefined role',
       ].filter(Boolean);
-      return reasons.length ? [`${describe(membership)}: ${reasons.join(', ')}; a member can use its privileges or SET ROLE to it, past RLS and table grants`] : [];
+      return reasons.length ? [`${describe(membership)}: ${reasons.join(', ')}; ${consequence(membership)}`] : [];
     });
     add('R1-DB-APP-MEMBERSHIP', forbidden.length ? 'FAIL' : 'VERIFIED', forbidden.length ? forbidden : [
       snapshot.memberships.length

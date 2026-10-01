@@ -171,6 +171,12 @@ describe('R1 read-only boundary verifier (real database)', () => {
               const result = await membership();
               expect(result.status, `inherit ${inherit} set ${setOption}`).toBe('FAIL');
               expect(result.evidence).toContain(`${app} is a member of ${owner} via ${owner} (inherit=${inherit} set=${setOption} admin=false): the migration owner`);
+              // The evidence states what this membership allows on the real server, nothing more.
+              const allows = inherit && setOption ? `${app} inherits this role's privileges and can SET ROLE to it`
+                : inherit ? `${app} inherits this role's privileges but cannot SET ROLE to it`
+                  : setOption ? `${app} can SET ROLE to it but does not inherit its privileges`
+                    : `${app} neither inherits its privileges nor can SET ROLE to it today`;
+              expect(result.evidence).toContain(`; ${allows}`);
               if (!inherit && setOption) {
                 // The gap this check closes: no effective privilege, yet SET ROLE reaches the owner.
                 expect((await admin.query('select has_table_privilege($1, \'public.schema_migrations\', \'SELECT\') as can', [app])).rows[0].can).toBe(false);
@@ -201,6 +207,73 @@ describe('R1 read-only boundary verifier (real database)', () => {
         } finally {
           await admin.query(`drop role if exists ${app}`);
           await admin.query(`drop role if exists ${safe}`);
+        }
+      });
+    }, 120_000);
+
+    // The other forbidden kinds, on real catalog output. Throwaway zz_ roles
+    // only, all dropped again; the probe function is dropped before the next test.
+    it('fails on nested, SUPERUSER, BYPASSRLS, server-file and other-owner memberships, read from the real catalog', async () => {
+      const url = adminUrl(database);
+      const suffix = randomUUID().slice(0, 8);
+      const [app, mid, superRole, bypassRole, otherOwner] = ['app', 'mid', 'super', 'bypass', 'owner'].map((kind) => `zz_r1_${kind}_${suffix}`);
+      const probeFunction = `public.zz_r1_owned_${suffix}()`;
+      const membership = async () => {
+        const checks = await verify(url, app);
+        return { status: statusOf(checks)['R1-DB-APP-MEMBERSHIP'], evidence: checks.find((item) => item.id === 'R1-DB-APP-MEMBERSHIP')!.evidence.join('\n') };
+      };
+      const expectFinding = async (grant: string, revoke: string, expected: string[]) => {
+        await withClient(url, (admin) => admin.query(grant));
+        try {
+          const result = await membership();
+          expect(result.status, grant).toBe('FAIL');
+          for (const text of expected) expect(result.evidence, grant).toContain(text);
+        } finally {
+          await withClient(url, (admin) => admin.query(revoke));
+        }
+      };
+      await withClient(url, async (admin) => {
+        const owner = (await admin.query<{ user: string }>('select current_user as user')).rows[0].user;
+        try {
+          await admin.query(`create role ${app} nologin`);
+          await admin.query(`create role ${mid} nologin`);
+          await admin.query(`create role ${superRole} superuser nologin`);
+          await admin.query(`create role ${bypassRole} bypassrls nologin`);
+          await admin.query(`create role ${otherOwner} nologin`);
+          expect(await membership()).toMatchObject({ status: 'VERIFIED' });
+
+          // Nested: app -> mid -> owner; the options shown are the last link's.
+          await admin.query(`grant "${owner}" to ${mid} with inherit false, set true`);
+          await expectFinding(`grant ${mid} to ${app}`, `revoke ${mid} from ${app}`, [
+            `${app} is a member of ${owner} via ${mid} -> ${owner} (last link ${mid} -> ${owner}: inherit=false set=true admin=false): the migration owner`,
+            'nested: what the application role can do depends on every link in the path',
+          ]);
+          await admin.query(`revoke "${owner}" from ${mid}`);
+
+          await expectFinding(`grant ${superRole} to ${app} with inherit false, set true`, `revoke ${superRole} from ${app}`, [
+            `${app} is a member of ${superRole} via ${superRole} (inherit=false set=true admin=false): SUPERUSER; ${app} can SET ROLE to it`,
+          ]);
+          await expectFinding(`grant ${bypassRole} to ${app}`, `revoke ${bypassRole} from ${app}`, [
+            `${app} is a member of ${bypassRole} via ${bypassRole} (inherit=true set=true admin=false): BYPASSRLS`,
+          ]);
+          for (const predefined of ['pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program']) {
+            await expectFinding(`grant ${predefined} to ${app}`, `revoke ${predefined} from ${app}`, [
+              `${app} is a member of ${predefined} via ${predefined} (inherit=true set=true admin=false): privileged predefined role`,
+            ]);
+          }
+
+          // Another role owning a BizcaiaOS object in public.
+          await admin.query(`create function ${probeFunction} returns integer language sql as 'select 1'`);
+          await admin.query(`alter function ${probeFunction} owner to ${otherOwner}`);
+          await expectFinding(`grant ${otherOwner} to ${app} with inherit false, set false`, `revoke ${otherOwner} from ${app}`, [
+            `${app} is a member of ${otherOwner} via ${otherOwner} (inherit=false set=false admin=false): owns BizcaiaOS objects in public; ${app} neither inherits its privileges nor can SET ROLE to it today`,
+          ]);
+          await admin.query(`drop function ${probeFunction}`);
+
+          expect(await membership()).toMatchObject({ status: 'VERIFIED' });
+        } finally {
+          await admin.query(`drop function if exists ${probeFunction}`);
+          for (const role of [app, mid, superRole, bypassRole, otherOwner]) await admin.query(`drop role if exists ${role}`);
         }
       });
     }, 120_000);
