@@ -189,7 +189,7 @@ must always run as `bizcaiaos_migrator`.
 ```text
 LOCAL VALIDATION (PostgreSQL 16 and 17, full integration suite)
       ↓
-STAGING MIGRATION (operator, bizcaiaos_migrator, after a backup)
+STAGING MIGRATION (separately authorized; operator, bizcaiaos_migrator, after a backup)
       ↓
 STAGING VALIDATION (privilege checks, smoke tests, recovery rehearsal)
       ↓
@@ -200,8 +200,10 @@ Each environment runs the same command twice: the first run applies every
 pending migration, the second must apply none.
 
 After the first staging migration, verify the following. The
-[staging runbook](staging-provisioning.md) gives the exact steps, and
-`deploy/sql/` holds read-only SQL for each check:
+[staging runbook](staging-provisioning.md) gives the exact steps,
+`deploy/sql/` holds read-only SQL for each check, and the R1 verifier
+(`npm run db:verify-boundary`, [below](#boundary-verification-r1)) checks
+items 1–8 in one read-only run:
 
 1. `select current_user` on `DATABASE_MIGRATE_URL` is `bizcaiaos_migrator`.
 2. `schema_migrations` holds `001`–`019`, `019` exactly once.
@@ -220,6 +222,101 @@ After the first staging migration, verify the following. The
    modify provider-owned objects.
 8. RLS is enabled on all 18 tables with all 49 policies present.
 9. The Data API is off and returns no endpoints.
+10. Supabase Auth email/password sign-in still works with the Data API off,
+    and the API accepts the resulting token (`/api/v1/me` returns 200).
+
+## Boundary verification (R1)
+
+`npm run db:verify-boundary` is the R1 verifier. It collects evidence that an
+environment follows the accepted architecture: the browser signs in with
+Supabase Auth and reaches data only through the BizcaiaOS API, the API
+connects as `bizcaiaos_app`, migrations stay with `bizcaiaos_migrator`, the
+Supabase Data API is not a data path, and Migration 019 and RLS hold.
+
+- **R1 = READ-ONLY VERIFICATION.**
+- **R1 DOES NOT PROVISION.**
+- **R1 DOES NOT MIGRATE.**
+- **R1 DOES NOT DEPLOY.**
+- **R1 DOES NOT MODIFY DATABASE STATE.**
+
+It creates no role, database, table, function, privilege, user, or test data.
+It calls no Supabase, Render, or DNS API, and never prints a password, key,
+token, or credential-bearing URL.
+
+```bash
+# Offline: repository only, or repository plus a filled-in configuration file
+npm run db:verify-boundary
+npm run db:verify-boundary -- --target staging --env-file <file outside the repository> [--other-ref <production ref>]
+
+# With a database: read-only catalog checks over DATABASE_MIGRATE_URL (or --database-url-env NAME)
+npm run db:verify-boundary -- --target staging --env-file <file> --database --strict
+```
+
+| Group | Runs when | Checks |
+|---|---|---|
+| Repository | always (offline) | `R1-REPO-MIGRATION-CHAIN` (registered list is `001`..N, in order, matching `database/`), `R1-REPO-MIGRATION-019` (present, registered, still revokes `PUBLIC` execute), `R1-REPO-RLS-MODEL` (tables and policies the migrations define; the expected state for the database check), `R1-REPO-DATA-PATH` (Supabase client only in the sign-in module; no Data API, storage, realtime, or functions paths; the API has no Supabase client), `R1-REPO-AUTH-WIRING` (the API verifies issuer, audience, and JWKS from configuration; the browser only signs in with email and password) |
+| Configuration | `--env-file` with `--target staging` or `production` (offline) | `R1-CFG-CONTRACT` (the `config:check` rules per section; `staging:preflight` for staging), `R1-CFG-PROJECT` (frontend URL, issuer, JWKS, API database, and migration database are one Supabase project), `R1-CFG-ENVIRONMENT` (hosts match the target; no staging/production leakage; `--other-ref` names the other environment's project), `R1-CFG-PUBLIC-SECRETS`, `R1-CFG-APP-ROLE`, `R1-CFG-MIGRATION-SEPARATION`, `R1-CFG-DATA-API` |
+| Database | `--database` | `R1-DB-IDENTITY` (read-only transaction; staging/production must connect as `bizcaiaos_migrator`), `R1-DB-ROLES` (no SUPERUSER, CREATEROLE, CREATEDB, or BYPASSRLS), `R1-DB-MIGRATIONS`, `R1-DB-OWNER`, `R1-DB-APP-PRIVILEGES`, `R1-DB-PUBLIC`, `R1-DB-ANON`, `R1-DB-AUTHENTICATED`, `R1-DB-FUTURE-FUNCTIONS` (from `pg_default_acl`; no function is created), `R1-DB-TRUSTED-FUNCTIONS`, `R1-DB-RLS` (every table and policy the migrations define, RLS enabled, nothing unexpected); recorded only: `R1-DB-DEFAULT-ACLS`, `R1-DB-SERVICE-ROLE`, `R1-DB-EXTENSIONS` |
+| Provider | always | `R1-PROVIDER-DATA-API`, `R1-PROVIDER-AUTH-SETTINGS`: always `NOT_VERIFIED`. R1 cannot observe Supabase project settings; check them with the runbook (section B2, section C steps 5 and 6) |
+
+Statuses:
+
+- `PASS` / `FAIL`: R1 observed the boundary.
+- `NOT_VERIFIED`: the evidence was not available. Examples:
+  `NOT_VERIFIED — DATABASE_CONNECTION_REQUIRED`, a provider setting, or a
+  catalog the connection may not read. R1 reports the limitation; it never
+  elevates privileges.
+- `NOT_APPLICABLE`: the subject does not exist (no Supabase roles on plain
+  PostgreSQL).
+- `INFO`: recorded only.
+
+Every `FAIL` and `NOT_VERIFIED` names a remediation category:
+
+- `repository`, `configuration`, `migration`;
+- `database-roles`, `database-privileges`, `rls`;
+- `provider-settings`, `verification-access`.
+
+Exit codes:
+
+- `0`: no `FAIL`.
+- `1`: one or more `FAIL`. With `--strict`, a required check that is still
+  `NOT_VERIFIED` also counts; the two provider checks are never required.
+- `2`: a usage or configuration error. Examples: bad arguments, an unreadable
+  `--env-file`, `--database` without a connection, or a connection or query
+  that fails. In each case nothing is changed.
+
+How the database checks stay read-only:
+
+1. R1 can send only a frozen allowlist of catalog `SELECT`s plus `begin` and
+   `rollback`; any other statement is refused before it reaches the database.
+2. Everything runs inside `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
+   READ ONLY`, which PostgreSQL enforces: a write fails with `25006`. R1
+   stops unless the database confirms `transaction_read_only = on`, and
+   always rolls back.
+3. Tests cover the allowlist, the statements actually sent to a real
+   database, the `25006` refusal, and an unchanged catalog fingerprint.
+
+Like `db:migrate`, R1 fills unset variables from a local `.env`, but it opens
+a database connection only with `--database`. For staging and production,
+connect as `bizcaiaos_migrator`. A connection as `bizcaiaos_app` is reported
+as wrong verification access, because that role cannot read
+`schema_migrations`.
+
+When to run it:
+
+| When | Command | Expect |
+|---|---|---|
+| Before staging provisioning (gate A) | `--target staging --env-file <file>` | Repository and configuration `PASS`; database and provider `NOT_VERIFIED` |
+| After staging configuration and migrations (step 11) | `--target staging --env-file <file> --database --strict` | No `FAIL`; only the provider checks `NOT_VERIFIED` (checked by hand) |
+| Before production launch | `--target production --env-file <file> --other-ref <staging ref>` | Configuration `PASS`; no staging leakage |
+| After production migration and deployment (separately authorized) | `--target production --env-file <file> --other-ref <staging ref> --database --strict` | No `FAIL` |
+
+Limitations:
+
+- R1 does not observe the hosted Data API switch or Auth settings.
+- It does not sign in or call the API; that is runbook step 19.
+- It cannot see Render's disk or instance count.
+- Its repository checks are static evidence of the wiring, not runtime proof.
 
 ## Render
 
@@ -280,11 +377,12 @@ both environments.
 
 **Supabase** (per environment): organization billing plan · project creation
 (region; staging and production in the same region) · compute · PITR and
-retention · Auth: email/password on, public sign-ups off, anonymous and phone
-off, asymmetric JWT signing keys, Site URL and redirect allowlist · Data API
-off · roles `bizcaiaos_migrator` and `bizcaiaos_app` · migration connection ·
-`npm run config:check -- --scope migration` · migrations `001`–`019` twice ·
-the verification list above · sign-in smoke test.
+retention · Auth: email provider on, "Allow new users to sign up" off,
+anonymous and phone off, asymmetric JWT signing keys, Site URL and redirect
+allowlist · Data API off · roles `bizcaiaos_migrator` and `bizcaiaos_app` ·
+migration connection · `npm run config:check -- --scope migration` ·
+migrations `001`–`019` twice · `npm run db:verify-boundary` and the
+verification list above · sign-in smoke test with the Data API off.
 
 **Render** (per environment): Static Site · Web Service (one instance, paid
 plan) · persistent disk · environment variables and secrets ·

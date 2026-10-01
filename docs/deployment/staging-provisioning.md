@@ -91,7 +91,17 @@ Repository gate, all on the exact `main` commit to be deployed:
    project; that both staging hosts share one `<domain>`; that no production
    host or production project (`--production-ref`) appears; and that every
    variable is in the section that reads it.
-4. Recommended before the token-rejection smoke test (step 18): fix the
+4. The R1 boundary verifier passes offline on the same file (read-only; it
+   contacts nothing):
+
+   ```bash
+   npm run db:verify-boundary -- --target staging --env-file <same file> [--other-ref <production project ref>]
+   ```
+
+   Expect: repository and configuration checks `PASS`. Database and provider
+   checks are `NOT_VERIFIED` until section C. See
+   [Boundary verification (R1)](production-readiness.md#boundary-verification-r1).
+5. Recommended before the token-rejection smoke test (step 19): fix the
    known finding that invalid tokens return HTTP 500 instead of 401. That fix
    needs its own authorization.
 
@@ -215,7 +225,7 @@ Record a UTC timestamp and the evidence for every step in the checklist.
 | 8 | Confirm 019 applied exactly once | `psql "$DATABASE_MIGRATE_URL" -X -f deploy/sql/staging-post-migration.sql`, POST-2 | `recorded 19`, `m019 1`, last `019_revoke_public_function_execute.sql` |
 | 9 | Second migration pass | `npm run db:migrate` | Nothing applied |
 | 10 | Confirm zero applied | Output of step 9 | No `applied` lines; `migrations complete` |
-| 11 | Migration 019 security verification | Re-run `staging-post-migration.sql` and keep the full output | Every "expect" line holds |
+| 11 | Migration 019 security verification | Re-run `staging-post-migration.sql` and keep the full output. Then run R1: `npm run db:verify-boundary -- --target staging --env-file <file> --database --strict` (read-only; uses `DATABASE_MIGRATE_URL`) and keep its output (`--json` for the record) | Every "expect" line holds. R1 exits `0`: no `FAIL`, and only `R1-PROVIDER-DATA-API` and `R1-PROVIDER-AUTH-SETTINGS` are `NOT_VERIFIED` (steps 5 and 6) |
 | 12 | `PUBLIC` cannot execute BizcaiaOS functions | POST-4 | No rows |
 | 13 | `anon` and `authenticated` have no unintended access | POST-5 | No rows. POST-10 records provider defaults; they apply only to objects the provider roles create, never to migrator-owned objects |
 | 14 | `bizcaiaos_app` works | `psql "$DATABASE_URL" -X -f deploy/sql/staging-app-role.sql`, plus POST-6 | APP-1 `bizcaiaos_app`, not superuser or bypassrls; APP-2 actor null, 0 visible rows; APP-3 `f, f`; POST-6 no rows |
@@ -226,8 +236,12 @@ Record a UTC timestamp and the evidence for every step in the checklist.
 | 19 | Auth sign-in smoke test | Sign in as the staging admin; call `/api/v1/me`; sign out. Tampered, wrong-issuer, and wrong-audience tokens against `/api/v1/me` | Sign-in works with the Data API off; `/api/v1/me` returns `200` for the right user; bad tokens are refused with no data (401 once the known 500 finding is fixed); after sign-out, requests without a token return `401`. Write-path tests (onboarding, organization isolation with a second user, documents) need G6 |
 | 20 | Record the staging baseline | Staging record (below) | Complete record stored with the owner's operations records, not in Git |
 
-If R1 (`npm run db:verify-boundary`) is merged, it runs the checks of steps
-11 to 16 in one read-only command. Run it in addition to the SQL scripts.
+The R1 verifier (`npm run db:verify-boundary`) covers steps 12 to 16 and the
+RLS and migration-history checks in one read-only run, cross-checked against
+the repository's migrations. The SQL scripts stay as the independent,
+human-readable record. R1 does not provision, migrate, deploy, or modify
+database state, and it cannot observe the Data API switch or Auth settings
+(steps 5 and 6).
 
 **Staging record (step 20):**
 
@@ -312,8 +326,8 @@ claimed.
    - Roles: check whether `bizcaiaos_migrator` and `bizcaiaos_app` and their
      passwords exist in the new project. If not, recreate them (B4) with new
      passwords and update `DATABASE_URL`.
-   - Run `staging:preflight`, steps 2, 11 to 16, and 18 to 19 against the new
-     project.
+   - Run `staging:preflight`, R1 (`db:verify-boundary --database --strict`),
+     steps 2, 11 to 16, and 18 to 19 against the new project.
 
 ### Render
 

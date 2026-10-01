@@ -23,6 +23,7 @@
     "db:migrate": "tsx server/migrate.ts",
     "config:check": "tsx server/config/environmentContract.ts",
     "staging:preflight": "tsx server/config/stagingPreflight.ts",
+    "db:verify-boundary": "tsx server/verifyBoundary.ts",
     "test:integration": "vitest run server/integration --environment node"
   },
   "dependencies": {

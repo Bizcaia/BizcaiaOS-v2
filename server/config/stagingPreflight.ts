@@ -114,7 +114,7 @@ function isPlaceholder(value: string) {
 }
 
 /** Supabase project reference of a database URL: pooler user "<role>.<ref>" or direct host "db.<ref>.supabase.co". */
-function databaseProjectRef(url: URL): string | null {
+export function databaseProjectRef(url: URL): string | null {
   const direct = /^db\.([a-z0-9]+)\.supabase\.co$/.exec(url.hostname);
   if (direct) return direct[1];
   if (url.hostname.endsWith('.pooler.supabase.com')) {
