@@ -18,6 +18,9 @@ export const updatePropertySchema = createPropertySchema.partial().omit({ organi
   acquisitionStage: z.never({ error: 'Use a stage transition to change the acquisition stage' }).optional(),
   // The status changes only through a status transition (L-03).
   acquisitionStatus: z.never({ error: 'Use a status transition to change the acquisition status' }).optional(),
+  // No default: .partial() keeps the create default, which would turn an
+  // omitted risk into 'medium' and overwrite (or forbid) the update.
+  risk: propertyRiskSchema.optional(),
   legalStatus: z.enum(['unknown','clear','under_review','blocked']).optional(),
   documentationStatus: z.string().trim().max(80).optional(),
   paymentStatus: z.string().trim().max(80).optional(),
