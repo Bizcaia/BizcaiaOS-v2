@@ -51,6 +51,9 @@ export async function runMigrations(): Promise<{ applied: string[] }> {
       throw new Error(`Migration preflight failed; nothing was changed:\n- ${problems.join('\n- ')}`);
     }
 
+    // Migration history belongs to the migration role only. Revoking here, in
+    // the same transaction that creates the table, also removes any access an
+    // earlier runner left behind before any migration runs.
     await client.query('begin');
     await client.query(`
       create table if not exists public.schema_migrations (
@@ -58,6 +61,7 @@ export async function runMigrations(): Promise<{ applied: string[] }> {
         applied_at timestamptz not null default timezone('utc', now())
       )
     `);
+    await client.query(`revoke all on table public.schema_migrations from ${quoteIdent(appRole)}`);
     await client.query('commit');
 
     const recorded = new Set(
@@ -195,16 +199,29 @@ export function migrationPrefixProblem(recorded: string[], registered: string[])
   return null;
 }
 
+/**
+ * One transaction: "all tables" includes schema_migrations, and the revoke
+ * that follows must commit together with that grant. Other sessions never see
+ * the application role holding migration history, and a failure part-way
+ * through rolls every grant back instead of leaving that access in place.
+ */
 async function grantApplicationPrivileges(client: pg.Client, roleName: string) {
   const role = quoteIdent(roleName);
-  await client.query(`grant usage on schema public to ${role}`);
-  await client.query(`grant select, insert, update, delete on all tables in schema public to ${role}`);
-  await client.query(`grant usage, select on all sequences in schema public to ${role}`);
-  await client.query(`grant execute on all functions in schema public to ${role}`);
-  await client.query(`alter default privileges in schema public grant select, insert, update, delete on tables to ${role}`);
-  await client.query(`alter default privileges in schema public grant usage, select on sequences to ${role}`);
-  await client.query(`alter default privileges in schema public grant execute on functions to ${role}`);
-  await client.query(`revoke all on table public.schema_migrations from ${role}`);
+  await client.query('begin');
+  try {
+    await client.query(`grant usage on schema public to ${role}`);
+    await client.query(`grant select, insert, update, delete on all tables in schema public to ${role}`);
+    await client.query(`grant usage, select on all sequences in schema public to ${role}`);
+    await client.query(`grant execute on all functions in schema public to ${role}`);
+    await client.query(`alter default privileges in schema public grant select, insert, update, delete on tables to ${role}`);
+    await client.query(`alter default privileges in schema public grant usage, select on sequences to ${role}`);
+    await client.query(`alter default privileges in schema public grant execute on functions to ${role}`);
+    await client.query(`revoke all on table public.schema_migrations from ${role}`);
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  }
 }
 
 export function quoteLiteral(value: string) {
