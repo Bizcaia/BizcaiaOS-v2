@@ -85,6 +85,7 @@ Copy `.env.example` to `.env` and fill in local values. Do not commit `.env`.
 | `npm run db:migrate` | Apply numbered SQL migrations |
 | `npm run db:reset` | Wipe local volume and re-migrate |
 | `npm run config:check` | Check a deployment environment against the configuration contract |
+| `npm run staging:preflight` | Gate a filled-in staging configuration before provisioning (contacts nothing) |
 | `npm run db:down` | Stop local PostgreSQL |
 | `npm run build` | Production UI build |
 | `npm run typecheck` | Client TypeScript |
@@ -140,5 +141,7 @@ Apply the numbered SQL files in `database/` in order with `npm run db:migrate`, 
 ## Staging and production
 
 No staging or production environment exists yet. [docs/deployment/production-readiness.md](docs/deployment/production-readiness.md) records the accepted architecture (Supabase Auth and PostgreSQL, Render Static Site and Web Service), the per-environment configuration contract, database roles, migration promotion, recovery targets, and the provisioning checklist. Placeholder templates live in `deploy/staging.env.example` and `deploy/production.env.example`; never commit real values. Check an environment before deploying with `npm run config:check -- --target staging --scope frontend` (or `--scope api`, `--scope migration`); it contacts nothing and prints no values.
+
+When staging is authorized, follow [docs/deployment/staging-provisioning.md](docs/deployment/staging-provisioning.md) (gated runbook, read-only SQL checks in `deploy/sql/`), record evidence in [the verification checklist](docs/deployment/staging-verification-checklist.md), and gate the filled-in configuration with `npm run staging:preflight -- --env-file <file>`. The owner's inputs are listed in [docs/deployment/staging-owner-input.md](docs/deployment/staging-owner-input.md); none are needed while the prototype stays on the Supabase Free plan.
 
 The dashboard “Active negotiations” metric continues to count properties whose `acquisition_stage = negotiation`, not open/paused rows in `negotiations`.

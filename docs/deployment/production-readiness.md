@@ -58,26 +58,48 @@ Local development uses the root [`.env.example`](../../.env.example).
 **Never commit real values**; real values live in the Render dashboard and the
 operator's secret store.
 
-| Variable | Where | When | Public / Secret | Differs per environment |
-|---|---|---|---|---|
-| `VITE_API_BASE_URL` | Static Site | build | public | yes (`https://api…/api/v1`; empty = demo mode) |
-| `VITE_SUPABASE_URL` | Static Site | build | public | yes (project URL) |
-| `VITE_SUPABASE_PUBLISHABLE_KEY` | Static Site | build | public (publishable/anon key only) | yes |
-| `VITE_ANALYTICS_ENDPOINT`, `VITE_ANALYTICS_WEBSITE_ID` | Static Site | build | public | optional (both or neither) |
-| `NODE_VERSION` | both Render services | build | public | no (`24`) |
-| `NODE_ENV` | Web Service | runtime | public | no (`production`) |
-| `API_PORT` | Web Service | runtime | public | no (`10000`; must equal Render's `PORT`) |
-| `CORS_ORIGIN` | Web Service | runtime | public | yes (exactly the frontend origin) |
-| `DATABASE_URL` | Web Service | runtime | **secret** | yes (`bizcaiaos_app`, TLS) |
-| `DATABASE_SSL` | Web Service | runtime | public | no (`require`) |
-| `DATABASE_POOL_SIZE` | Web Service | runtime | public | optional |
-| `AUTH_ISSUER` | Web Service | runtime | public | yes (`https://<ref>.supabase.co/auth/v1`) |
-| `AUTH_AUDIENCE` | Web Service | runtime | public | no (`authenticated`) |
-| `AUTH_JWKS_URL` | Web Service | runtime | public | yes (`<AUTH_ISSUER>/.well-known/jwks.json`) |
-| `DOCUMENT_STORAGE_PROVIDER` | Web Service | runtime | public | no (`local`) |
-| `DOCUMENT_STORAGE_LOCAL_ROOT` | Web Service | runtime | public | no (`/var/data/documents`, inside the disk mount) |
-| `DATABASE_MIGRATE_URL` | operator only, never Render | migration | **secret** | yes (`bizcaiaos_migrator`, port 5432, `sslmode=require`) |
-| `POSTGRES_APP_USER` | operator only | migration | public | no (`bizcaiaos_app`) |
+### Environment variable matrix
+
+This is the single authoritative list. `<ref>` is the environment's own
+Supabase project reference, and `<domain>` is not yet chosen. "Owner" is who
+sets the value, and where.
+
+| Variable | Local | Staging | Production | Public / Secret | Build / Runtime | Owner |
+|---|---|---|---|---|---|---|
+| `NODE_VERSION` | installed Node.js (24 tested) | `24` | `24` | public | build and runtime | Operator: both Render services |
+| `VITE_API_BASE_URL` | `http://localhost:8787/api/v1`, or empty for demo mode | `https://api-staging.<domain>/api/v1` | `https://api.<domain>/api/v1` | public | build | Operator: Render Static Site |
+| `VITE_SUPABASE_URL` | empty, or a developer's own project | `https://<staging-ref>.supabase.co` | `https://<production-ref>.supabase.co` | public | build | Operator: Static Site, from Supabase |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | empty, or a developer's own key | staging publishable key | production publishable key | public (never a secret or service-role key) | build | Operator: Static Site, from Supabase |
+| `VITE_ANALYTICS_ENDPOINT`, `VITE_ANALYTICS_WEBSITE_ID` | optional | optional (both or neither) | optional (both or neither) | public | build | Operator: Static Site |
+| `NODE_ENV` | unset | `production` | `production` | public | runtime | Operator: Web Service |
+| `PORT` | unset | set by Render (`10000` unless set) | set by Render | public | runtime | Render (automatic) |
+| `API_PORT` | `8787` | `10000` (must equal `PORT`) | `10000` (must equal `PORT`) | public | runtime | Operator: Web Service |
+| `CORS_ORIGIN` | `http://localhost:5173` | `https://staging.<domain>` | `https://app.<domain>` | public | runtime | Operator: Web Service |
+| `DATABASE_URL` | `bizcaiaos_app` at `127.0.0.1` | `bizcaiaos_app.<staging-ref>` on the Supabase pooler | `bizcaiaos_app.<production-ref>` on the Supabase pooler | **secret** | runtime | Operator: Web Service secret |
+| `DATABASE_SSL` | empty | `require` | `require` | public | runtime | Operator: Web Service |
+| `DATABASE_POOL_SIZE` | optional (default 10) | optional, within the pooler's client limit | optional, within the pooler's client limit | public | runtime | Operator: Web Service |
+| `AUTH_ISSUER` | optional (unset: authenticated requests return 503) | `https://<staging-ref>.supabase.co/auth/v1` | `https://<production-ref>.supabase.co/auth/v1` | public | runtime | Operator: Web Service |
+| `AUTH_AUDIENCE` | `authenticated` | `authenticated` | `authenticated` | public | runtime | Operator: Web Service |
+| `AUTH_JWKS_URL` | `<AUTH_ISSUER>/.well-known/jwks.json` | same rule | same rule | public | runtime | Operator: Web Service |
+| `DOCUMENT_STORAGE_PROVIDER` | `local` | `local` | `local` | public | runtime | Operator: Web Service |
+| `DOCUMENT_STORAGE_LOCAL_ROOT` | `./.data/documents` | `/var/data/documents` (inside the disk) | `/var/data/documents` (inside the disk) | public | runtime | Operator: Web Service |
+| `DOCUMENT_MAX_SIZE_BYTES`, `DOCUMENT_ACCEPTED_MIME_TYPES` | optional (defaults) | optional (defaults) | optional (defaults) | public | runtime | Operator: Web Service |
+| `DATABASE_MIGRATE_URL` | local owner role | `bizcaiaos_migrator.<staging-ref>`, port 5432, `sslmode=require` | `bizcaiaos_migrator.<production-ref>`, port 5432, `sslmode=require` | **secret** | migration | Operator: secret store and operator shell only, **never Render** |
+| `POSTGRES_APP_USER` | `bizcaiaos_app` | `bizcaiaos_app` | `bizcaiaos_app` | public | migration | Operator shell |
+| `POSTGRES_APP_PASSWORD` | local `db:provision-app-role` only | **not used** (password set with `\password`) | **not used** | secret | local tooling | Developer `.env` only |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_PORT` | Docker Compose | not used | not used | local | local tooling | Developer `.env` only |
+
+These names are **not** read by BizcaiaOS, and `staging:preflight` rejects
+them:
+
+- `VITE_SUPABASE_ANON_KEY`: the publishable or legacy anon key goes in
+  `VITE_SUPABASE_PUBLISHABLE_KEY`;
+- `DOCUMENT_ROOT`: use `DOCUMENT_STORAGE_LOCAL_ROOT`;
+- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `JWKS_URL`.
+
+Supabase project settings that are not environment variables (Auth Site URL,
+redirect URLs, sign-up, signing keys, Data API) are listed in
+[staging-provisioning.md](staging-provisioning.md#b-supabase-staging-project-g1-g2).
 
 Rules the code depends on:
 
@@ -91,6 +113,11 @@ Rules the code depends on:
   `.env` file**.
 - The migration runner ignores `DATABASE_SSL`: put `sslmode=require` in
   `DATABASE_MIGRATE_URL`.
+- Both connections verify the server certificate against Node's trusted
+  roots. The current `pg` driver treats `sslmode=require` as `verify-full`,
+  and an `sslmode` in `DATABASE_URL` overrides `DATABASE_SSL`. If Supabase's
+  certificate is not trusted, add `sslrootcert=<CA file>` to both URLs; never
+  disable verification.
 
 ### Checking a configuration
 
@@ -134,17 +161,20 @@ URL and redirect allowlist must name its own frontend origin, and the API's
 
 | Role | Purpose | Attributes |
 |---|---|---|
-| `bizcaiaos_migrator` | Migration owner: runs `npm run db:migrate`, owns every BizcaiaOS object | `LOGIN NOSUPERUSER NOCREATEROLE NOBYPASSRLS`; `CREATE, USAGE` on schema `public` |
+| `bizcaiaos_migrator` | Migration owner: runs `npm run db:migrate`, owns every BizcaiaOS object | `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`; `CREATE, USAGE` on schema `public` |
 | `bizcaiaos_app` | API runtime role; subject to RLS | `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`; owns nothing |
 
-Create both per project in the Supabase SQL editor, with passwords chosen by
-the operator and stored only in Render or the secret store (never in Git,
-chat, or this repository):
+Create both per project as `postgres` from the operator's `psql` session.
+The operator chooses the passwords and stores them only in Render or the
+secret store (never in Git, chat, or this repository). `\password` sends a
+hash, so the password stays out of SQL history:
 
 ```sql
-create role bizcaiaos_migrator login nosuperuser nocreaterole nobypassrls password '<choose>';
+create role bizcaiaos_migrator login nosuperuser nocreatedb nocreaterole nobypassrls;
 grant create, usage on schema public to bizcaiaos_migrator;
-create role bizcaiaos_app login nosuperuser nocreatedb nocreaterole nobypassrls password '<choose>';
+create role bizcaiaos_app login nosuperuser nocreatedb nocreaterole nobypassrls;
+\password bizcaiaos_migrator
+\password bizcaiaos_app
 ```
 
 `db:migrate` never creates or re-passwords `bizcaiaos_app` (C-02); it checks
@@ -169,7 +199,9 @@ PRODUCTION MIGRATION (separately authorized, maintenance window, after a verifie
 Each environment runs the same command twice: the first run applies every
 pending migration, the second must apply none.
 
-After the first staging migration, verify:
+After the first staging migration, verify the following. The
+[staging runbook](staging-provisioning.md) gives the exact steps, and
+`deploy/sql/` holds read-only SQL for each check:
 
 1. `select current_user` on `DATABASE_MIGRATE_URL` is `bizcaiaos_migrator`.
 2. `schema_migrations` holds `001`–`019`, `019` exactly once.
@@ -180,8 +212,10 @@ After the first staging migration, verify:
 5. `pg_default_acl`: record every entry (role, schema, type, privileges); the
    migrator's global entry has no `PUBLIC` execute; note any `postgres` or
    `supabase_admin` defaults that still grant to `anon`/`authenticated`.
-6. A temporary function created as `bizcaiaos_migrator` is executable by
-   `bizcaiaos_app` only; drop it afterwards.
+6. Future functions: `pg_default_acl` shows that the migrator's global
+   function default grants no `PUBLIC` execute and its `public` default
+   grants `bizcaiaos_app` execute. This is read from the catalog; nothing is
+   created on staging.
 7. List non-extension functions in `public` not owned by the migrator; do not
    modify provider-owned objects.
 8. RLS is enabled on all 18 tables with all 49 policies present.
@@ -235,6 +269,14 @@ authorized. Known limitations:
   consistency check.
 
 ## Provisioning checklist (each step separately authorized)
+
+Staging follows [staging-provisioning.md](staging-provisioning.md) (gates,
+exact settings, migration and verification steps, recovery rehearsal),
+recorded in
+[staging-verification-checklist.md](staging-verification-checklist.md). It is
+gated by `npm run staging:preflight`. The owner's inputs are listed in
+[staging-owner-input.md](staging-owner-input.md). The summary below covers
+both environments.
 
 **Supabase** (per environment): organization billing plan · project creation
 (region; staging and production in the same region) · compute · PITR and
