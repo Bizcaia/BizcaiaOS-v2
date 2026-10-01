@@ -219,6 +219,26 @@ R1's `R1-DB-APP-PRIVILEGES` check also fails if the application role holds any
 privilege on the table. Nothing here is specific to Supabase. Real staging and
 production remain `NOT_VERIFIED`.
 
+Privilege checks (`has_table_privilege`) see access that arrives through a
+grant, `PUBLIC`, or an inherited membership. They miss one path: a membership
+granted `WITH INHERIT FALSE, SET TRUE` adds no effective privilege, yet lets
+`bizcaiaos_app` run `SET ROLE` to the role it belongs to. R1's
+`R1-DB-APP-MEMBERSHIP` therefore reads the memberships themselves from
+`pg_auth_members`, direct and nested, and fails whatever their `INHERIT` and
+`SET` options, when `bizcaiaos_app` belongs to:
+
+- the migration owner (`bizcaiaos_migrator`; locally, the role R1 connects as);
+- any other role that owns BizcaiaOS relations or functions in `public`;
+- a `SUPERUSER` or `BYPASSRLS` role;
+- `pg_read_all_data`, `pg_write_all_data`, `pg_read_server_files`,
+  `pg_write_server_files`, or `pg_execute_server_program`.
+
+Other memberships pass and are listed as evidence. This is a detection
+control: R1 reports the membership and never changes one, and no BizcaiaOS
+script grants `bizcaiaos_app` any membership. Tested on disposable PostgreSQL
+17 (`server/integration/postgres.verifyBoundary.integration.test.ts`); staging
+and production remain `NOT_VERIFIED`.
+
 ## Migration promotion
 
 ```text
@@ -377,7 +397,7 @@ verification access, because that role cannot read `schema_migrations`.
 |---|---|---|
 | Repository | this checkout's files (always; offline) | `R1-REPO-MIGRATION-CHAIN` (`001`..N, in order, matching `database/`), `R1-REPO-MIGRATION-019` (present, registered, still revokes `PUBLIC` execute), `R1-REPO-RLS-MODEL` (tables and policies the migrations define: the expected state for the database), `R1-REPO-DATA-PATH` (Supabase client only in the sign-in module; no Data API, storage, realtime, or functions paths; no Supabase client in the API), `R1-REPO-AUTH-WIRING` (the API verifies issuer, audience, and JWKS from configuration; email/password sign-in only) |
 | Configuration | the supplied file, not the deployed services (`--env-file` with `--target staging` or `production`; offline) | `R1-CFG-CONTRACT` (the `config:check` rules per section; `staging:preflight` for staging), `R1-CFG-PROJECT` (frontend URL, issuer, JWKS, API database, and migration database are one Supabase project), `R1-CFG-ENVIRONMENT` (hosts match the target; no staging/production leakage; `--other-ref` names the other environment's project), `R1-CFG-PUBLIC-SECRETS` (no secret, connection string, Supabase secret, or `service_role` key in the Static Site), `R1-CFG-APP-ROLE` (`DATABASE_URL` is `bizcaiaos_app`, not the migration role), `R1-CFG-API-TLS` (`DATABASE_SSL=require`; no `sslmode=disable`/`no-verify`, `ssl=0`, or `uselibpqcompat` without `verify-full` in `DATABASE_URL`), `R1-CFG-PRIVILEGED-CREDENTIALS` (no `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET`, Supabase secret key, `service_role` JWT, private key, or local postgres password in the API or migration sections), `R1-CFG-MIGRATION-SEPARATION` (no migration credentials on the API; migrations as `bizcaiaos_migrator` on a session port), `R1-CFG-DATA-API` (no configured URL makes the Data API a data path) |
-| Database | one read-only catalog snapshot (`--database`) | `R1-DB-IDENTITY` (read-only transaction; staging/production connect as `bizcaiaos_migrator`), `R1-DB-ROLES` (no SUPERUSER, CREATEROLE, CREATEDB, or BYPASSRLS), `R1-DB-MIGRATIONS`, `R1-DB-OWNER`, `R1-DB-APP-PRIVILEGES`, `R1-DB-PUBLIC`, `R1-DB-ANON`, `R1-DB-AUTHENTICATED`, `R1-DB-FUTURE-FUNCTIONS` (from `pg_default_acl`; nothing is created), `R1-DB-TRUSTED-FUNCTIONS`, `R1-DB-RLS` (every table and policy the migrations define, RLS enabled, nothing unexpected); recorded only: `R1-DB-DEFAULT-ACLS`, `R1-DB-SERVICE-ROLE` (read, never changed), `R1-DB-EXTENSIONS` |
+| Database | one read-only catalog snapshot (`--database`) | `R1-DB-IDENTITY` (read-only transaction; staging/production connect as `bizcaiaos_migrator`), `R1-DB-ROLES` (no SUPERUSER, CREATEROLE, CREATEDB, or BYPASSRLS), `R1-DB-APP-MEMBERSHIP` (`bizcaiaos_app` is not a member of the migration owner, another owner of BizcaiaOS objects, a SUPERUSER or BYPASSRLS role, or a privileged predefined role; read from `pg_auth_members`), `R1-DB-MIGRATIONS`, `R1-DB-OWNER`, `R1-DB-APP-PRIVILEGES`, `R1-DB-PUBLIC`, `R1-DB-ANON`, `R1-DB-AUTHENTICATED`, `R1-DB-FUTURE-FUNCTIONS` (from `pg_default_acl`; nothing is created), `R1-DB-TRUSTED-FUNCTIONS`, `R1-DB-RLS` (every table and policy the migrations define, RLS enabled, nothing unexpected); recorded only: `R1-DB-DEFAULT-ACLS`, `R1-DB-SERVICE-ROLE` (read, never changed), `R1-DB-EXTENSIONS` |
 | Provider settings | Supabase project settings (manual) | `R1-PROVIDER-DATA-API`, `R1-PROVIDER-AUTH-SETTINGS`: always `NOT_VERIFIED`. Check them with the runbook (section B2; section C, steps 5 and 6) |
 
 Local configuration stays with `config:check --target local`, which is
