@@ -157,6 +157,41 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
       expect(text).not.toContain('a member can use its privileges or SET ROLE');
     });
 
+    it.each([
+      [false, false, 'bizcaiaos_app neither inherits its privileges nor can SET ROLE to it through this grant, but with ADMIN, bizcaiaos_app can grant this role to itself or other roles with any INHERIT and SET options, which opens both'],
+      [false, true, 'bizcaiaos_app can SET ROLE to it but does not inherit its privileges; with ADMIN, bizcaiaos_app can grant this role to itself or other roles with any INHERIT and SET options'],
+      [true, false, "bizcaiaos_app inherits this role's privileges but cannot SET ROLE to it; with ADMIN, bizcaiaos_app can grant this role to itself or other roles with any INHERIT and SET options"],
+      [true, true, "bizcaiaos_app inherits this role's privileges and can SET ROLE to it; with ADMIN, bizcaiaos_app can grant this role to itself or other roles with any INHERIT and SET options"],
+    ])('states that ADMIN lets the member re-grant the role (INHERIT %s / SET %s)', (inherit, setOption, consequence) => {
+      const checks = run(withMemberships(member(OWNER, { inherit, setOption, admin: true })));
+      expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toBe(
+        `bizcaiaos_app is a member of bizcaiaos_migrator via bizcaiaos_migrator (inherit=${inherit} set=${setOption} admin=true): the migration owner; ${consequence}`,
+      );
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).not.toContain('today');
+    });
+
+    it('does not claim ADMIN on a SUPERUSER role can be used, since only a superuser may grant one', () => {
+      const text = evidence(run(withMemberships(member('ops_admin', { superuser: true, inherit: false, setOption: false, admin: true }))), 'R1-DB-APP-MEMBERSHIP');
+      expect(text).toBe(
+        'bizcaiaos_app is a member of ops_admin via ops_admin (inherit=false set=false admin=true): SUPERUSER; ' +
+          'bizcaiaos_app neither inherits its privileges nor can SET ROLE to it today; the membership is still forbidden, because widening its options would open both; ' +
+          'its ADMIN option is unusable unless the holder is a superuser, because only superusers may grant a SUPERUSER role',
+      );
+      expect(text).not.toContain('can grant this role to itself');
+    });
+
+    it('states ADMIN on the last link of a nested path, and on servers before PostgreSQL 16', () => {
+      const nested = run(withMemberships(member('ops_group'), member(OWNER, { path: ['ops_group', OWNER], inherit: false, setOption: false, admin: true })));
+      expect(evidence(nested, 'R1-DB-APP-MEMBERSHIP')).toContain(
+        'the membership is forbidden whatever the options; the last link carries ADMIN, so ops_group can grant bizcaiaos_migrator to any role, including bizcaiaos_app, with any options',
+      );
+      const pre16 = run(withMemberships(member(OWNER, { inherit: null, setOption: null, admin: true })));
+      expect(evidence(pre16, 'R1-DB-APP-MEMBERSHIP')).toContain(
+        '(inherit=n/a set=n/a admin=true): the migration owner; INHERIT and SET are not recorded per membership before PostgreSQL 16, where any member can SET ROLE to the role; with ADMIN, bizcaiaos_app can also grant the role to other roles',
+      );
+    });
+
     it('fails on NOINHERIT + SET even though every effective privilege check still passes', () => {
       const snapshot = withMemberships(member(OWNER, { inherit: false, setOption: true }));
       // The privilege view is exactly the clean one: has_table_privilege shows nothing new.

@@ -194,6 +194,48 @@ describe('R1 read-only boundary verifier (real database)', () => {
             }
           }
 
+          // ADMIN with neither INHERIT nor SET is not inert: the member can grant the
+          // role to itself again (pg_read_all_data). A SUPERUSER role is the
+          // exception: only a superuser may grant it (the local owner usually is one).
+          const asApp = new URL(url);
+          asApp.username = app;
+          asApp.password = password;
+          await admin.query(`grant pg_read_all_data to ${app} with admin true, inherit false, set false`);
+          try {
+            const result = await membership();
+            expect(result.status).toBe('FAIL');
+            expect(result.evidence).toContain(
+              `${app} is a member of pg_read_all_data via pg_read_all_data (inherit=false set=false admin=true): privileged predefined role; ` +
+                `${app} neither inherits its privileges nor can SET ROLE to it through this grant, but with ADMIN, ${app} can grant this role to itself or other roles with any INHERIT and SET options, which opens both`,
+            );
+            const read = await withClient(asApp.toString(), async (client) => {
+              await expect(client.query('select count(*) from public.schema_migrations')).rejects.toMatchObject({ code: '42501' });
+              await client.query(`grant pg_read_all_data to ${app} with inherit true, set true`);
+              return (await client.query('select count(*)::int as n from public.schema_migrations')).rows[0].n;
+            });
+            expect(read).toBe(MIGRATION_FILES.length);
+          } finally {
+            // The self-granted membership depends on the ADMIN grant; cascade removes both.
+            await admin.query(`revoke pg_read_all_data from ${app} cascade`);
+          }
+          const ownerIsSuperuser = (await admin.query<{ s: boolean }>('select rolsuper as s from pg_roles where rolname = current_user')).rows[0].s;
+          await admin.query(`grant "${owner}" to ${app} with admin true, inherit false, set false`);
+          try {
+            const result = await membership();
+            expect(result.status).toBe('FAIL');
+            expect(result.evidence).toContain(`${app} is a member of ${owner} via ${owner} (inherit=false set=false admin=true): the migration owner`);
+            if (ownerIsSuperuser) {
+              expect(result.evidence).toContain('its ADMIN option is unusable unless the holder is a superuser, because only superusers may grant a SUPERUSER role');
+              await expect(withClient(asApp.toString(), (client) => client.query(`grant "${owner}" to ${app} with inherit true, set true`)))
+                .rejects.toMatchObject({ code: '42501' });
+            } else {
+              expect(result.evidence).toContain(`with ADMIN, ${app} can grant this role to itself or other roles with any INHERIT and SET options, which opens both`);
+            }
+          } finally {
+            await admin.query(`revoke "${owner}" from ${app} cascade`);
+          }
+          expect((await admin.query('select count(*)::int as n from pg_auth_members where member = to_regrole($1)', [app])).rows[0].n).toBe(1);
+
           for (const predefined of ['pg_read_all_data', 'pg_write_all_data']) {
             await admin.query(`grant ${predefined} to ${app}`);
             try {

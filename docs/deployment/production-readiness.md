@@ -239,11 +239,20 @@ options of one grant, then states what that grant allows today:
 - **Direct membership:** the options are those of the grant to
   `bizcaiaos_app`, and the evidence says whether it inherits the role's
   privileges, can `SET ROLE` to it, both, or neither. A membership with
-  neither still fails, because widening its options would open both.
+  neither, and without `ADMIN`, still fails, because widening its options
+  would open both.
+- **`ADMIN`:** a grant with `ADMIN` is not inert. Its holder can grant the
+  role again, to itself or to other roles, with any `INHERIT` and `SET`
+  options (verified on PostgreSQL 16 and 17), so the evidence says so even
+  when the grant itself has neither. The exception is a `SUPERUSER` role:
+  only a superuser may grant one (verified on PostgreSQL 15 and 17), and the
+  evidence says the `ADMIN` option is unusable unless the holder is a
+  superuser.
 - **Nested membership** (`bizcaiaos_app -> a -> b`): the options are those of
   the **last link** (`a -> b`), labelled as such. What `bizcaiaos_app` can
   actually do depends on every link in the path; R1 fails on the membership
-  whatever the options.
+  whatever the options. If the last link carries `ADMIN`, the evidence notes
+  that `a` can grant `b` to any role, including `bizcaiaos_app`.
 - **PostgreSQL before 16:** `pg_auth_members` has no per-membership `INHERIT`
   or `SET` option, so both print as `n/a`. On those versions any member can
   `SET ROLE` to the role, and the check fails exactly as on 16 and later.
@@ -252,8 +261,9 @@ Other memberships pass and are listed as evidence. This is a detection
 control: R1 reports the membership and never changes one, and no BizcaiaOS
 script grants `bizcaiaos_app` any membership. Tested on disposable PostgreSQL
 17 (`server/integration/postgres.verifyBoundary.integration.test.ts`: every
-`INHERIT`/`SET` combination, nested, `SUPERUSER`, `BYPASSRLS`, the five
-predefined roles, and another object owner); staging and production remain
+`INHERIT`/`SET` combination, an `ADMIN` grant re-granted by its holder,
+nested, `SUPERUSER`, `BYPASSRLS`, the five predefined roles, and another
+object owner); staging and production remain
 `NOT_VERIFIED`.
 
 ## Migration promotion
