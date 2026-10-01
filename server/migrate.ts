@@ -25,6 +25,7 @@ export const MIGRATION_FILES = [
   '016_property_creation_rules.sql',
   '017_legacy_stage_remediation.sql',
   '018_lifecycle_optimistic_concurrency.sql',
+  '019_revoke_public_function_execute.sql',
 ];
 
 export function requiredEnv(name: string, purpose = 'run migrations') {
