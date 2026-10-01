@@ -24,6 +24,7 @@ function cleanSnapshot(): Snapshot {
     appRole: APP,
     roles: [role(APP), role(OWNER)],
     memberships: [],
+    subscriptionDatabases: { usage: false, app: [], predefinedRole: [] },
     migrations: [...MIGRATION_FILES],
     relations,
     functions: FUNCTIONS.map((signature) => ({ signature, name: signature.split('(')[0], owner: OWNER, extension: null })),
@@ -224,6 +225,96 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
       expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
       expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain(`member of ${predefined} via ${predefined}`);
       expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('privileged predefined role');
+    });
+
+    describe('pg_maintain and pg_create_subscription (C5)', () => {
+      const MAINTAIN = 'VACUUM, ANALYZE, REINDEX, REFRESH MATERIALIZED VIEW and LOCK TABLE on every relation, without reading or writing its data (PostgreSQL 17+)';
+      const SUBSCRIBE = 'subscriptions make the server connect out to a host the subscriber names (PostgreSQL 16+); CREATE SUBSCRIPTION also needs CREATE on the database: ';
+      const NONE = 'no database bizcaiaos_app can connect to';
+      const withSubscription = (databases: Partial<Snapshot['subscriptionDatabases']>, ...memberships: Snapshot['memberships']) =>
+        ({ ...withMemberships(...memberships), subscriptionDatabases: { usage: false, app: [], predefinedRole: [], ...databases } });
+
+      it.each([
+        [true, true, "bizcaiaos_app inherits this role's privileges and can SET ROLE to it"],
+        [false, true, 'bizcaiaos_app can SET ROLE to it but does not inherit its privileges'],
+        [true, false, "bizcaiaos_app inherits this role's privileges but cannot SET ROLE to it"],
+        [false, false, 'bizcaiaos_app neither inherits its privileges nor can SET ROLE to it today; the membership is still forbidden, because widening its options would open both'],
+      ])('fails on pg_maintain with INHERIT %s / SET %s and states what it allows', (inherit, setOption, consequence) => {
+        const checks = run(withMemberships(member('pg_maintain', { inherit, setOption })));
+        expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+        expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toBe(
+          `bizcaiaos_app is a member of pg_maintain via pg_maintain (inherit=${inherit} set=${setOption} admin=false): privileged predefined role; ${consequence}; ${MAINTAIN}`,
+        );
+      });
+
+      it('fails on pg_maintain held with ADMIN only, and through a nested path', () => {
+        expect(evidence(run(withMemberships(member('pg_maintain', { inherit: false, setOption: false, admin: true }))), 'R1-DB-APP-MEMBERSHIP')).toBe(
+          'bizcaiaos_app is a member of pg_maintain via pg_maintain (inherit=false set=false admin=true): privileged predefined role; ' +
+            'bizcaiaos_app neither inherits its privileges nor can SET ROLE to it through this grant, but with ADMIN, bizcaiaos_app can grant this role to itself or other roles with any INHERIT and SET options, which opens both; ' +
+            MAINTAIN,
+        );
+        const nested = run(withMemberships(member('ops_group'), member('pg_maintain', { path: ['ops_group', 'pg_maintain'] })));
+        expect(failed(nested)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+        expect(evidence(nested, 'R1-DB-APP-MEMBERSHIP')).toBe(
+          'bizcaiaos_app is a member of pg_maintain via ops_group -> pg_maintain (last link ops_group -> pg_maintain: inherit=true set=true admin=false): privileged predefined role; ' +
+            `nested: what the application role can do depends on every link in the path; the membership is forbidden whatever the options; ${MAINTAIN}`,
+        );
+      });
+
+      it('fails on pg_create_subscription without CREATE on any database, and says no subscription can be created today', () => {
+        const checks = run(withSubscription({ usage: true }, member('pg_create_subscription')));
+        expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+        expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toBe(
+          "bizcaiaos_app is a member of pg_create_subscription via pg_create_subscription (inherit=true set=true admin=false): privileged predefined role; bizcaiaos_app inherits this role's privileges and can SET ROLE to it; " +
+            `${SUBSCRIBE}bizcaiaos_app holds it on ${NONE}, pg_create_subscription itself (the acting role after SET ROLE) on ${NONE}; bizcaiaos_app cannot create a subscription today`,
+        );
+      });
+
+      it('states the complete condition: membership with INHERIT plus CREATE on the database', () => {
+        const text = evidence(run(withSubscription({ usage: true, app: ['postgres (current)'] }, member('pg_create_subscription'))), 'R1-DB-APP-MEMBERSHIP');
+        expect(text).toContain(`${SUBSCRIBE}bizcaiaos_app holds it on postgres (current), pg_create_subscription itself (the acting role after SET ROLE) on ${NONE}; `);
+        expect(text.endsWith('; bizcaiaos_app can create subscriptions in postgres (current) now')).toBe(true);
+      });
+
+      it('does not flag CREATE on the database without the membership', () => {
+        const checks = run(withSubscription({ usage: false, app: ['postgres (current)'], predefinedRole: ['postgres (current)'] }));
+        expect(failed(checks)).toEqual([]);
+        expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toBe('bizcaiaos_app is a member of no role\nread from pg_auth_members, whatever the INHERIT and SET options');
+      });
+
+      it('SET only: CREATE held by the application role does not complete the condition; CREATE held by pg_create_subscription does', () => {
+        const setOnly = member('pg_create_subscription', { inherit: false, setOption: true });
+        const ownCreate = evidence(run(withSubscription({ usage: false, app: ['postgres (current)'] }, setOnly)), 'R1-DB-APP-MEMBERSHIP');
+        expect(ownCreate).toContain('bizcaiaos_app can SET ROLE to it but does not inherit its privileges; ');
+        expect(ownCreate.endsWith(`bizcaiaos_app holds it on postgres (current), pg_create_subscription itself (the acting role after SET ROLE) on ${NONE}; bizcaiaos_app cannot create a subscription today`)).toBe(true);
+        const roleCreate = evidence(run(withSubscription({ usage: false, predefinedRole: ['postgres (current)'] }, setOnly)), 'R1-DB-APP-MEMBERSHIP');
+        expect(roleCreate.endsWith('pg_create_subscription itself (the acting role after SET ROLE) on postgres (current); after SET ROLE, bizcaiaos_app can create subscriptions in postgres (current) now')).toBe(true);
+        // Neither INHERIT nor SET: still a finding, and nothing can be created today.
+        const neither = run(withSubscription({ usage: false, app: ['postgres (current)'], predefinedRole: ['postgres (current)'] }, member('pg_create_subscription', { inherit: false, setOption: false })));
+        expect(failed(neither)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+        expect(evidence(neither, 'R1-DB-APP-MEMBERSHIP').endsWith('bizcaiaos_app cannot create a subscription today')).toBe(true);
+      });
+
+      it('fails on pg_create_subscription held with ADMIN only, and through a nested path that inherits it', () => {
+        const admin = evidence(run(withSubscription({ usage: false, app: ['postgres (current)'] }, member('pg_create_subscription', { inherit: false, setOption: false, admin: true }))), 'R1-DB-APP-MEMBERSHIP');
+        expect(admin).toContain('(inherit=false set=false admin=true): privileged predefined role; ');
+        expect(admin).toContain('but with ADMIN, bizcaiaos_app can grant this role to itself or other roles with any INHERIT and SET options, which opens both; ');
+        expect(admin.endsWith('bizcaiaos_app cannot create a subscription today')).toBe(true);
+        // A nested path never gets the SET ROLE verdict: SET ROLE would reach ops_group, not pg_create_subscription.
+        const nested = evidence(run(withSubscription({ usage: true, app: ['postgres (current)'], predefinedRole: ['postgres (current)'] },
+          member('ops_group'), member('pg_create_subscription', { path: ['ops_group', 'pg_create_subscription'] }))), 'R1-DB-APP-MEMBERSHIP');
+        expect(nested).toContain('via ops_group -> pg_create_subscription (last link ops_group -> pg_create_subscription: inherit=true set=true admin=false): privileged predefined role; nested: ');
+        expect(nested.endsWith('; bizcaiaos_app can create subscriptions in postgres (current) now')).toBe(true);
+        expect(nested).not.toContain('after SET ROLE, bizcaiaos_app can create');
+      });
+
+      it('leaves the evidence of every other forbidden membership unchanged', () => {
+        for (const predefined of ['pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program']) {
+          expect(evidence(run(withSubscription({ usage: true, app: ['postgres (current)'] }, member(predefined))), 'R1-DB-APP-MEMBERSHIP')).toBe(
+            `bizcaiaos_app is a member of ${predefined} via ${predefined} (inherit=true set=true admin=false): privileged predefined role; bizcaiaos_app inherits this role's privileges and can SET ROLE to it`,
+          );
+        }
+      });
     });
 
     it('fails on membership in a SUPERUSER or BYPASSRLS role, and in another owner of BizcaiaOS objects', () => {

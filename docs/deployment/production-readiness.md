@@ -231,7 +231,32 @@ granted `WITH INHERIT FALSE, SET TRUE` adds no effective privilege, yet lets
 - any other role that owns BizcaiaOS relations or functions in `public`;
 - a `SUPERUSER` or `BYPASSRLS` role;
 - `pg_read_all_data`, `pg_write_all_data`, `pg_read_server_files`,
-  `pg_write_server_files`, or `pg_execute_server_program`.
+  `pg_write_server_files`, or `pg_execute_server_program`;
+- `pg_maintain` (PostgreSQL 17 and later) or `pg_create_subscription`
+  (PostgreSQL 16 and later). Neither role exists on older servers, where R1
+  reads the catalog unchanged and finds nothing.
+
+What the two newer roles allow, verified on disposable PostgreSQL 15.19,
+16.14, 17.11 and 18.6:
+
+- **`pg_maintain`:** `VACUUM`, `ANALYZE`, `REINDEX`, `REFRESH MATERIALIZED
+  VIEW`, and `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on relations it holds no
+  grant on, but no `SELECT`, `INSERT`, `UPDATE`, or `TRUNCATE`. The finding
+  says so.
+- **`pg_create_subscription`:** `CREATE SUBSCRIPTION`, which makes the server
+  connect out to a host the subscriber names. PostgreSQL also requires
+  `CREATE` on the database the subscription is created in, checked for the
+  acting role. Membership alone, or `CREATE` alone, is refused. `CREATE` counts
+  whether it is granted directly, inherited, granted to `PUBLIC`, or held as
+  the database owner. With a `SET`-only membership, after
+  `SET ROLE pg_create_subscription` the acting role is
+  `pg_create_subscription` itself, so `CREATE` must be held by that role.
+
+  The membership is the finding, whatever its options, as for every role
+  above. The finding adds the `CREATE` half: the databases `bizcaiaos_app` can
+  connect to where it, or `pg_create_subscription`, holds `CREATE`, and
+  whether `bizcaiaos_app` can create a subscription today. `CREATE` on a
+  database without the membership is not a finding.
 
 Each finding shows the membership path and the `INHERIT`, `SET`, and `ADMIN`
 options of one grant, then states what that grant allows today:
@@ -263,7 +288,12 @@ script grants `bizcaiaos_app` any membership. Tested on disposable PostgreSQL
 17 (`server/integration/postgres.verifyBoundary.integration.test.ts`: every
 `INHERIT`/`SET` combination, an `ADMIN` grant re-granted by its holder,
 nested, `SUPERUSER`, `BYPASSRLS`, the five predefined roles, and another
-object owner); staging and production remain
+object owner). The `pg_maintain` and `pg_create_subscription` cases in the
+same file run on PostgreSQL 16 and 17, and also passed on 15 and 18. They
+cover every `INHERIT`/`SET` combination, `ADMIN`, nested, membership with and
+without `CREATE`, and the `SET`-only case. Each condition is granted, found,
+revoked and verified clean again, and PostgreSQL's own acceptance or refusal
+of the subscription is checked alongside. Staging and production remain
 `NOT_VERIFIED`.
 
 ## Migration promotion
