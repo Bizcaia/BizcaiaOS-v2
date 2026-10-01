@@ -22,8 +22,16 @@ export const TRUSTED_FUNCTIONS = ['sync_authenticated_user', 'bootstrap_organiza
 const API_ROLES = ['anon', 'authenticated'] as const;
 const OBSERVED_ROLES = ['anon', 'authenticated', 'service_role', 'postgres', 'supabase_admin'];
 const APP_TABLE_PRIVILEGES = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
-/** Predefined roles that reach data or server files past every table grant and RLS policy. */
-export const PRIVILEGED_PREDEFINED_ROLES = ['pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program'];
+/**
+ * Predefined roles that reach data or server files past every table grant and
+ * RLS policy, maintain and lock every relation (pg_maintain, PostgreSQL 17+),
+ * or create subscriptions that make the server connect out (pg_create_subscription,
+ * PostgreSQL 16+, together with CREATE on the database).
+ */
+export const PRIVILEGED_PREDEFINED_ROLES = [
+  'pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program',
+  'pg_maintain', 'pg_create_subscription',
+];
 
 export const QUERIES = Object.freeze({
   identity: `select current_database() as database, current_user as "user", version() as version,
@@ -46,6 +54,25 @@ export const QUERIES = Object.freeze({
     select r.rolname as role, array(select pg_get_userbyid(x)::text from unnest(c.path) x) as path, c.inherit, c."setOption",
       c.admin, r.rolsuper as superuser, r.rolbypassrls as "bypassRls"
     from chain c join pg_roles r on r.oid = c.roleid order by 1, 2`,
+  // CREATE SUBSCRIPTION needs the privileges of pg_create_subscription and
+  // CREATE on the database it runs in, both checked for the acting role: the
+  // application role itself, or any role it can SET ROLE to, directly or
+  // through nested memberships (pg_has_role ... 'SET'). `app`: the databases
+  // the application role can connect to where it holds CREATE. `acting`:
+  // every (role, database) pair where such an acting role has both. Null-safe
+  // when either role does not exist; the CASE keeps 'SET' (PostgreSQL 16+)
+  // from being evaluated where pg_create_subscription does not exist.
+  subscriptionDatabases: `select array(select d.datname::text || case when d.datname = current_database() then ' (current)' else '' end from pg_database d
+      where d.datallowconn and has_database_privilege(to_regrole($1), d.oid, 'CONNECT')
+        and has_database_privilege(to_regrole($1), d.oid, 'CREATE') order by 1) as app,
+    coalesce((select json_agg(json_build_object('role', r.rolname::text,
+        'database', d.datname::text || case when d.datname = current_database() then ' (current)' else '' end) order by r.rolname, d.datname)
+      from pg_roles r cross join pg_database d
+      where d.datallowconn and has_database_privilege(to_regrole($1), d.oid, 'CONNECT')
+        and case when to_regrole('pg_create_subscription') is null or to_regrole($1) is null then false
+          else (r.oid = to_regrole($1) or pg_has_role(to_regrole($1), r.oid, 'SET'))
+            and pg_has_role(r.oid, to_regrole('pg_create_subscription'), 'USAGE')
+            and has_database_privilege(r.oid, d.oid, 'CREATE') end), '[]') as acting`,
   migrationsAccess: `select to_regclass('public.schema_migrations') is not null as tracked,
     coalesce(has_table_privilege(current_user, to_regclass('public.schema_migrations')::oid, 'SELECT'), false) as readable`,
   migrations: `select id from public.schema_migrations order by id`,
@@ -110,6 +137,8 @@ export type Snapshot = {
   roles: { name: string; login: boolean; superuser: boolean; bypassRls: boolean; createRole: boolean; createDb: boolean }[];
   /** Roles the application role is a member of; `path` runs from its direct membership to `role`. Options describe the last link. */
   memberships: { role: string; path: string[]; inherit: boolean | null; setOption: boolean | null; admin: boolean; superuser: boolean; bypassRls: boolean }[];
+  /** The CREATE half of the subscription condition: databases (connectable by the application role) where it holds CREATE, and every role it can act as (itself or through SET ROLE) with both halves, per database. */
+  subscriptionDatabases: { app: string[]; acting: { role: string; database: string }[] };
   /** null: no schema_migrations table; 'unreadable': the connection may not read it. */
   migrations: string[] | null | 'unreadable';
   relations: { name: string; kind: string; owner: string; rls: boolean }[];
@@ -129,6 +158,7 @@ export async function collectSnapshot(client: Queryable, appRole: string): Promi
     const roles = await run('roles', [[...new Set([appRole, MIGRATOR_ROLE, ...OBSERVED_ROLES])]]);
     const present = new Set(roles.map((role: { name: string }) => role.name));
     const memberships = await run('memberships', [appRole]);
+    const [subscriptionDatabases] = await run('subscriptionDatabases', [appRole]);
     const [access] = await run('migrationsAccess');
     const migrations = !access.tracked ? null : !access.readable ? 'unreadable' : (await run('migrations')).map((row: { id: string }) => row.id);
     const relations = await run('relations');
@@ -153,6 +183,7 @@ export async function collectSnapshot(client: Queryable, appRole: string): Promi
       appRole,
       roles,
       memberships,
+      subscriptionDatabases,
       migrations,
       relations,
       functions,
@@ -292,6 +323,24 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
         : membership.inherit ? `${app} inherits this role's privileges but cannot SET ROLE to it`
           : `${app} can SET ROLE to it but does not inherit its privileges`);
     };
+    // What the two newer predefined roles allow (verified on PostgreSQL 15-18).
+    // CREATE SUBSCRIPTION also needs CREATE on the database, checked for the
+    // acting role: the application role itself, or any role it can SET ROLE to,
+    // directly or through nested memberships. Only the paths found are stated;
+    // finding none is not proof that no subscription can be created.
+    const subscriptionCondition = () => {
+      const { app: appDatabases, acting } = snapshot.subscriptionDatabases;
+      const roles = [...new Set(acting.map((entry) => entry.role))];
+      const paths = roles.map((role) => `${role === app ? 'as itself' : `after SET ROLE ${role}`} in ${acting.filter((entry) => entry.role === role).map((entry) => entry.database).join(', ')}`);
+      return 'subscriptions make the server connect out to a host the subscriber names (PostgreSQL 16+); CREATE SUBSCRIPTION also needs CREATE on the database, checked for the acting role: ' +
+        `${app} holds CREATE on ${appDatabases.length ? appDatabases.join(', ') : `no database ${app} can connect to`}; ` +
+        (paths.length ? `${app} can create subscriptions now: ${paths.join('; ')}`
+          : `none of the roles ${app} can act as (itself, or through SET ROLE) holds both the privileges of pg_create_subscription and CREATE on a database ${app} can connect to; ` +
+            'routes other than role switching, such as SECURITY DEFINER functions, are not evaluated');
+    };
+    const roleNote = (membership: Membership) =>
+      membership.role === 'pg_maintain' ? 'VACUUM, ANALYZE, REINDEX, REFRESH MATERIALIZED VIEW and LOCK TABLE on every relation, without reading or writing its data (PostgreSQL 17+)'
+        : membership.role === 'pg_create_subscription' ? subscriptionCondition() : null;
     const forbidden = snapshot.memberships.flatMap((membership) => {
       const reasons = [
         (membership.role === MIGRATOR_ROLE || membership.role === owner) && 'the migration owner',
@@ -300,7 +349,8 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
         membership.bypassRls && 'BYPASSRLS',
         PRIVILEGED_PREDEFINED_ROLES.includes(membership.role) && 'privileged predefined role',
       ].filter(Boolean);
-      return reasons.length ? [`${describe(membership)}: ${reasons.join(', ')}; ${consequence(membership)}`] : [];
+      const note = roleNote(membership);
+      return reasons.length ? [`${describe(membership)}: ${reasons.join(', ')}; ${consequence(membership)}${note ? `; ${note}` : ''}`] : [];
     });
     add('R1-DB-APP-MEMBERSHIP', forbidden.length ? 'FAIL' : 'VERIFIED', forbidden.length ? forbidden : [
       snapshot.memberships.length
