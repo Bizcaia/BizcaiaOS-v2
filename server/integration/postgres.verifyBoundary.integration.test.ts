@@ -336,8 +336,11 @@ describe('R1 read-only boundary verifier (real database)', () => {
       const MAINTAIN = 'VACUUM, ANALYZE, REINDEX, REFRESH MATERIALIZED VIEW and LOCK TABLE on every relation, without reading or writing its data (PostgreSQL 17+)';
       const none = `no database ${app} can connect to`;
       const here = `${database} (current)`;
-      const subscribe = (appOn: string, roleOn: string) => 'subscriptions make the server connect out to a host the subscriber names (PostgreSQL 16+); ' +
-        `CREATE SUBSCRIPTION also needs CREATE on the database: ${app} holds it on ${appOn}, pg_create_subscription itself (the acting role after SET ROLE) on ${roleOn}; `;
+      const subscribe = (appOn: string) => 'subscriptions make the server connect out to a host the subscriber names (PostgreSQL 16+); ' +
+        `CREATE SUBSCRIPTION also needs CREATE on the database, checked for the acting role: ${app} holds CREATE on ${appOn}; `;
+      const noneFound = `none of the roles ${app} can act as (itself, or through SET ROLE) holds both the privileges of pg_create_subscription and CREATE on a database ${app} can connect to; ` +
+        'routes other than role switching, such as SECURITY DEFINER functions, are not evaluated';
+      const canCreate = (paths: string) => `${app} can create subscriptions now: ${paths}`;
       const membership = async () => {
         const checks = await verify(url, app);
         return { status: statusOf(checks)['R1-DB-APP-MEMBERSHIP'], evidence: checks.find((item) => item.id === 'R1-DB-APP-MEMBERSHIP')!.evidence.join('\n') };
@@ -421,13 +424,13 @@ describe('R1 read-only boundary verifier (real database)', () => {
             // Membership without CREATE: a finding; PostgreSQL refuses the subscription.
             await admin.query(`grant pg_create_subscription to ${app}`);
             try {
-              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${direct('inherit=true set=true admin=false', both)}${subscribe(none, none)}${app} cannot create a subscription today` });
+              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${direct('inherit=true set=true admin=false', both)}${subscribe(none)}${noneFound}` });
               await withClient(asApp.toString(), (client) => expect(createSubscription(client)).rejects.toMatchObject({ code: '42501' }));
 
               // Membership plus CREATE: the complete condition, and PostgreSQL creates the subscription.
               await admin.query(`grant create on database ${database} to ${app}`);
               try {
-                expect(await membership()).toEqual({ status: 'FAIL', evidence: `${direct('inherit=true set=true admin=false', both)}${subscribe(here, none)}${app} can create subscriptions in ${here} now` });
+                expect(await membership()).toEqual({ status: 'FAIL', evidence: `${direct('inherit=true set=true admin=false', both)}${subscribe(here)}${canCreate(`as itself in ${here}`)}` });
                 await withClient(asApp.toString(), async (client) => {
                   await createSubscription(client);
                   await client.query(`drop subscription ${subscription}`);
@@ -446,14 +449,14 @@ describe('R1 read-only boundary verifier (real database)', () => {
             await admin.query(`grant create on database ${database} to ${app}`);
             try {
               const setOnly = direct('inherit=false set=true admin=false', `${app} can SET ROLE to it but does not inherit its privileges`);
-              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${setOnly}${subscribe(here, none)}${app} cannot create a subscription today` });
+              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${setOnly}${subscribe(here)}${noneFound}` });
               await withClient(asApp.toString(), async (client) => {
                 await expect(createSubscription(client)).rejects.toMatchObject({ code: '42501' });
                 await client.query('set role pg_create_subscription');
                 await expect(createSubscription(client)).rejects.toMatchObject({ code: '42501' });
               });
               await admin.query(`grant create on database ${database} to pg_create_subscription`);
-              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${setOnly}${subscribe(here, here)}after SET ROLE, ${app} can create subscriptions in ${here} now` });
+              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${setOnly}${subscribe(here)}${canCreate(`after SET ROLE pg_create_subscription in ${here}`)}` });
               await withClient(asApp.toString(), async (client) => {
                 await client.query('set role pg_create_subscription');
                 await createSubscription(client);
@@ -470,17 +473,73 @@ describe('R1 read-only boundary verifier (real database)', () => {
             // ADMIN only, then nested through another role that inherits it.
             await finding(admin, `grant pg_create_subscription to ${app} with admin true, inherit false, set false`, `revoke pg_create_subscription from ${app} cascade`,
               `${direct('inherit=false set=false admin=true', `${app} neither inherits its privileges nor can SET ROLE to it through this grant, but with ADMIN, ${app} can grant this role to itself or other roles with any INHERIT and SET options, which opens both`)}` +
-                `${subscribe(none, none)}${app} cannot create a subscription today`);
+                `${subscribe(none)}${noneFound}`);
+            const nestedVia = (options: string) => `${app} is a member of pg_create_subscription via ${mid} -> pg_create_subscription (last link ${mid} -> pg_create_subscription: ${options}): privileged predefined role; ` +
+              'nested: what the application role can do depends on every link in the path; the membership is forbidden whatever the options; ';
             await admin.query(`grant pg_create_subscription to ${mid}`);
             await admin.query(`grant create on database ${database} to ${app}`);
             try {
               await finding(admin, `grant ${mid} to ${app}`, `revoke ${mid} from ${app}`,
-                `${app} is a member of pg_create_subscription via ${mid} -> pg_create_subscription (last link ${mid} -> pg_create_subscription: inherit=true set=true admin=false): privileged predefined role; ` +
-                  `nested: what the application role can do depends on every link in the path; the membership is forbidden whatever the options; ${subscribe(here, none)}${app} can create subscriptions in ${here} now`);
+                `${nestedVia('inherit=true set=true admin=false')}${subscribe(here)}${canCreate(`as itself in ${here}`)}`);
             } finally {
               await admin.query(`revoke create on database ${database} from ${app}`);
               await admin.query(`revoke pg_create_subscription from ${mid}`);
             }
+
+            // Nested SET ROLE paths: R1 states the acting role PostgreSQL actually uses, and never claims "cannot".
+            // N1: SET ROLE to an intermediate role that inherits pg_create_subscription and holds CREATE.
+            await admin.query(`grant pg_create_subscription to ${mid}`);
+            await admin.query(`grant create on database ${database} to ${mid}`);
+            await admin.query(`grant ${mid} to ${app} with inherit false, set true`);
+            try {
+              expect(await membership()).toEqual({ status: 'FAIL', evidence: `${nestedVia('inherit=true set=true admin=false')}${subscribe(none)}${canCreate(`after SET ROLE ${mid} in ${here}`)}` });
+              await withClient(asApp.toString(), async (client) => {
+                await expect(createSubscription(client)).rejects.toMatchObject({ code: '42501' });
+                await client.query(`set role ${mid}`);
+                await createSubscription(client);
+                await client.query(`drop subscription ${subscription}`);
+              });
+            } finally {
+              await admin.query(`drop subscription if exists ${subscription}`);
+              await admin.query(`revoke ${mid} from ${app}`);
+              await admin.query(`revoke create on database ${database} from ${mid}`);
+              await admin.query(`revoke pg_create_subscription from ${mid}`);
+            }
+            await verified('after N1');
+
+            // N2: a chain of SET options reaches pg_create_subscription itself, which holds CREATE.
+            // N3 (control): without SET on the first link, SET ROLE is refused and R1 finds no path.
+            await admin.query(`grant pg_create_subscription to ${mid} with inherit false, set true`);
+            await admin.query(`grant create on database ${database} to pg_create_subscription`);
+            try {
+              await admin.query(`grant ${mid} to ${app}`);
+              try {
+                expect(await membership()).toEqual({ status: 'FAIL', evidence: `${nestedVia('inherit=false set=true admin=false')}${subscribe(none)}${canCreate(`after SET ROLE pg_create_subscription in ${here}`)}` });
+                await withClient(asApp.toString(), async (client) => {
+                  await expect(createSubscription(client)).rejects.toMatchObject({ code: '42501' });
+                  await client.query('set role pg_create_subscription');
+                  await createSubscription(client);
+                  await client.query(`drop subscription ${subscription}`);
+                });
+              } finally {
+                await admin.query(`drop subscription if exists ${subscription}`);
+                await admin.query(`revoke ${mid} from ${app}`);
+              }
+              await admin.query(`grant ${mid} to ${app} with inherit true, set false`);
+              try {
+                expect(await membership()).toEqual({ status: 'FAIL', evidence: `${nestedVia('inherit=false set=true admin=false')}${subscribe(none)}${noneFound}` });
+                await withClient(asApp.toString(), async (client) => {
+                  await expect(client.query('set role pg_create_subscription')).rejects.toMatchObject({ code: '42501' });
+                  await expect(createSubscription(client)).rejects.toMatchObject({ code: '42501' });
+                });
+              } finally {
+                await admin.query(`revoke ${mid} from ${app}`);
+              }
+            } finally {
+              await admin.query(`revoke create on database ${database} from pg_create_subscription`);
+              await admin.query(`revoke pg_create_subscription from ${mid}`);
+            }
+            await verified('after N2 and N3');
           }
           await verified('clean again');
           expect((await admin.query('select count(*)::int as n from pg_auth_members where member in (to_regrole($1), to_regrole($2))', [app, mid])).rows[0].n).toBe(0);

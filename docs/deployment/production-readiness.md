@@ -254,9 +254,15 @@ What the two newer roles allow, verified on disposable PostgreSQL 15.19,
 
   The membership is the finding, whatever its options, as for every role
   above. The finding adds the `CREATE` half: the databases `bizcaiaos_app` can
-  connect to where it, or `pg_create_subscription`, holds `CREATE`, and
-  whether `bizcaiaos_app` can create a subscription today. `CREATE` on a
-  database without the membership is not a finding.
+  connect to where it holds `CREATE`, and every role it can act as (itself,
+  or any role it can `SET ROLE` to, directly or through nested memberships)
+  that holds both the privileges of `pg_create_subscription` and `CREATE`,
+  with the databases. For example, it might be able to act `as itself`, or
+  `after SET ROLE` an intermediate role, or `after SET ROLE
+  pg_create_subscription`. When R1 finds no such role, it says so without
+  claiming a subscription cannot be created: routes other than role
+  switching, such as `SECURITY DEFINER` functions, are not evaluated.
+  `CREATE` on a database without the membership is not a finding.
 
 Each finding shows the membership path and the `INHERIT`, `SET`, and `ADMIN`
 options of one grant, then states what that grant allows today:
@@ -291,7 +297,7 @@ nested, `SUPERUSER`, `BYPASSRLS`, the five predefined roles, and another
 object owner). The `pg_maintain` and `pg_create_subscription` cases in the
 same file run on PostgreSQL 16 and 17, and also passed on 15 and 18. They
 cover every `INHERIT`/`SET` combination, `ADMIN`, nested, membership with and
-without `CREATE`, and the `SET`-only case. Each condition is granted, found,
+without `CREATE`, the `SET`-only case, and nested `SET ROLE` paths. Each condition is granted, found,
 revoked and verified clean again, and PostgreSQL's own acceptance or refusal
 of the subscription is checked alongside. Staging and production remain
 `NOT_VERIFIED`.
