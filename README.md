@@ -84,6 +84,7 @@ Copy `.env.example` to `.env` and fill in local values. Do not commit `.env`.
 | `npm run db:provision-app-role` | Create the local application role if missing (local only) |
 | `npm run db:migrate` | Apply numbered SQL migrations |
 | `npm run db:reset` | Wipe local volume and re-migrate |
+| `npm run config:check` | Check a deployment environment against the configuration contract |
 | `npm run db:down` | Stop local PostgreSQL |
 | `npm run build` | Production UI build |
 | `npm run typecheck` | Client TypeScript |
@@ -134,6 +135,10 @@ API: `API_PORT`, `CORS_ORIGIN`, `DATABASE_URL`, `DATABASE_MIGRATE_URL`, `DATABAS
 
 Analytics is optional. The Umami script is injected only when both `VITE_ANALYTICS_ENDPOINT` and `VITE_ANALYTICS_WEBSITE_ID` are set. An empty or missing pair is omitted from the production build.
 
-Apply SQL in order: `database/001_core_schema.sql`, `002_rbac_rls.sql`, `003_organization_onboarding.sql`, `004_property_workflow_rls.sql`, `005_projects_write_rls.sql`, `006_negotiations_rls.sql`. Use `npm run db:migrate` for the recorded runner. Do not connect the API as the table owner if you want RLS to apply.
+Apply the numbered SQL files in `database/` in order with `npm run db:migrate`, the recorded runner. Do not connect the API as the table owner if you want RLS to apply.
+
+## Staging and production
+
+No staging or production environment exists yet. [docs/deployment/production-readiness.md](docs/deployment/production-readiness.md) records the accepted architecture (Supabase Auth and PostgreSQL, Render Static Site and Web Service), the per-environment configuration contract, database roles, migration promotion, recovery targets, and the provisioning checklist. Placeholder templates live in `deploy/staging.env.example` and `deploy/production.env.example`; never commit real values. Check an environment before deploying with `npm run config:check -- --target staging --scope frontend` (or `--scope api`, `--scope migration`); it contacts nothing and prints no values.
 
 The dashboard “Active negotiations” metric continues to count properties whose `acquisition_stage = negotiation`, not open/paused rows in `negotiations`.

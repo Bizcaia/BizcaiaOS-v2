@@ -21,6 +21,7 @@
     "db:reset": "docker compose down -v && docker compose up -d --wait && npm run db:provision-app-role && npm run db:migrate",
     "db:provision-app-role": "tsx server/provisionAppRole.ts",
     "db:migrate": "tsx server/migrate.ts",
+    "config:check": "tsx server/config/environmentContract.ts",
     "test:integration": "vitest run server/integration --environment node"
   },
   "dependencies": {
