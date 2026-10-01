@@ -23,6 +23,7 @@ function cleanSnapshot(): Snapshot {
     identity: { database: 'postgres', user: OWNER, version: 'PostgreSQL 17.6 on x86_64', publicSchema: true, readOnly: true },
     appRole: APP,
     roles: [role(APP), role(OWNER)],
+    memberships: [],
     migrations: [...MIGRATION_FILES],
     relations,
     functions: FUNCTIONS.map((signature) => ({ signature, name: signature.split('(')[0], owner: OWNER, extension: null })),
@@ -72,7 +73,7 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
     const checks = run(supabaseSnapshot());
     expect(failed(checks)).toEqual([]);
     expect(statusOf(checks)).toMatchObject({
-      'R1-DB-IDENTITY': 'VERIFIED', 'R1-DB-ROLES': 'VERIFIED', 'R1-DB-MIGRATIONS': 'VERIFIED', 'R1-DB-OWNER': 'VERIFIED', 'R1-DB-APP-PRIVILEGES': 'VERIFIED',
+      'R1-DB-IDENTITY': 'VERIFIED', 'R1-DB-ROLES': 'VERIFIED', 'R1-DB-APP-MEMBERSHIP': 'VERIFIED', 'R1-DB-MIGRATIONS': 'VERIFIED', 'R1-DB-OWNER': 'VERIFIED', 'R1-DB-APP-PRIVILEGES': 'VERIFIED',
       'R1-DB-PUBLIC': 'VERIFIED', 'R1-DB-ANON': 'VERIFIED', 'R1-DB-AUTHENTICATED': 'VERIFIED', 'R1-DB-FUTURE-FUNCTIONS': 'VERIFIED',
       'R1-DB-TRUSTED-FUNCTIONS': 'VERIFIED', 'R1-DB-RLS': 'VERIFIED', 'R1-DB-DEFAULT-ACLS': 'INFO', 'R1-DB-SERVICE-ROLE': 'INFO',
     });
@@ -119,6 +120,84 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
     const checks = run(snapshot);
     expect(failed(checks)).toEqual(['R1-DB-ROLES']);
     expect(evidence(checks, 'R1-DB-ROLES')).toMatch(/bizcaiaos_app: CREATEDB[\s\S]*bizcaiaos_app: BYPASSRLS[\s\S]*bizcaiaos_migrator: CREATEROLE/);
+  });
+
+  describe('application role memberships (R1-DB-APP-MEMBERSHIP)', () => {
+    const member = (roleName: string, extra: Partial<Snapshot['memberships'][number]> = {}) =>
+      ({ role: roleName, path: [roleName], inherit: true, setOption: true, admin: false, superuser: false, bypassRls: false, ...extra });
+    const withMemberships = (...memberships: Snapshot['memberships']) => ({ ...supabaseSnapshot(), memberships });
+
+    it('passes with no membership, and records that it read pg_auth_members', () => {
+      const checks = run(withMemberships());
+      expect(statusOf(checks)['R1-DB-APP-MEMBERSHIP']).toBe('VERIFIED');
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('bizcaiaos_app is a member of no role');
+    });
+
+    it.each([
+      [true, true],
+      [false, true],
+      [true, false],
+      [false, false],
+    ])('fails on membership in the migration owner with INHERIT %s / SET %s', (inherit, setOption) => {
+      const checks = run(withMemberships(member(OWNER, { inherit, setOption })));
+      expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain(
+        `bizcaiaos_app is a member of bizcaiaos_migrator via bizcaiaos_migrator (inherit=${inherit} set=${setOption} admin=false): the migration owner`,
+      );
+    });
+
+    it('fails on NOINHERIT + SET even though every effective privilege check still passes', () => {
+      const snapshot = withMemberships(member(OWNER, { inherit: false, setOption: true }));
+      // The privilege view is exactly the clean one: has_table_privilege shows nothing new.
+      expect(snapshot.relationPrivileges[APP]).toEqual(supabaseSnapshot().relationPrivileges[APP]);
+      expect(statusOf(run(snapshot))).toMatchObject({ 'R1-DB-APP-PRIVILEGES': 'VERIFIED', 'R1-DB-PUBLIC': 'VERIFIED', 'R1-DB-APP-MEMBERSHIP': 'FAIL' });
+    });
+
+    it('fails on a nested membership that reaches the migration owner', () => {
+      const checks = run(withMemberships(member('ops_group'), member(OWNER, { path: ['ops_group', OWNER], inherit: false })));
+      expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('via ops_group -> bizcaiaos_migrator');
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).not.toContain('member of ops_group via');
+    });
+
+    it.each(['pg_read_all_data', 'pg_write_all_data', 'pg_execute_server_program'])('fails on membership in %s', (predefined) => {
+      const checks = run(withMemberships(member(predefined)));
+      expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP']);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain(`member of ${predefined} via ${predefined}`);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('privileged predefined role');
+    });
+
+    it('fails on membership in a SUPERUSER or BYPASSRLS role, and in another owner of BizcaiaOS objects', () => {
+      const attributes = run(withMemberships(member('ops_admin', { superuser: true }), member('service_role', { bypassRls: true })));
+      expect(evidence(attributes, 'R1-DB-APP-MEMBERSHIP')).toMatch(/member of ops_admin[^\n]*SUPERUSER[\s\S]*member of service_role[^\n]*BYPASSRLS/);
+      const owned = supabaseSnapshot();
+      owned.functions[0].owner = 'legacy_owner';
+      owned.memberships = [member('legacy_owner')];
+      const checks = run(owned);
+      expect(failed(checks)).toEqual(['R1-DB-APP-MEMBERSHIP', 'R1-DB-OWNER']);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('member of legacy_owner via legacy_owner (inherit=true set=true admin=false): owns BizcaiaOS objects in public');
+    });
+
+    it('passes a harmless unrelated membership and records it', () => {
+      const checks = run(withMemberships(member('reporting_readers', { inherit: false, setOption: false })));
+      expect(failed(checks)).toEqual([]);
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('bizcaiaos_app memberships, none across the boundary: reporting_readers');
+    });
+
+    it('treats the connection owner as the migration owner on a local database, and reports a missing application role', () => {
+      const local = { ...supabaseSnapshot(), identity: { ...supabaseSnapshot().identity, user: 'local_owner' } };
+      for (const rel of local.relations) rel.owner = 'local_owner';
+      for (const fn of local.functions) fn.owner = 'local_owner';
+      local.memberships = [member('local_owner', { inherit: false })];
+      expect(evidence(run(local, 'local'), 'R1-DB-APP-MEMBERSHIP')).toContain('member of local_owner via local_owner (inherit=false set=true admin=false): the migration owner');
+      const missing = { ...supabaseSnapshot(), roles: [role(OWNER)] };
+      expect(evidence(run(missing), 'R1-DB-APP-MEMBERSHIP')).toBe('bizcaiaos_app does not exist');
+    });
+
+    it('prints n/a for options on servers without INHERIT/SET per membership', () => {
+      const checks = run(withMemberships(member(OWNER, { inherit: null, setOption: null })));
+      expect(evidence(checks, 'R1-DB-APP-MEMBERSHIP')).toContain('(inherit=n/a set=n/a admin=false)');
+    });
   });
 
   it('fails when RLS is disabled on an expected table', () => {

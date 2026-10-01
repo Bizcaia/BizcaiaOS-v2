@@ -22,6 +22,8 @@ export const TRUSTED_FUNCTIONS = ['sync_authenticated_user', 'bootstrap_organiza
 const API_ROLES = ['anon', 'authenticated'] as const;
 const OBSERVED_ROLES = ['anon', 'authenticated', 'service_role', 'postgres', 'supabase_admin'];
 const APP_TABLE_PRIVILEGES = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
+/** Predefined roles that reach data or server files past every table grant and RLS policy. */
+export const PRIVILEGED_PREDEFINED_ROLES = ['pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program'];
 
 export const QUERIES = Object.freeze({
   identity: `select current_database() as database, current_user as "user", version() as version,
@@ -29,6 +31,21 @@ export const QUERIES = Object.freeze({
   roles: `select r.rolname as name, r.rolcanlogin as login, r.rolsuper as superuser, r.rolbypassrls as "bypassRls",
       r.rolcreaterole as "createRole", r.rolcreatedb as "createDb"
     from pg_roles r where r.rolname = any($1::text[]) order by r.rolname`,
+  // Every role the application role belongs to, directly or through other
+  // roles, read from pg_auth_members: the relationship itself, whatever its
+  // INHERIT and SET options (PostgreSQL 16+; null on older servers). Privilege
+  // functions miss a NOINHERIT membership that still allows SET ROLE.
+  memberships: `with recursive chain as (
+      select m.roleid, array[m.roleid] as path, (to_jsonb(m) ->> 'inherit_option')::boolean as inherit,
+        (to_jsonb(m) ->> 'set_option')::boolean as "setOption", m.admin_option as admin
+      from pg_auth_members m where m.member = to_regrole($1)
+      union all
+      select m.roleid, c.path || m.roleid, (to_jsonb(m) ->> 'inherit_option')::boolean,
+        (to_jsonb(m) ->> 'set_option')::boolean, m.admin_option
+      from pg_auth_members m join chain c on m.member = c.roleid where not m.roleid = any(c.path))
+    select r.rolname as role, array(select pg_get_userbyid(x)::text from unnest(c.path) x) as path, c.inherit, c."setOption",
+      c.admin, r.rolsuper as superuser, r.rolbypassrls as "bypassRls"
+    from chain c join pg_roles r on r.oid = c.roleid order by 1, 2`,
   migrationsAccess: `select to_regclass('public.schema_migrations') is not null as tracked,
     coalesce(has_table_privilege(current_user, to_regclass('public.schema_migrations')::oid, 'SELECT'), false) as readable`,
   migrations: `select id from public.schema_migrations order by id`,
@@ -91,6 +108,8 @@ export type Snapshot = {
   identity: { database: string; user: string; version: string; publicSchema: boolean; readOnly: boolean };
   appRole: string;
   roles: { name: string; login: boolean; superuser: boolean; bypassRls: boolean; createRole: boolean; createDb: boolean }[];
+  /** Roles the application role is a member of; `path` runs from its direct membership to `role`. Options describe the last link. */
+  memberships: { role: string; path: string[]; inherit: boolean | null; setOption: boolean | null; admin: boolean; superuser: boolean; bypassRls: boolean }[];
   /** null: no schema_migrations table; 'unreadable': the connection may not read it. */
   migrations: string[] | null | 'unreadable';
   relations: { name: string; kind: string; owner: string; rls: boolean }[];
@@ -109,6 +128,7 @@ export async function collectSnapshot(client: Queryable, appRole: string): Promi
     const [identity] = await run('identity');
     const roles = await run('roles', [[...new Set([appRole, MIGRATOR_ROLE, ...OBSERVED_ROLES])]]);
     const present = new Set(roles.map((role: { name: string }) => role.name));
+    const memberships = await run('memberships', [appRole]);
     const [access] = await run('migrationsAccess');
     const migrations = !access.tracked ? null : !access.readable ? 'unreadable' : (await run('migrations')).map((row: { id: string }) => row.id);
     const relations = await run('relations');
@@ -132,6 +152,7 @@ export async function collectSnapshot(client: Queryable, appRole: string): Promi
       identity,
       appRole,
       roles,
+      memberships,
       migrations,
       relations,
       functions,
@@ -149,6 +170,7 @@ export async function collectSnapshot(client: Queryable, appRole: string): Promi
 export const DATABASE_CHECKS = {
   'R1-DB-IDENTITY': 'Verification connection: read-only transaction and the role it connects as',
   'R1-DB-ROLES': 'Role attributes: bizcaiaos_app and bizcaiaos_migrator (no SUPERUSER, CREATEROLE, CREATEDB, BYPASSRLS)',
+  'R1-DB-APP-MEMBERSHIP': 'Application role is not a member (any INHERIT/SET option, direct or nested) of the migration owner, an owner of BizcaiaOS objects, a SUPERUSER/BYPASSRLS role, or a privileged predefined role',
   'R1-DB-MIGRATIONS': 'Migration history equals the registered chain (001..019), applied once each',
   'R1-DB-OWNER': 'The migration owner owns every BizcaiaOS relation and function in public',
   'R1-DB-APP-PRIVILEGES': 'Application role keeps what the API needs (CRUD, sequences, every function, RLS helpers) and nothing on schema_migrations',
@@ -223,6 +245,34 @@ export function evaluate(snapshot: Snapshot, options: { target: VerifyTarget; re
     else roleEvidence.push(`${MIGRATOR_ROLE}: not present (local database; migrations ran as ${user})`);
   }
   add('R1-DB-ROLES', roleProblems.length ? 'FAIL' : 'VERIFIED', [...roleProblems, ...roleEvidence], 'database-roles');
+
+  // R1-DB-APP-MEMBERSHIP: the membership itself, not the privileges it happens
+  // to pass on. A NOINHERIT membership adds no effective privilege, yet with
+  // SET it still lets the application role SET ROLE to the owner.
+  if (!roleNames.has(app)) {
+    add('R1-DB-APP-MEMBERSHIP', 'FAIL', [`${app} does not exist`], 'database-roles');
+  } else {
+    const objectOwners = new Set([...snapshot.relations, ...bizFunctions].map((item) => item.owner).filter((name) => name !== app));
+    const option = (value: boolean | null) => (value === null ? 'n/a' : String(value));
+    const describe = (membership: Snapshot['memberships'][number]) =>
+      `${app} is a member of ${membership.role} via ${membership.path.join(' -> ')} (inherit=${option(membership.inherit)} set=${option(membership.setOption)} admin=${membership.admin})`;
+    const forbidden = snapshot.memberships.flatMap((membership) => {
+      const reasons = [
+        (membership.role === MIGRATOR_ROLE || membership.role === owner) && 'the migration owner',
+        membership.role !== MIGRATOR_ROLE && membership.role !== owner && objectOwners.has(membership.role) && 'owns BizcaiaOS objects in public',
+        membership.superuser && 'SUPERUSER',
+        membership.bypassRls && 'BYPASSRLS',
+        PRIVILEGED_PREDEFINED_ROLES.includes(membership.role) && 'privileged predefined role',
+      ].filter(Boolean);
+      return reasons.length ? [`${describe(membership)}: ${reasons.join(', ')}; a member can use its privileges or SET ROLE to it, past RLS and table grants`] : [];
+    });
+    add('R1-DB-APP-MEMBERSHIP', forbidden.length ? 'FAIL' : 'VERIFIED', forbidden.length ? forbidden : [
+      snapshot.memberships.length
+        ? `${app} memberships, none across the boundary: ${snapshot.memberships.map((membership) => membership.path.join(' -> ')).join('; ')}`
+        : `${app} is a member of no role`,
+      'read from pg_auth_members, whatever the INHERIT and SET options',
+    ], 'database-roles');
+  }
 
   // R1-DB-MIGRATIONS
   if (snapshot.migrations === 'unreadable') {

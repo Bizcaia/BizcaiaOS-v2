@@ -23,10 +23,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const appRole = process.env.POSTGRES_APP_USER?.trim() || 'bizcaiaos_app';
 const { rls } = repositoryChecks(ROOT, MIGRATION_FILES);
 const API_ROLE_CHECKS = ['R1-DB-ANON', 'R1-DB-AUTHENTICATED'];
-async function verify(url: string): Promise<Check[]> {
+async function verify(url: string, role = appRole): Promise<Check[]> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await databaseChecks(url, { target: 'local', appRole, registered: MIGRATION_FILES, rls });
+      return await databaseChecks(url, { target: 'local', appRole: role, registered: MIGRATION_FILES, rls });
     } catch (error) {
       const concurrentRoleDrop = (error as { code?: string }).code === '42704';
       if (!concurrentRoleDrop || attempt === 5) throw error;
@@ -74,11 +74,15 @@ describe('R1 read-only boundary verifier (real database)', () => {
       return url.toString();
     };
     const adminUrl = (db: string | null) => urlFor(requireDatabaseEnv().migrateUrl, db);
+    // pg_roles is cluster-wide: parallel suites create and drop their fixture
+    // roles (zz_*, and anon/authenticated on plain PostgreSQL) at any moment,
+    // so those are left out. Every other role, including the application and
+    // migration roles, stays in.
     const fingerprint = (client: pg.Client) => client.query<{ hash: string }>(`
       select md5(string_agg(entry, '|' order by entry)) as hash from (
         select 'p' || oid || coalesce(proacl::text, '') as entry from pg_proc
         union all select 'c' || oid || relrowsecurity || coalesce(relacl::text, '') from pg_class
-        union all select 'r' || oid || rolname from pg_roles
+        union all select 'r' || oid || rolname from pg_roles where rolname not in ('anon', 'authenticated') and left(rolname, 3) <> 'zz_'
         union all select 'y' || oid || polname from pg_policy
         union all select 'd' || oid || defaclacl::text from pg_default_acl) entries`).then((result) => result.rows[0].hash);
 
@@ -103,6 +107,7 @@ describe('R1 read-only boundary verifier (real database)', () => {
       expect(statusOf(checks)).toMatchObject({
         'R1-DB-IDENTITY': 'VERIFIED',
         'R1-DB-ROLES': 'VERIFIED',
+        'R1-DB-APP-MEMBERSHIP': 'VERIFIED',
         'R1-DB-MIGRATIONS': 'VERIFIED',
         'R1-DB-OWNER': 'VERIFIED',
         'R1-DB-APP-PRIVILEGES': 'VERIFIED',
@@ -137,6 +142,68 @@ describe('R1 read-only boundary verifier (real database)', () => {
       const checks = await verify(urlFor(requireDatabaseEnv().url, database));
       expect(statusOf(checks)).toMatchObject({ 'R1-DB-IDENTITY': 'FAIL', 'R1-DB-MIGRATIONS': 'NOT_VERIFIED', 'R1-DB-OWNER': 'NOT_VERIFIED' });
     });
+
+    // Memberships are cluster-wide, so this uses its own throwaway application
+    // role: other suites check bizcaiaos_app's memberships in parallel.
+    it('fails on any membership in the migration owner, including NOINHERIT + SET that no privilege check shows', async () => {
+      const url = adminUrl(database);
+      const suffix = randomUUID().slice(0, 8);
+      const app = `zz_r1_app_${suffix}`;
+      const safe = `zz_r1_safe_${suffix}`;
+      const password = randomUUID();
+      const membership = async () => {
+        const checks = await verify(url, app);
+        return { status: statusOf(checks)['R1-DB-APP-MEMBERSHIP'], evidence: checks.find((item) => item.id === 'R1-DB-APP-MEMBERSHIP')!.evidence.join('\n') };
+      };
+      await withClient(url, async (admin) => {
+        const owner = (await admin.query<{ user: string }>('select current_user as user')).rows[0].user;
+        try {
+          await admin.query(`create role ${app} login password '${password}'`);
+          await admin.query(`create role ${safe} nologin`);
+          await admin.query(`grant ${safe} to ${app}`);
+          // An unrelated role is not a finding.
+          expect(await membership()).toMatchObject({ status: 'VERIFIED' });
+          expect((await membership()).evidence).toContain(`${app} memberships, none across the boundary: ${safe}`);
+
+          for (const [inherit, setOption] of [[true, true], [false, true], [true, false], [false, false]]) {
+            await admin.query(`grant "${owner}" to ${app} with inherit ${inherit}, set ${setOption}`);
+            try {
+              const result = await membership();
+              expect(result.status, `inherit ${inherit} set ${setOption}`).toBe('FAIL');
+              expect(result.evidence).toContain(`${app} is a member of ${owner} via ${owner} (inherit=${inherit} set=${setOption} admin=false): the migration owner`);
+              if (!inherit && setOption) {
+                // The gap this check closes: no effective privilege, yet SET ROLE reaches the owner.
+                expect((await admin.query('select has_table_privilege($1, \'public.schema_migrations\', \'SELECT\') as can', [app])).rows[0].can).toBe(false);
+                const asApp = new URL(url);
+                asApp.username = app;
+                asApp.password = password;
+                const read = await withClient(asApp.toString(), async (client) => {
+                  await client.query(`set role "${owner}"`);
+                  return (await client.query('select count(*)::int as n from public.schema_migrations')).rows[0].n;
+                });
+                expect(read).toBe(MIGRATION_FILES.length);
+              }
+            } finally {
+              await admin.query(`revoke "${owner}" from ${app}`);
+            }
+          }
+
+          for (const predefined of ['pg_read_all_data', 'pg_write_all_data']) {
+            await admin.query(`grant ${predefined} to ${app}`);
+            try {
+              expect(await membership()).toMatchObject({ status: 'FAIL' });
+              expect((await membership()).evidence).toContain(`member of ${predefined} via ${predefined}`);
+            } finally {
+              await admin.query(`revoke ${predefined} from ${app}`);
+            }
+          }
+          expect(await membership()).toMatchObject({ status: 'VERIFIED' });
+        } finally {
+          await admin.query(`drop role if exists ${app}`);
+          await admin.query(`drop role if exists ${safe}`);
+        }
+      });
+    }, 120_000);
 
     // Last: it breaks the boundary in this database on purpose.
     it('GOOD state passes and verification leaves the catalog unchanged; BAD grants and RLS changes fail', async () => {
