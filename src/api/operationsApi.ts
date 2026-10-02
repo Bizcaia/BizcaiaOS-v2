@@ -2177,6 +2177,9 @@ export const operationsApi = {
     propertyId: string,
     input: { category: DocumentCategory; title: string; negotiationId?: string | null; file: File },
   ) {
+    // Checked in both modes, before any request: the live form below is built from
+    // fixed fields, so an unknown key would otherwise be dropped instead of refused.
+    rejectUnknownDemoKeys(input, 'uploadDocument', ['file']);
     const config = await operationsApi.getConfig();
     if (input.file.size > config.documentUpload.maxSizeBytes) {
       throw new Error(`File exceeds the maximum allowed size of ${config.documentUpload.maxSizeBytes} bytes`);
@@ -2192,7 +2195,6 @@ export const operationsApi = {
       form.set('file', input.file);
       return uploadRequest<PropertyDocument>(`/ops/properties/${propertyId}/documents`, form);
     }
-    rejectUnknownDemoKeys(input, 'uploadDocument', ['file']);
     if (!demoCanWriteDocument()) throw new Error('You do not have permission for this operation');
     const property = demoProperties.find((entry) => entry.id === propertyId);
     if (!property) throw new Error('Property not found');
