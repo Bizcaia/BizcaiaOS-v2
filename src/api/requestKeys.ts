@@ -35,8 +35,14 @@ export const REQUEST_BODY_KEYS = {
 
 export type RequestBodyOperation = keyof typeof REQUEST_BODY_KEYS;
 
-/** The top-level keys of a request body that the API does not accept for the operation. */
+/**
+ * The top-level keys of a request body that the API does not accept for the operation.
+ * A key whose value is undefined is not counted: JSON.stringify leaves it out of the
+ * live request, so the API never sees it.
+ */
 export function unknownRequestKeys(input: object, operation: RequestBodyOperation): string[] {
   const allowed: readonly string[] = REQUEST_BODY_KEYS[operation];
-  return Object.keys(input).filter((key) => !allowed.includes(key));
+  return Object.entries(input)
+    .filter(([key, value]) => !allowed.includes(key) && value !== undefined)
+    .map(([key]) => key);
 }

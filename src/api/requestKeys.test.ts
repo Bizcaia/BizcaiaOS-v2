@@ -40,6 +40,13 @@ describe('demo request-body keys', () => {
     expect(unknownRequestKeys({ title: 'T', stauts: 'done', priority: 'high' }, 'updateTask')).toEqual(['stauts']);
     expect(unknownRequestKeys({ metadata: { anything: { nested: 1 } } }, 'updateProperty')).toEqual([]);
   });
+
+  it('ignores an unknown key whose value is undefined, which a live request never sends', () => {
+    expect(unknownRequestKeys({ title: 'T', stauts: undefined }, 'updateTask')).toEqual([]);
+    for (const value of ['x', 0, false, {}, [], null]) {
+      expect(unknownRequestKeys({ title: 'T', stauts: value }, 'updateTask')).toEqual(['stauts']);
+    }
+  });
 });
 
 describe('demo adapters refuse unknown request-body keys like the API', () => {
@@ -191,5 +198,149 @@ describe('uploadDocument refuses unknown input keys in live and demo mode', () =
     const demo = await rejection((await loadDemoClient()).operationsApi.uploadDocument(propertyId, input));
     expect(live).toEqual(demo);
     expect(live).toEqual(refused);
+  });
+});
+
+describe('an unknown key whose value is undefined is ignored alike in live and demo mode', () => {
+  const apiBase = 'https://api.example.com/api/v1';
+  const propertyId = '70000000-0000-4000-8000-000000000001';
+  type Api = Record<string, (...args: unknown[]) => Promise<unknown>>;
+  type Sent = { method: string; path: string; body: unknown };
+
+  // Every client function that checks its request body, with placeholder ids;
+  // the input is passed as the last argument.
+  const OPERATIONS: [api: 'operations' | 'organization', name: string, args: unknown[], input: Record<string, unknown>][] = [
+    ['operations', 'createOwner', [], { ownerType: 'individual', displayName: 'Owner', contactDetails: { any: { nested: true } } }],
+    ['operations', 'createProperty', [], { propertyReference: 'NCP-U1' }],
+    ['operations', 'updateProperty', ['id-1'], { risk: 'high', metadata: { any: { nested: true } } }],
+    ['operations', 'transitionPropertyStage', ['id-1'], { targetStage: 'negotiation', expectedStage: 'identified' }],
+    ['operations', 'escalateRemediation', ['id-1'], { reason: 'r' }],
+    ['operations', 'returnRemediationToReview', ['id-1'], { reason: 'r' }],
+    ['operations', 'resolveRemediation', ['id-1'], { resultingStage: 'identified', expectedStage: 'identified', reason: 'r' }],
+    ['operations', 'reopenRemediation', ['id-1'], { reason: 'r' }],
+    ['operations', 'transitionPropertyStatus', ['id-1'], { targetStatus: 'active', expectedStatus: 'active' }],
+    ['operations', 'linkPropertyOwner', ['id-1'], { ownerId: 'owner-1' }],
+    ['operations', 'createNegotiation', [], { propertyId: 'id-1' }],
+    ['operations', 'updateNegotiation', ['id-1'], { status: 'paused' }],
+    ['operations', 'createNegotiationEvent', ['id-1'], { eventType: 'note', metadata: { any: { nested: true } } }],
+    ['operations', 'updateDocument', ['id-1'], { title: 'T' }],
+    ['operations', 'createTask', ['id-1'], { title: 'T' }],
+    ['operations', 'updateTask', ['id-1'], { title: 'T' }],
+    ['operations', 'createPayment', ['id-1'], { amount: 1, paymentType: 'deposit' }],
+    ['operations', 'updatePayment', ['id-1'], { amount: 1 }],
+    ['operations', 'createAgreementSignature', ['id-1'], { documentId: 'document-1', ownerId: 'owner-1' }],
+    ['operations', 'createInteraction', ['id-1'], { interactionType: 'call', notes: 'n' }],
+    ['organization', 'onboardOrganization', [], { name: 'Org', slug: 'org', timezone: 'Asia/Manila' }],
+    ['organization', 'updateOrganization', ['org-1'], { name: 'Org', settings: { any: { nested: true } } }],
+    ['organization', 'updateMember', ['org-1', 'user-1'], { isActive: true }],
+    ['organization', 'createInvitation', ['org-1'], { email: 'a@example.com', role: 'viewer' }],
+    ['operations', 'uploadDocument', [propertyId], { category: 'title_deed', title: 'Deed' }],
+  ];
+
+  const withFile = (name: string, input: Record<string, unknown>) =>
+    name === 'uploadDocument' ? { ...input, file: new File(['deed'], 'deed.pdf', { type: 'application/pdf' }) } : input;
+
+  async function wireBody(body: unknown) {
+    if (!(body instanceof FormData)) return typeof body === 'string' ? JSON.parse(body) : body;
+    return Promise.all([...body.entries()].map(async ([key, value]) => [key, value instanceof File ? await value.text() : value]));
+  }
+
+  async function loadLive() {
+    vi.resetModules();
+    vi.stubEnv('VITE_API_BASE_URL', `${apiBase}/`);
+    window.__BIZCAIAOS_AUTH__ = { getAccessToken: vi.fn().mockResolvedValue('verified-jwt-token') };
+    const sent: Sent[] = [];
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(async (url, init = {}) => {
+      const path = url.replace(apiBase, '');
+      const respond = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+      if (path === '/ops/config') return respond(200, { data: { documentUpload: { maxSizeBytes: 1024, acceptedMimeTypes: ['application/pdf'] } } });
+      sent.push({ method: init.method ?? 'GET', path, body: await wireBody(init.body) });
+      // Stands in for the strict API, which refuses any top-level key its schema does not declare.
+      return JSON.stringify(sent.at(-1)?.body).includes('unexpectedKey')
+        ? respond(400, { error: { code: 'validation_error', message: 'Request validation failed', details: [{ code: 'unrecognized_keys', keys: ['unexpectedKey'], path: [] }] } })
+        : respond(200, { data: { id: 'server-1' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const [operations, organization] = await Promise.all([import('./operationsApi'), import('./organizationApi')]);
+    return { apis: { operations: operations.operationsApi as unknown as Api, organization: organization.organizationApi as unknown as Api }, sent, fetchMock };
+  }
+
+  async function loadDemo() {
+    vi.resetModules();
+    vi.stubEnv('VITE_API_BASE_URL', '');
+    const [operations, organization] = await Promise.all([import('./operationsApi'), import('./organizationApi')]);
+    return { operations: operations.operationsApi as unknown as Api, organization: organization.organizationApi as unknown as Api };
+  }
+
+  async function outcome(promise: Promise<unknown>) {
+    return promise.then(
+      // Generated ids, tokens and timestamps differ between two otherwise identical demo writes.
+      (value) => ({
+        resolved: JSON.stringify(value)
+          .replace(/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/g, '<id>')
+          .replace(/demo_[0-9a-f]{32}/g, '<token>')
+          .replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, '<time>'),
+      }),
+      (error: { name: string; message: string; status?: number; code?: string }) => ({ rejected: [error.name, error.message, error.status, error.code] }),
+    );
+  }
+
+  afterEach(() => {
+    delete window.__BIZCAIAOS_AUTH__;
+    vi.unstubAllGlobals();
+  });
+
+  it.each(OPERATIONS)('%s.%s: live sends the same request with or without the undefined key, and demo answers alike', async (api, name, args, input) => {
+    const live = await loadLive();
+    const plain = await outcome(live.apis[api][name](...args, withFile(name, input)));
+    const extra = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: undefined })));
+    expect(plain).toEqual({ resolved: JSON.stringify({ id: 'server-1' }) });
+    expect(extra).toEqual(plain);
+    expect(live.sent).toHaveLength(2);
+    expect(live.sent[1]).toEqual(live.sent[0]);
+    expect(JSON.stringify(live.sent)).not.toContain('unexpectedKey');
+
+    // Placeholder ids make most demo calls fail later (e.g. not found); with or
+    // without the undefined key the demo must give the same answer, never a validation_error.
+    const demoPlain = await outcome((await loadDemo())[api][name](...args, withFile(name, input)));
+    const demoExtra = await outcome((await loadDemo())[api][name](...args, withFile(name, { ...input, unexpectedKey: undefined })));
+    expect(demoExtra).toEqual(demoPlain);
+    expect(JSON.stringify(demoExtra)).not.toContain('validation_error');
+  });
+
+  it.each(OPERATIONS)('%s.%s: an unknown key with a defined value, null included, is still refused in both modes', async (api, name, args, input) => {
+    const errorName = api === 'organization' ? 'OrganizationApiError' : 'OperationsApiError';
+    for (const value of ['x', 1, true, { nested: 1 }, [1], null]) {
+      const live = await loadLive();
+      const liveResult = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: value })));
+      const demoResult = await outcome((await loadDemo())[api][name](...args, withFile(name, { ...input, unexpectedKey: value })));
+      expect(liveResult).toEqual({ rejected: [errorName, 'Request validation failed', 400, 'validation_error'] });
+      expect(demoResult).toEqual(liveResult);
+      // The upload client refuses locally; every other live client sends the key and the API refuses it.
+      if (name === 'uploadDocument') expect(live.fetchMock).not.toHaveBeenCalled();
+      else expect(JSON.stringify(live.sent[0].body)).toContain('unexpectedKey');
+    }
+  });
+
+  it('accepts real demo writes carrying an undefined unknown key', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo().then(() => import('./operationsApi'));
+    const { organizationApi } = await import('./organizationApi');
+    const project = await operationsApi.createProject({ organization_id: DEMO_ORGANIZATION_ID, code: 'NCP-U2', name: 'Undefined' });
+    const property = await operationsApi.createProperty({ organizationId: DEMO_ORGANIZATION_ID, projectId: project.id, propertyReference: 'NCP-U2001', unexpectedKey: undefined } as never);
+    expect(property).toMatchObject({ property_reference: 'NCP-U2001' });
+
+    await expect(operationsApi.updateProperty(property.id, { risk: 'high', unexpectedKey: undefined })).resolves.toMatchObject({ risk: 'high' });
+    expect(JSON.parse(JSON.stringify(await operationsApi.getProperty(property.id)))).not.toHaveProperty('unexpectedKey');
+
+    const task = await operationsApi.createTask(property.id, { title: 'Call owner', unexpectedKey: undefined } as never);
+    expect(task).toMatchObject({ title: 'Call owner' });
+    expect(task).not.toHaveProperty('unexpectedKey');
+
+    const { organizations: [organization] } = await organizationApi.getMe();
+    const [member] = await organizationApi.listMembers(organization.id);
+    await expect(organizationApi.updateMember(organization.id, member.user_id, { isActive: member.is_active, unexpectedKey: undefined } as never)).resolves.toMatchObject({ user_id: member.user_id });
+
+    const file = new File(['deed'], 'deed.pdf', { type: 'application/pdf' });
+    await expect(operationsApi.uploadDocument(propertyId, { category: 'title_deed', title: 'Deed', file, unexpectedKey: undefined } as never)).resolves.toMatchObject({ title: 'Deed', storage_provider: 'local' });
   });
 });
