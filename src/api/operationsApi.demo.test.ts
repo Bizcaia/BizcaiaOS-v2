@@ -148,7 +148,7 @@ describe('operationsApi demo adapter', () => {
     expect(events[0].amount).toBe(13000000);
   });
 
-  it('lists the seeded document and uploads a new one, ignoring any client-supplied storage metadata', async () => {
+  it('lists the seeded document and uploads a new one, refusing client-supplied storage metadata', async () => {
     const { operationsApi } = await import('./operationsApi');
     const negotiationProperty = '70000000-0000-4000-8000-000000000001';
 
@@ -162,13 +162,19 @@ describe('operationsApi demo adapter', () => {
     });
 
     const file = new File(['deed contents'], 'deed.pdf', { type: 'application/pdf' });
-    const uploaded = await operationsApi.uploadDocument(negotiationProperty, {
-      category: 'title_deed',
-      title: 'Second Deed',
-      // @ts-expect-error -- storage_provider is not part of the input type; this proves it cannot be set from the client even if a caller tries.
-      storageProvider: 's3',
-      file,
-    });
+    // Like the API, a storage field is refused (400 validation_error) before anything is stored.
+    await expect(
+      operationsApi.uploadDocument(negotiationProperty, {
+        category: 'title_deed',
+        title: 'Second Deed',
+        // @ts-expect-error -- storage_provider is not part of the input type; this proves it cannot be set from the client even if a caller tries.
+        storageProvider: 's3',
+        file,
+      }),
+    ).rejects.toMatchObject({ status: 400, code: 'validation_error' });
+    expect(await operationsApi.listDocuments(negotiationProperty)).toHaveLength(1);
+
+    const uploaded = await operationsApi.uploadDocument(negotiationProperty, { category: 'title_deed', title: 'Second Deed', file });
     expect(uploaded).toMatchObject({
       title: 'Second Deed',
       storage_provider: 'local',

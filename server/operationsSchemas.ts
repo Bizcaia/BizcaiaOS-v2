@@ -10,9 +10,13 @@ export const propertyListQuerySchema = z.object({ organizationId: z.uuid(), proj
 export const idParamsSchema = z.object({ id: z.uuid() });
 export const organizationAndIdParamsSchema = z.object({ organizationId: z.uuid(), id: z.uuid() });
 
-export const createProjectSchema = z.object({ organizationId: z.uuid(), code: z.string().trim().min(2).max(40), name: z.string().trim().min(2).max(160), description: z.string().trim().max(2000).optional(), status: projectStatusSchema.default('planning'), acquisitionTarget: z.number().nonnegative().optional(), managerUserId: z.uuid().nullable().optional(), startsOn: z.string().date().nullable().optional(), targetCompletionOn: z.string().date().nullable().optional() });
+// Request bodies are strict objects: an unknown top-level key is refused with
+// 400 validation_error (issue code unrecognized_keys), including fields the
+// server derives or that are immutable. Free-form metadata and contactDetails
+// keep any nested keys. Query and path schemas are not request bodies.
+export const createProjectSchema = z.strictObject({ organizationId: z.uuid(), code: z.string().trim().min(2).max(40), name: z.string().trim().min(2).max(160), description: z.string().trim().max(2000).optional(), status: projectStatusSchema.default('planning'), acquisitionTarget: z.number().nonnegative().optional(), managerUserId: z.uuid().nullable().optional(), startsOn: z.string().date().nullable().optional(), targetCompletionOn: z.string().date().nullable().optional() });
 // P-6 (L-05): identified is the only creation stage; status always starts active.
-export const createPropertySchema = z.object({ organizationId: z.uuid(), projectId: z.uuid(), propertyReference: z.string().trim().min(1).max(80), titleNumber: z.string().trim().max(120).nullable().optional(), taxDeclaration: z.string().trim().max(120).nullable().optional(), lotNumber: z.string().trim().max(120).nullable().optional(), areaHectares: z.number().nonnegative().nullable().optional(), municipality: z.string().trim().max(120).nullable().optional(), province: z.string().trim().max(120).nullable().optional(), barangay: z.string().trim().max(120).nullable().optional(), acquisitionStage: z.literal('identified', { error: 'A property can only be created in the identified stage' }).default('identified'), assignedNegotiatorId: z.uuid().nullable().optional(), assignedManagerId: z.uuid().nullable().optional(), risk: propertyRiskSchema.default('medium') });
+export const createPropertySchema = z.strictObject({ organizationId: z.uuid(), projectId: z.uuid(), propertyReference: z.string().trim().min(1).max(80), titleNumber: z.string().trim().max(120).nullable().optional(), taxDeclaration: z.string().trim().max(120).nullable().optional(), lotNumber: z.string().trim().max(120).nullable().optional(), areaHectares: z.number().nonnegative().nullable().optional(), municipality: z.string().trim().max(120).nullable().optional(), province: z.string().trim().max(120).nullable().optional(), barangay: z.string().trim().max(120).nullable().optional(), acquisitionStage: z.literal('identified', { error: 'A property can only be created in the identified stage' }).default('identified'), assignedNegotiatorId: z.uuid().nullable().optional(), assignedManagerId: z.uuid().nullable().optional(), risk: propertyRiskSchema.default('medium') });
 export const updatePropertySchema = createPropertySchema.partial().omit({ organizationId: true, projectId: true, propertyReference: true }).extend({
   // The stage changes only through a stage transition (L-02).
   acquisitionStage: z.never({ error: 'Use a stage transition to change the acquisition stage' }).optional(),
@@ -32,7 +36,7 @@ export const updatePropertySchema = createPropertySchema.partial().omit({ organi
 // message; the transition function is the authority for every stage rule.
 // expectedStage / expectedStatus: the value the caller's screen showed (D-X1,
 // L-07). A stale value is refused as a lifecycle conflict (409).
-export const stageTransitionSchema = z.object({
+export const stageTransitionSchema = z.strictObject({
   targetStage: acquisitionStageSchema,
   expectedStage: acquisitionStageSchema,
   reason: z.string().max(2000).nullable().optional(),
@@ -41,7 +45,7 @@ export const stageTransitionSchema = z.object({
 });
 
 // The transition function is the authority for every status rule (N-2).
-export const statusTransitionSchema = z.object({
+export const statusTransitionSchema = z.strictObject({
   targetStatus: acquisitionStatusSchema,
   expectedStatus: acquisitionStatusSchema,
   reason: z.string().max(2000).nullable().optional(),
@@ -50,11 +54,11 @@ export const statusTransitionSchema = z.object({
 
 // Legacy stage remediation (L-06). The remediation functions are the
 // authority for every rule (state, authority, reason, evidence, integrity).
-export const remediationStepSchema = z.object({
+export const remediationStepSchema = z.strictObject({
   reason: z.string().max(2000).nullable().optional(),
 });
 
-export const remediationResolveSchema = z.object({
+export const remediationResolveSchema = z.strictObject({
   resultingStage: acquisitionStageSchema,
   expectedStage: acquisitionStageSchema,
   reason: z.string().max(2000).nullable().optional(),
@@ -67,14 +71,14 @@ export const remediationQueueQuerySchema = z.object({ organizationId: z.uuid() }
 
 export const ownerTypeSchema = z.enum(['individual', 'corporate', 'estate', 'government', 'other']);
 export const ownerListQuerySchema = z.object({ organizationId: z.uuid() });
-export const createOwnerSchema = z.object({
+export const createOwnerSchema = z.strictObject({
   organizationId: z.uuid(),
   ownerType: ownerTypeSchema,
   displayName: z.string().trim().min(1).max(160),
   organizationName: z.string().trim().max(160).nullable().optional(),
   contactDetails: z.record(z.string(), z.unknown()).optional(),
 });
-export const linkOwnerSchema = z.object({
+export const linkOwnerSchema = z.strictObject({
   ownerId: z.uuid(),
   ownershipPercent: z.number().min(0).max(100).nullable().optional(),
   isPrimary: z.boolean().optional(),
@@ -93,7 +97,7 @@ export const negotiationListQuerySchema = z.object({
   status: negotiationStatusSchema.optional(),
 });
 
-export const createNegotiationSchema = z.object({
+export const createNegotiationSchema = z.strictObject({
   organizationId: z.uuid(),
   propertyId: z.uuid(),
   assignedNegotiatorId: z.uuid().nullable().optional(),
@@ -103,7 +107,7 @@ export const createNegotiationSchema = z.object({
   startedAt: z.string().datetime().optional(),
 });
 
-export const updateNegotiationSchema = z.object({
+export const updateNegotiationSchema = z.strictObject({
   status: negotiationStatusSchema.optional(),
   assignedNegotiatorId: z.uuid().nullable().optional(),
   openingAmount: z.number().nonnegative().nullable().optional(),
@@ -114,7 +118,7 @@ export const updateNegotiationSchema = z.object({
   archivedAt: z.string().datetime().nullable().optional(),
 });
 
-export const createNegotiationEventSchema = z.object({
+export const createNegotiationEventSchema = z.strictObject({
   eventType: negotiationEventTypeSchema,
   amount: z.number().nonnegative().nullable().optional(),
   contextualNote: z.string().trim().max(4000).nullable().optional(),
@@ -159,13 +163,13 @@ export const documentListQuerySchema = z.object({
 // Non-file multipart fields for POST /properties/:id/documents. storage_key,
 // storage_provider, content_type, size_bytes, and original_filename are never
 // accepted from the client -- they are derived server-side from the upload.
-export const createDocumentFieldsSchema = z.object({
+export const createDocumentFieldsSchema = z.strictObject({
   category: documentCategorySchema,
   title: z.string().trim().min(1).max(200),
   negotiationId: z.uuid().optional(),
 });
 
-export const updateDocumentSchema = z.object({
+export const updateDocumentSchema = z.strictObject({
   category: documentCategorySchema.optional(),
   status: documentStatusSchema.optional(),
   title: z.string().trim().min(1).max(200).optional(),
@@ -185,7 +189,7 @@ export const taskListQuerySchema = z.object({
   includeArchived: z.coerce.boolean().default(false),
 });
 
-export const createTaskSchema = z.object({
+export const createTaskSchema = z.strictObject({
   title: z.string().trim().min(1).max(200),
   description: z.string().trim().max(4000).nullable().optional(),
   priority: taskPrioritySchema.default('normal'),
@@ -193,7 +197,7 @@ export const createTaskSchema = z.object({
   dueOn: z.string().date().nullable().optional(),
 });
 
-export const updateTaskSchema = z.object({
+export const updateTaskSchema = z.strictObject({
   title: z.string().trim().min(1).max(200).optional(),
   description: z.string().trim().max(4000).nullable().optional(),
   status: taskStatusSchema.optional(),
@@ -215,7 +219,7 @@ export const paymentListQuerySchema = z.object({
   includeArchived: z.coerce.boolean().default(false),
 });
 
-export const createPaymentSchema = z.object({
+export const createPaymentSchema = z.strictObject({
   amount: z.number().positive(),
   currencyCode: z.string().trim().length(3).default('PHP'),
   paymentType: paymentTypeSchema,
@@ -225,7 +229,7 @@ export const createPaymentSchema = z.object({
   referenceNumber: z.string().trim().max(120).nullable().optional(),
 });
 
-export const updatePaymentSchema = z.object({
+export const updatePaymentSchema = z.strictObject({
   amount: z.number().positive().optional(),
   currencyCode: z.string().trim().length(3).optional(),
   paymentType: paymentTypeSchema.optional(),
@@ -247,14 +251,14 @@ export const agreementSignatureListQuerySchema = z.object({
 
 // organization_id, property_id, and recorded_by_user_id are derived
 // server-side and never accepted from the client.
-export const createAgreementSignatureSchema = z.object({
+export const createAgreementSignatureSchema = z.strictObject({
   documentId: z.uuid(),
   ownerId: z.uuid(),
   signedOn: z.string().date(),
 });
 
 // Signatures are immutable; the only permitted change is archiving.
-export const archiveAgreementSignatureSchema = z.object({
+export const archiveAgreementSignatureSchema = z.strictObject({
   archived: z.literal(true),
 });
 
@@ -263,7 +267,7 @@ export const interactionTypeSchema = z.enum(['call', 'meeting', 'site_visit', 'm
 // organization_id, property_id, and recorded_by_user_id are derived
 // server-side. occurredAt defaults to the server clock; a supplied future
 // value is rejected by the database (zero tolerance).
-export const createInteractionSchema = z.object({
+export const createInteractionSchema = z.strictObject({
   interactionType: interactionTypeSchema,
   notes: z.string().trim().min(1).max(4000),
   occurredAt: z.string().datetime().optional(),
@@ -271,7 +275,7 @@ export const createInteractionSchema = z.object({
 });
 
 // Interactions are immutable; the only permitted change is archiving.
-export const archiveInteractionSchema = z.object({
+export const archiveInteractionSchema = z.strictObject({
   archived: z.literal(true),
 });
 

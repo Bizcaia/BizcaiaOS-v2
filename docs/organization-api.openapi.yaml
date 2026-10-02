@@ -28,6 +28,8 @@ paths:
       responses:
         '201':
           description: Organization created
+        '400':
+          $ref: '#/components/responses/ValidationError'
         '409':
           description: Slug conflict or user already belongs to an active organization
   /organizations:
@@ -57,6 +59,8 @@ paths:
       responses:
         '200':
           description: Updated organization
+        '400':
+          $ref: '#/components/responses/ValidationError'
         '403':
           $ref: '#/components/responses/Forbidden'
   /organizations/{organizationId}/members:
@@ -82,6 +86,8 @@ paths:
       responses:
         '200':
           description: Updated membership
+        '400':
+          $ref: '#/components/responses/ValidationError'
         '403':
           $ref: '#/components/responses/Forbidden'
         '422':
@@ -115,6 +121,8 @@ paths:
       responses:
         '201':
           description: Invitation created; raw token returned once
+        '400':
+          $ref: '#/components/responses/ValidationError'
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
@@ -139,6 +147,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [token]
               properties:
                 token:
@@ -147,6 +156,8 @@ paths:
       responses:
         '200':
           description: Membership activated
+        '400':
+          $ref: '#/components/responses/ValidationError'
         '403':
           description: Invitation email does not match the authenticated user
         '404':
@@ -258,3 +269,53 @@ components:
       description: Authenticated user lacks the required role or organization scope
     NotFound:
       description: Resource is absent or invisible under RLS
+    ValidationError:
+      description: >-
+        The request body does not match its schema. Request bodies are strict:
+        a top-level key the schema does not declare is refused with an
+        `unrecognized_keys` issue listing every such key. Keys nested inside
+        the free-form `settings` object are not checked.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message, details]
+                properties:
+                  code:
+                    type: string
+                    const: validation_error
+                  message:
+                    type: string
+                    const: Request validation failed
+                  details:
+                    type: array
+                    description: Validation issues; an unknown key appears as code `unrecognized_keys` with `keys` and an empty `path`.
+                    items:
+                      type: object
+                      required: [code, path, message]
+                      properties:
+                        code:
+                          type: string
+                        path:
+                          type: array
+                          items:
+                            type: [string, integer]
+                        message:
+                          type: string
+                        keys:
+                          type: array
+                          items:
+                            type: string
+          example:
+            error:
+              code: validation_error
+              message: Request validation failed
+              details:
+                - code: unrecognized_keys
+                  keys: [plan]
+                  path: []
+                  message: 'Unrecognized key: "plan"'

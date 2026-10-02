@@ -1,4 +1,5 @@
 import { organizationApi } from './organizationApi';
+import { unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
 
 export type AcquisitionStage =
   | 'identified'
@@ -366,6 +367,13 @@ function demoLifecycleConflict(field: LifecycleConflictDetails['field'], current
     'lifecycle_conflict',
     { conflict: 'lifecycle', field, current, expected },
   );
+}
+
+/** Mirrors the API's 400 validation_error for a request-body key it does not accept. */
+function rejectUnknownDemoKeys(input: object, operation: RequestBodyOperation, notInBody: readonly string[] = []) {
+  if (unknownRequestKeys(input, operation).some((key) => !notInBody.includes(key))) {
+    throw new OperationsApiError('Request validation failed', 400, 'validation_error');
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -1526,6 +1534,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'createOwner');
     const owner: Owner = {
       id: crypto.randomUUID(),
       organization_id: input.organizationId,
@@ -1568,6 +1577,7 @@ export const operationsApi = {
 
   async createProperty(input: CreatePropertyInput) {
     if (operationsApiMode === 'live') return request<Property>('/ops/properties', { method: 'POST', body: JSON.stringify(input) });
+    rejectUnknownDemoKeys(input, 'createProperty');
     // Mirrors enforce_property_creation_rules() (P-6, L-05): identified is the only creation stage.
     if (input.acquisitionStage !== undefined && input.acquisitionStage !== 'identified') {
       throw new Error(`A property can only be created in the identified stage (requested ${input.acquisitionStage})`);
@@ -1608,6 +1618,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Property>(`/ops/properties/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'updateProperty');
     const index = demoProperties.findIndex((property) => property.id === id);
     if (index < 0) throw new Error('Property not found');
     if (input.acquisitionStage !== undefined) {
@@ -1635,6 +1646,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Property>(`/ops/properties/${id}/stage-transitions`, { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'transitionPropertyStage');
     const index = demoProperties.findIndex((property) => property.id === id);
     if (index < 0 || !demoCanReadProperty(demoProperties[index])) throw new Error('Property not found');
     const previous = demoProperties[index];
@@ -1759,6 +1771,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/escalate`, { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'remediationStep');
     return demoMoveRemediation(propertyId, 'UNDER_REVIEW', 'REQUIRES_ESCALATION', 'escalated', input.reason, true);
   },
 
@@ -1770,6 +1783,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'remediationStep');
     return demoMoveRemediation(propertyId, 'REQUIRES_ESCALATION', 'UNDER_REVIEW', 'returned_to_review', input.reason, false);
   },
 
@@ -1778,6 +1792,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/resolve`, { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'resolveRemediation');
     const property = demoAuthorizeRemediation(propertyId);
     if (input.expectedStage !== property.acquisition_stage) {
       demoLifecycleConflict('acquisition_stage', property.acquisition_stage, input.expectedStage);
@@ -1832,6 +1847,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/reopen`, { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'remediationStep');
     const property = demoAuthorizeRemediation(propertyId);
     const previous = demoLatestRemediation(propertyId, 'RESOLVED');
     // The reason is optional (Q-5); a blank one is none.
@@ -1864,6 +1880,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Property>(`/ops/properties/${id}/status-transitions`, { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'transitionPropertyStatus');
     const index = demoProperties.findIndex((property) => property.id === id);
     if (index < 0 || !demoCanReadProperty(demoProperties[index])) throw new Error('Property not found');
     const previous = demoProperties[index];
@@ -1897,6 +1914,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request(`/ops/properties/${propertyId}/owners`, { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'linkPropertyOwner');
     const property = demoProperties.find((entry) => entry.id === propertyId);
     const owner = demoOwners.find((entry) => entry.id === input.ownerId);
     if (!property) throw new Error('Property not found');
@@ -1965,6 +1983,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Negotiation>('/ops/negotiations', { method: 'POST', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'createNegotiation');
     const property = demoProperties.find((entry) => entry.id === input.propertyId);
     if (!property) throw new Error('Property not found');
     if (property.organization_id !== input.organizationId) {
@@ -2026,6 +2045,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Negotiation>(`/ops/negotiations/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'updateNegotiation');
     const index = demoNegotiations.findIndex((entry) => entry.id === id);
     if (index < 0) throw new Error('Negotiation not found');
     const existing = demoNegotiations[index];
@@ -2093,6 +2113,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'createNegotiationEvent');
     const negotiation = demoNegotiations.find((entry) => entry.id === negotiationId);
     if (!negotiation) throw new Error('Negotiation not found');
     if (!demoCanWriteNegotiation(negotiation.assigned_negotiator_id)) {
@@ -2156,6 +2177,9 @@ export const operationsApi = {
     propertyId: string,
     input: { category: DocumentCategory; title: string; negotiationId?: string | null; file: File },
   ) {
+    // Checked in both modes, before any request: the live form below is built from
+    // fixed fields, so an unknown key would otherwise be dropped instead of refused.
+    rejectUnknownDemoKeys(input, 'uploadDocument', ['file']);
     const config = await operationsApi.getConfig();
     if (input.file.size > config.documentUpload.maxSizeBytes) {
       throw new Error(`File exceeds the maximum allowed size of ${config.documentUpload.maxSizeBytes} bytes`);
@@ -2224,6 +2248,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyDocument>(`/ops/documents/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'updateDocument');
     if (!demoCanWriteDocument()) throw new Error('You do not have permission for this operation');
     const index = demoDocuments.findIndex((entry) => entry.id === id);
     if (index < 0) throw new Error('Document not found');
@@ -2301,6 +2326,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'createTask');
     const property = demoProperties.find((entry) => entry.id === propertyId);
     if (!property) throw new Error('Property not found');
     const assignedUserId = input.assignedUserId ?? null;
@@ -2343,6 +2369,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyTask>(`/ops/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'updateTask');
     const index = demoTasks.findIndex((entry) => entry.id === id);
     if (index < 0) throw new Error('Task not found');
     const existing = demoTasks[index];
@@ -2413,6 +2440,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'createPayment');
     if (!demoCanWritePayment()) throw new Error('You do not have permission for this operation');
     if (!(input.amount > 0)) throw new Error('Payment amount must be greater than zero');
     const property = demoProperties.find((entry) => entry.id === propertyId);
@@ -2462,6 +2490,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyPayment>(`/ops/payments/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
     }
+    rejectUnknownDemoKeys(input, 'updatePayment');
     if (!demoCanWritePayment()) throw new Error('You do not have permission for this operation');
     if (input.amount !== undefined && !(input.amount > 0)) {
       throw new Error('Payment amount must be greater than zero');
@@ -2518,6 +2547,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'createAgreementSignature');
     if (!demoCanWriteAgreementSignature()) throw new Error('You do not have permission for this operation');
     if (!input.signedOn) throw new Error('A signed date is required');
     const property = demoProperties.find((entry) => entry.id === propertyId);
@@ -2602,6 +2632,7 @@ export const operationsApi = {
         body: JSON.stringify(input),
       });
     }
+    rejectUnknownDemoKeys(input, 'createInteraction');
     const property = demoProperties.find((entry) => entry.id === propertyId);
     if (!property) throw new Error('Property not found');
     if (!demoCanUseInteractions()) throw new Error('You do not have permission for this operation');
