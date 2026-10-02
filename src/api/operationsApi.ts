@@ -1,5 +1,5 @@
 import { organizationApi } from './organizationApi';
-import { unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
+import { unknownBigIntKeys, unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
 
 export type AcquisitionStage =
   | 'identified'
@@ -367,6 +367,20 @@ function demoLifecycleConflict(field: LifecycleConflictDetails['field'], current
     'lifecycle_conflict',
     { conflict: 'lifecycle', field, current, expected },
   );
+}
+
+/**
+ * The live JSON request body. An unknown key holding a BigInt cannot be serialized; it is
+ * refused with the API's 400 validation_error, as demo mode does, instead of a TypeError.
+ * Any other serialization failure is left unchanged.
+ */
+function jsonRequestBody(input: object, operation: RequestBodyOperation): string {
+  try {
+    return JSON.stringify(input);
+  } catch (error) {
+    if (unknownBigIntKeys(input, operation).length) throw new OperationsApiError('Request validation failed', 400, 'validation_error');
+    throw error;
+  }
 }
 
 /** Mirrors the API's 400 validation_error for a request-body key it does not accept. */
@@ -1531,7 +1545,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Owner>('/ops/owners', {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'createOwner'),
       });
     }
     rejectUnknownDemoKeys(input, 'createOwner');
@@ -1576,7 +1590,7 @@ export const operationsApi = {
   },
 
   async createProperty(input: CreatePropertyInput) {
-    if (operationsApiMode === 'live') return request<Property>('/ops/properties', { method: 'POST', body: JSON.stringify(input) });
+    if (operationsApiMode === 'live') return request<Property>('/ops/properties', { method: 'POST', body: jsonRequestBody(input, 'createProperty') });
     rejectUnknownDemoKeys(input, 'createProperty');
     // Mirrors enforce_property_creation_rules() (P-6, L-05): identified is the only creation stage.
     if (input.acquisitionStage !== undefined && input.acquisitionStage !== 'identified') {
@@ -1616,7 +1630,7 @@ export const operationsApi = {
 
   async updateProperty(id: string, input: Record<string, unknown>) {
     if (operationsApiMode === 'live') {
-      return request<Property>(`/ops/properties/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+      return request<Property>(`/ops/properties/${id}`, { method: 'PATCH', body: jsonRequestBody(input, 'updateProperty') });
     }
     rejectUnknownDemoKeys(input, 'updateProperty');
     const index = demoProperties.findIndex((property) => property.id === id);
@@ -1644,7 +1658,7 @@ export const operationsApi = {
     input: { targetStage: AcquisitionStage; expectedStage: AcquisitionStage; reason?: string | null; override?: boolean },
   ) {
     if (operationsApiMode === 'live') {
-      return request<Property>(`/ops/properties/${id}/stage-transitions`, { method: 'POST', body: JSON.stringify(input) });
+      return request<Property>(`/ops/properties/${id}/stage-transitions`, { method: 'POST', body: jsonRequestBody(input, 'transitionPropertyStage') });
     }
     rejectUnknownDemoKeys(input, 'transitionPropertyStage');
     const index = demoProperties.findIndex((property) => property.id === id);
@@ -1769,7 +1783,7 @@ export const operationsApi = {
   /** Mirrors escalate_property_stage_remediation(): insufficient evidence (R-8); the stage is kept. */
   async escalateRemediation(propertyId: string, input: { reason?: string | null }) {
     if (operationsApiMode === 'live') {
-      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/escalate`, { method: 'POST', body: JSON.stringify(input) });
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/escalate`, { method: 'POST', body: jsonRequestBody(input, 'remediationStep') });
     }
     rejectUnknownDemoKeys(input, 'remediationStep');
     return demoMoveRemediation(propertyId, 'UNDER_REVIEW', 'REQUIRES_ESCALATION', 'escalated', input.reason, true);
@@ -1780,7 +1794,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/return-to-review`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'remediationStep'),
       });
     }
     rejectUnknownDemoKeys(input, 'remediationStep');
@@ -1790,7 +1804,7 @@ export const operationsApi = {
   /** Mirrors resolve_property_stage_remediation(): reason and evidence (Q-1), references, and integrity (P-12). */
   async resolveRemediation(propertyId: string, input: ResolveRemediationInput) {
     if (operationsApiMode === 'live') {
-      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/resolve`, { method: 'POST', body: JSON.stringify(input) });
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/resolve`, { method: 'POST', body: jsonRequestBody(input, 'resolveRemediation') });
     }
     rejectUnknownDemoKeys(input, 'resolveRemediation');
     const property = demoAuthorizeRemediation(propertyId);
@@ -1845,7 +1859,7 @@ export const operationsApi = {
   /** Mirrors reopen_property_stage_remediation(): a new cycle; the resolved one is kept (R-7). */
   async reopenRemediation(propertyId: string, input: { reason?: string | null }) {
     if (operationsApiMode === 'live') {
-      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/reopen`, { method: 'POST', body: JSON.stringify(input) });
+      return request<PropertyRemediation>(`/ops/properties/${propertyId}/remediation/reopen`, { method: 'POST', body: jsonRequestBody(input, 'remediationStep') });
     }
     rejectUnknownDemoKeys(input, 'remediationStep');
     const property = demoAuthorizeRemediation(propertyId);
@@ -1878,7 +1892,7 @@ export const operationsApi = {
     input: { targetStatus: AcquisitionStatus; expectedStatus: AcquisitionStatus; reason?: string | null; override?: boolean },
   ) {
     if (operationsApiMode === 'live') {
-      return request<Property>(`/ops/properties/${id}/status-transitions`, { method: 'POST', body: JSON.stringify(input) });
+      return request<Property>(`/ops/properties/${id}/status-transitions`, { method: 'POST', body: jsonRequestBody(input, 'transitionPropertyStatus') });
     }
     rejectUnknownDemoKeys(input, 'transitionPropertyStatus');
     const index = demoProperties.findIndex((property) => property.id === id);
@@ -1912,7 +1926,7 @@ export const operationsApi = {
     input: { ownerId: string; ownershipPercent?: number | null; isPrimary?: boolean },
   ) {
     if (operationsApiMode === 'live') {
-      return request(`/ops/properties/${propertyId}/owners`, { method: 'POST', body: JSON.stringify(input) });
+      return request(`/ops/properties/${propertyId}/owners`, { method: 'POST', body: jsonRequestBody(input, 'linkPropertyOwner') });
     }
     rejectUnknownDemoKeys(input, 'linkPropertyOwner');
     const property = demoProperties.find((entry) => entry.id === propertyId);
@@ -1981,7 +1995,7 @@ export const operationsApi = {
     startedAt?: string;
   }) {
     if (operationsApiMode === 'live') {
-      return request<Negotiation>('/ops/negotiations', { method: 'POST', body: JSON.stringify(input) });
+      return request<Negotiation>('/ops/negotiations', { method: 'POST', body: jsonRequestBody(input, 'createNegotiation') });
     }
     rejectUnknownDemoKeys(input, 'createNegotiation');
     const property = demoProperties.find((entry) => entry.id === input.propertyId);
@@ -2043,7 +2057,7 @@ export const operationsApi = {
     },
   ) {
     if (operationsApiMode === 'live') {
-      return request<Negotiation>(`/ops/negotiations/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+      return request<Negotiation>(`/ops/negotiations/${id}`, { method: 'PATCH', body: jsonRequestBody(input, 'updateNegotiation') });
     }
     rejectUnknownDemoKeys(input, 'updateNegotiation');
     const index = demoNegotiations.findIndex((entry) => entry.id === id);
@@ -2110,7 +2124,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<NegotiationEvent>(`/ops/negotiations/${negotiationId}/events`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'createNegotiationEvent'),
       });
     }
     rejectUnknownDemoKeys(input, 'createNegotiationEvent');
@@ -2246,7 +2260,7 @@ export const operationsApi = {
     },
   ) {
     if (operationsApiMode === 'live') {
-      return request<PropertyDocument>(`/ops/documents/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+      return request<PropertyDocument>(`/ops/documents/${id}`, { method: 'PATCH', body: jsonRequestBody(input, 'updateDocument') });
     }
     rejectUnknownDemoKeys(input, 'updateDocument');
     if (!demoCanWriteDocument()) throw new Error('You do not have permission for this operation');
@@ -2323,7 +2337,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyTask>(`/ops/properties/${propertyId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'createTask'),
       });
     }
     rejectUnknownDemoKeys(input, 'createTask');
@@ -2367,7 +2381,7 @@ export const operationsApi = {
     },
   ) {
     if (operationsApiMode === 'live') {
-      return request<PropertyTask>(`/ops/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+      return request<PropertyTask>(`/ops/tasks/${id}`, { method: 'PATCH', body: jsonRequestBody(input, 'updateTask') });
     }
     rejectUnknownDemoKeys(input, 'updateTask');
     const index = demoTasks.findIndex((entry) => entry.id === id);
@@ -2437,7 +2451,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<PropertyPayment>(`/ops/properties/${propertyId}/payments`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'createPayment'),
       });
     }
     rejectUnknownDemoKeys(input, 'createPayment');
@@ -2488,7 +2502,7 @@ export const operationsApi = {
     },
   ) {
     if (operationsApiMode === 'live') {
-      return request<PropertyPayment>(`/ops/payments/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+      return request<PropertyPayment>(`/ops/payments/${id}`, { method: 'PATCH', body: jsonRequestBody(input, 'updatePayment') });
     }
     rejectUnknownDemoKeys(input, 'updatePayment');
     if (!demoCanWritePayment()) throw new Error('You do not have permission for this operation');
@@ -2544,7 +2558,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<AgreementSignature>(`/ops/properties/${propertyId}/agreement-signatures`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'createAgreementSignature'),
       });
     }
     rejectUnknownDemoKeys(input, 'createAgreementSignature');
@@ -2629,7 +2643,7 @@ export const operationsApi = {
     if (operationsApiMode === 'live') {
       return request<Interaction>(`/ops/properties/${propertyId}/interactions`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: jsonRequestBody(input, 'createInteraction'),
       });
     }
     rejectUnknownDemoKeys(input, 'createInteraction');

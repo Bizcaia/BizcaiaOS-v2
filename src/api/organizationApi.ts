@@ -1,4 +1,4 @@
-import { unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
+import { unknownBigIntKeys, unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
 
 export type OrganizationRole =
   | 'system_admin'
@@ -72,6 +72,20 @@ export class OrganizationApiError extends Error {
   ) {
     super(message);
     this.name = 'OrganizationApiError';
+  }
+}
+
+/**
+ * The live JSON request body. An unknown key holding a BigInt cannot be serialized; it is
+ * refused with the API's 400 validation_error, as demo mode does, instead of a TypeError.
+ * Any other serialization failure is left unchanged.
+ */
+function jsonRequestBody(input: object, operation: RequestBodyOperation): string {
+  try {
+    return JSON.stringify(input);
+  } catch (error) {
+    if (unknownBigIntKeys(input, operation).length) throw new OrganizationApiError('Request validation failed', 400, 'validation_error');
+    throw error;
   }
 }
 
@@ -167,7 +181,7 @@ export const organizationApi = {
   async onboardOrganization(input: { name: string; slug: string; timezone: string }) {
     if (organizationApiMode === 'live') {
       return request<{ organizationId: string; userId: string; role: OrganizationRole }>('/organizations/onboard', {
-        method: 'POST', body: JSON.stringify(input),
+        method: 'POST', body: jsonRequestBody(input, 'onboardOrganization'),
       });
     }
     rejectUnknownDemoKeys(input, 'onboardOrganization');
@@ -183,7 +197,7 @@ export const organizationApi = {
 
   async updateOrganization(organizationId: string, input: { name?: string; legalName?: string | null; timezone?: string }) {
     if (organizationApiMode === 'live') {
-      return request<Organization>(`/organizations/${organizationId}`, { method: 'PATCH', body: JSON.stringify(input) });
+      return request<Organization>(`/organizations/${organizationId}`, { method: 'PATCH', body: jsonRequestBody(input, 'updateOrganization') });
     }
     rejectUnknownDemoKeys(input, 'updateOrganization');
     await pause();
@@ -204,7 +218,7 @@ export const organizationApi = {
     if (organizationApiMode === 'live') {
       return request<{ organization_id: string; user_id: string; role: OrganizationRole; is_active: boolean }>(
         `/organizations/${organizationId}/members/${userId}`,
-        { method: 'PATCH', body: JSON.stringify(input) },
+        { method: 'PATCH', body: jsonRequestBody(input, 'updateMember') },
       );
     }
     rejectUnknownDemoKeys(input, 'updateMember');
@@ -232,7 +246,7 @@ export const organizationApi = {
   async createInvitation(organizationId: string, input: { email: string; role: Exclude<OrganizationRole, 'system_admin'>; expiresInHours?: number }) {
     if (organizationApiMode === 'live') {
       const payload = await requestEnvelope<Invitation>(`/organizations/${organizationId}/invitations`, {
-        method: 'POST', body: JSON.stringify(input),
+        method: 'POST', body: jsonRequestBody(input, 'createInvitation'),
       });
       return {
         ...payload.data!,
