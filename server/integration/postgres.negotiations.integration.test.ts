@@ -1,7 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
 import {
@@ -11,6 +8,7 @@ import {
   createAppPool,
   expectSqlError,
   insertPropertyFixture,
+  reapplyMigration,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -43,24 +41,7 @@ describe('PostgreSQL negotiations security', () => {
     // Re-apply 006 under the same advisory lock as migrate so concurrent suites
     // do not race CREATE OR REPLACE / GRANT, and so function text matches the repo
     // even when schema_migrations already recorded an earlier 006 revision.
-    const { default: pg } = await import('pg');
-    const admin = new pg.Client({ connectionString: requireDatabaseEnv().migrateUrl });
-    await admin.connect();
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      const sql = readFileSync(
-        join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', '006_negotiations_rls.sql'),
-        'utf8',
-      );
-      await admin.query(sql);
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-      await admin.end();
-    }
+    await reapplyMigration('006_negotiations_rls.sql', ['negotiations', 'negotiation_events']);
     const orgOne = await bootstrapOrg(
       pool,
       `Neg North ${suffix}`,

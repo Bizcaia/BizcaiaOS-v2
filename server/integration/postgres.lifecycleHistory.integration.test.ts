@@ -7,12 +7,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
 import { loadPropertyTimeline } from '../operationsRoutes.js';
 import {
+  LIFECYCLE_TABLES,
   addMember,
   asUser,
   bootstrapOrg,
   createAppPool,
   expectSqlError,
   insertPropertyFixture,
+  reapplyWithTableLocks,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -124,31 +126,13 @@ describe('PostgreSQL property lifecycle history', () => {
     await admin.connect();
     // Re-apply 012-014 under the migration advisory lock so function text always
     // matches the repo, and record that re-applying writes no history (no backfill).
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      // Take the strongest properties lock first (drop trigger needs it), then
-      // the history table (014 alters it), so re-applying never upgrades a lock
-      // or reverses a property write's lock order and cannot deadlock with
-      // parallel suites.
-      await admin.query('begin');
-      try {
-        await admin.query('lock table public.properties in access exclusive mode');
-        await admin.query('lock table public.property_lifecycle_history in access exclusive mode');
-        historyCountBeforeReapply = await historyCount();
-        await admin.query(migrationSql());
-        historyCountAfterReapply = await historyCount();
-        await admin.query('commit');
-      } catch (error) {
-        await admin.query('rollback');
-        throw error;
-      }
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-    }
+    // Every table the files alter is locked before the first statement (see
+    // runWithTableLocks), so re-applying cannot deadlock with parallel suites.
+    await reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
+      historyCountBeforeReapply = await historyCount();
+      await admin.query(migrationSql());
+      historyCountAfterReapply = await historyCount();
+    });
 
     const orgOne = await bootstrapOrg(pool, `Lh North ${suffix}`, `lh-north-${suffix}`, `auth0|lh-admin-a-${suffix}`, 'Lh Admin A', `lh-admin-a-${suffix}@example.com`);
     const orgTwo = await bootstrapOrg(pool, `Lh South ${suffix}`, `lh-south-${suffix}`, `auth0|lh-admin-b-${suffix}`, 'Lh Admin B', `lh-admin-b-${suffix}@example.com`);
