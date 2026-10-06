@@ -69,7 +69,7 @@ Operator: ______  Date (UTC): ______  Commit SHA: ______  Environment: staging
 
 | Check | State | Evidence |
 |---|---|---|
-| `001`–`019` applied, `019` exactly once (steps 7 to 8, POST-2) | NOT_VERIFIED | ______ |
+| `001`–`020` applied, `019` exactly once (steps 7 to 8, POST-2) | NOT_VERIFIED | ______ |
 | Second run applies 0 (steps 9 to 10) | NOT_VERIFIED | ______ |
 | `PUBLIC` execute revoked (POST-4) | NOT_VERIFIED | ______ |
 | `anon` privileges verified (POST-5) | NOT_VERIFIED | ______ |

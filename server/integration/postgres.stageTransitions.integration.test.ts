@@ -123,6 +123,7 @@ describe('PostgreSQL stage transitions (L-02)', () => {
         '016_property_creation_rules.sql',
         '017_legacy_stage_remediation.sql',
         '018_lifecycle_optimistic_concurrency.sql',
+        '020_property_risk_history.sql',
       ]) {
         await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
       }

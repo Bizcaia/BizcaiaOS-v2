@@ -85,7 +85,7 @@ describe('public function privilege boundary (migration 019)', () => {
           (row) => row.id,
         );
         expect(recorded).toEqual(MIGRATION_FILES);
-        expect(recorded.at(-1)).toBe('019_revoke_public_function_execute.sql');
+        expect(recorded[18]).toBe('019_revoke_public_function_execute.sql');
       });
     });
 

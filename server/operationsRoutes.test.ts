@@ -2846,6 +2846,44 @@ describe('property workflow API', () => {
     expect(timelineSql).not.toMatch(/\bi\.notes\b/);
   });
 
+  it('maps a risk history row into a risk_changed Timeline entry', async () => {
+    store.timelineRows = [
+      { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-9', kind: 'risk_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'risk', title: 'medium', secondary: 'high', event_ts: new Date('2026-09-21T03:00:00Z') },
+      { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-8', kind: 'risk_changed', basis: 'occurrence', code: 'risk', title: 'high', secondary: 'low', event_ts: new Date('2026-09-20T03:00:00Z') },
+    ];
+    await withApi(async (baseUrl) => {
+      const body = await (await getTimeline(baseUrl)).json();
+      expect(body.data).toEqual([
+        {
+          id: 'lifecycle:lh-9:risk_changed',
+          kind: 'risk_changed',
+          source_type: 'lifecycle',
+          source_id: 'lh-9',
+          occurred_at: '2026-09-21T03:00:00.000Z',
+          precision: 'timestamp',
+          basis: 'occurrence',
+          actor: { id: USER_ID, display_name: 'Test User' },
+          summary: 'Risk changed from Medium to High',
+          archived: false,
+        },
+        {
+          id: 'lifecycle:lh-8:risk_changed',
+          kind: 'risk_changed',
+          source_type: 'lifecycle',
+          source_id: 'lh-8',
+          occurred_at: '2026-09-20T03:00:00.000Z',
+          precision: 'timestamp',
+          basis: 'occurrence',
+          actor: null,
+          summary: 'Risk changed from High to Low',
+          archived: false,
+        },
+      ]);
+    });
+    const timelineSql = String(timelineQueryCalls()[0][0]);
+    expect(timelineSql).toContain("when 'acquisition_stage' then 'stage_changed' when 'acquisition_status' then 'status_changed' else 'risk_changed'");
+  });
+
   it('maps lifecycle history rows into stage and status Timeline entries without the reason', async () => {
     store.timelineRows = [
       { ...TIMELINE_ROW_BASE, source_type: 'lifecycle', source_id: 'lh-4', kind: 'status_changed', basis: 'occurrence', actor_id: USER_ID, actor_name: 'Test User', code: 'acquisition_status', title: 'active', secondary: 'on_hold', event_ts: new Date('2026-09-21T03:00:00Z') },

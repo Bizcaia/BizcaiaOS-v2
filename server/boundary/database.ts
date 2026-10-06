@@ -202,7 +202,7 @@ export const DATABASE_CHECKS = {
   'R1-DB-IDENTITY': 'Verification connection: read-only transaction and the role it connects as',
   'R1-DB-ROLES': 'Role attributes: bizcaiaos_app and bizcaiaos_migrator (no SUPERUSER, CREATEROLE, CREATEDB, BYPASSRLS)',
   'R1-DB-APP-MEMBERSHIP': 'Application role is not a member (any INHERIT/SET option, direct or nested) of the migration owner, an owner of BizcaiaOS objects, a SUPERUSER/BYPASSRLS role, or a privileged predefined role',
-  'R1-DB-MIGRATIONS': 'Migration history equals the registered chain (001..019), applied once each',
+  'R1-DB-MIGRATIONS': 'Migration history equals the registered chain (001..020), applied once each',
   'R1-DB-OWNER': 'The migration owner owns every BizcaiaOS relation and function in public',
   'R1-DB-APP-PRIVILEGES': 'Application role keeps what the API needs (CRUD, sequences, every function, RLS helpers) and nothing on schema_migrations',
   'R1-DB-PUBLIC': 'PUBLIC executes no BizcaiaOS function and holds no relation privilege (Migration 019)',

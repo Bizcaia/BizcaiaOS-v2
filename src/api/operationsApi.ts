@@ -225,7 +225,8 @@ export type TimelineKind =
   | 'agreement_signed'
   | 'interaction'
   | 'stage_changed'
-  | 'status_changed';
+  | 'status_changed'
+  | 'risk_changed';
 
 export type TimelineSourceType =
   | 'negotiation_event'
@@ -596,7 +597,7 @@ type DemoLifecycleHistory = {
   id: string;
   organization_id: string;
   property_id: string;
-  field: 'acquisition_stage' | 'acquisition_status';
+  field: 'acquisition_stage' | 'acquisition_status' | 'risk';
   from_value: string | null;
   to_value: string;
   reason: string | null;
@@ -640,7 +641,7 @@ function demoCanReadProperty(property: Property): boolean {
   return true;
 }
 
-/** Mirrors record_property_lifecycle_history(): initial values on create, each changed value on update. */
+/** Mirrors record_property_lifecycle_history(): initial stage and status on create; each changed stage, status and risk on update. */
 function recordDemoLifecycleHistory(
   previous: Property | null,
   next: Property,
@@ -667,6 +668,23 @@ function recordDemoLifecycleHistory(
       is_override: rules != null,
       overridden_rules: rules,
       remediation_id: previous && field === 'acquisition_stage' ? remediationId : null,
+    });
+  }
+  // A risk change carries no reason and is never an override; creation records no risk row.
+  if (previous && previous.risk !== next.risk) {
+    demoLifecycleHistory.push({
+      id: crypto.randomUUID(),
+      organization_id: next.organization_id,
+      property_id: next.id,
+      field: 'risk',
+      from_value: previous.risk,
+      to_value: next.risk,
+      reason: null,
+      actor_user_id: DEMO_ACTOR_ID,
+      changed_at: changedAt,
+      is_override: false,
+      overridden_rules: null,
+      remediation_id: null,
     });
   }
 }
@@ -963,6 +981,12 @@ const timelineStatusLabels: Record<string, string> = {
   complete: 'Complete',
 };
 
+const timelineRiskLabels: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+};
+
 function timelineLifecycleSummary(noun: string, labels: Record<string, string>, fromValue: string | null, toValue: string) {
   const to = labels[toValue] ?? toValue;
   // The reason recorded with a change is never part of the summary.
@@ -1135,6 +1159,19 @@ function demoPropertyTimeline(property: Property, timeZone: string, page: { limi
   // Lifecycle history is visible wherever the property is.
   for (const history of demoLifecycleHistory) {
     if (history.property_id !== property.id || !reached(history.changed_at)) continue;
+    if (history.field === 'risk') {
+      add({
+        kind: 'risk_changed',
+        source_type: 'lifecycle',
+        source_id: history.id,
+        occurred_at: new Date(history.changed_at).toISOString(),
+        precision: 'timestamp',
+        basis: 'occurrence',
+        actor: demoTimelineActor(history.actor_user_id),
+        summary: timelineLifecycleSummary('Risk', timelineRiskLabels, history.from_value, history.to_value),
+      });
+      continue;
+    }
     const isStage = history.field === 'acquisition_stage';
     add({
       kind: isStage ? 'stage_changed' : 'status_changed',

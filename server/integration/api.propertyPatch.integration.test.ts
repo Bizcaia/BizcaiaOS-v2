@@ -192,4 +192,40 @@ describe('property PATCH against real PostgreSQL', () => {
     expect((await patch(who, { readinessPercent: 99 })).status).toBe(404);
     expect(await stored()).toEqual(before);
   });
+
+  it('shows each risk change made through the API in the Timeline, with its actor, and nothing for an unchanged risk or another field', async () => {
+    type Entry = { kind: string; summary: string; actor: { id: string } | null };
+    const riskEntries = async (who: Who) => {
+      const response = await call(who, 'GET', `/ops/properties/${ids.property}/timeline?limit=200`);
+      expect(response.status).toBe(200);
+      return (response.body.data as Entry[]).filter((entry) => entry.kind === 'risk_changed');
+    };
+    await resetRisk('low');
+    const before = (await riskEntries('lam')).length;
+
+    expect((await patch('lam', { risk: 'high' })).status).toBe(200);
+    expect((await patch('sup', { risk: 'medium' })).status).toBe(200);
+    // Unchanged risk, another field, and roles that may not change risk record nothing.
+    expect((await patch('lam', { risk: 'medium' })).status).toBe(200);
+    expect((await patch('sup', { readinessPercent: 35 })).status).toBe(200);
+    expect((await patch('legal', { legalStatus: 'under_review' })).status).toBe(200);
+    expect((await patch('legal', { risk: 'low' })).status).toBe(403);
+    expect((await patch('finance', { risk: 'low' })).status).toBe(403);
+
+    const entries = await riskEntries('lam');
+    expect(entries).toHaveLength(before + 2);
+    // Newest first.
+    expect(entries.slice(0, 2).map((entry) => [entry.summary, entry.actor?.id])).toEqual([
+      ['Risk changed from High to Medium', ids.sup],
+      ['Risk changed from Low to High', ids.lam],
+    ]);
+    // Every role that can see the property sees the same risk entries; the creation risk (high) has none.
+    for (const who of ['adminA', 'sup', 'legal', 'finance'] as const) {
+      expect((await riskEntries(who)).map((entry) => entry.summary)).toEqual(entries.map((entry) => entry.summary));
+    }
+    expect(entries.some((entry) => entry.summary.startsWith('Risk set to'))).toBe(false);
+    for (const who of ['neg', 'adminB'] as const) {
+      expect((await call(who, 'GET', `/ops/properties/${ids.property}/timeline`)).status).toBe(404);
+    }
+  });
 });
