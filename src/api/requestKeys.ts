@@ -1,7 +1,8 @@
 /**
  * The API refuses an unknown top-level request-body key with 400
  * validation_error (issue code unrecognized_keys). The demo adapters apply the
- * same rule, so demo mode never accepts a body the live API refuses. Each list
+ * same rule to the body JSON.stringify would send (see unknownRequestKeys), so
+ * demo mode never accepts a body the live API refuses. Each list
  * mirrors the keys of the server's body schema; requestKeys.test.ts fails if
  * they drift apart.
  */
@@ -37,12 +38,63 @@ export type RequestBodyOperation = keyof typeof REQUEST_BODY_KEYS;
 
 /**
  * The top-level keys of a request body that the API does not accept for the operation.
- * A key whose value is undefined is not counted: JSON.stringify leaves it out of the
- * live request, so the API never sees it.
+ *
+ * Strictness follows the serialized JSON body, not the caller's object: a key counts
+ * only if JSON.stringify keeps it in the live request. A key whose value it leaves out
+ * (undefined, a function, a symbol, or a toJSON() that returns undefined) never reaches
+ * the API and is not counted; a value it keeps (including through toJSON()) is. A BigInt,
+ * primitive or wrapped as an object, cannot be serialized at all; it counts as present, so an unknown key holding one is
+ * refused with 400 validation_error in both modes (see jsonRequestBody in the adapters).
  */
 export function unknownRequestKeys(input: object, operation: RequestBodyOperation): string[] {
   const allowed: readonly string[] = REQUEST_BODY_KEYS[operation];
-  return Object.entries(input)
-    .filter(([key, value]) => !allowed.includes(key) && value !== undefined)
-    .map(([key]) => key);
+  const keys = serializedBodyKeys(input) ?? Object.keys(input).filter((key) => (input as Record<string, unknown>)[key] !== undefined);
+  return keys.filter((key) => !allowed.includes(key));
+}
+
+/** The unknown top-level keys whose value holds a BigInt, which makes JSON.stringify throw. */
+export function unknownBigIntKeys(input: object, operation: RequestBodyOperation): string[] {
+  const allowed: readonly string[] = REQUEST_BODY_KEYS[operation];
+  return Object.keys(input).filter((key) => !allowed.includes(key) && holdsBigInt(key, (input as Record<string, unknown>)[key]));
+}
+
+/** A BigInt, or a BigInt wrapper object such as Object(1n), which JSON.stringify unwraps and equally refuses. */
+function isBigInt(value: unknown): boolean {
+  if (typeof value === 'bigint') return true;
+  if (typeof value !== 'object' || value === null) return false;
+  try {
+    BigInt.prototype.valueOf.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const bigIntAsNull = (_key: string, value: unknown) => (isBigInt(value) ? null : value);
+
+/**
+ * The top-level keys of JSON.stringify(input), keeping a BigInt value (as null) instead
+ * of throwing. Null when serialization fails for another reason (for example a cycle);
+ * the caller then falls back to the object's own keys that hold a defined value.
+ */
+function serializedBodyKeys(input: object): string[] | null {
+  try {
+    const body: unknown = JSON.parse(JSON.stringify(input, bigIntAsNull) ?? 'null');
+    return body !== null && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body) : [];
+  } catch {
+    return null;
+  }
+}
+
+function holdsBigInt(key: string, value: unknown): boolean {
+  let found = false;
+  try {
+    JSON.stringify({ [key]: value }, (nestedKey, nested: unknown) => {
+      if (isBigInt(nested)) found = true;
+      return bigIntAsNull(nestedKey, nested);
+    });
+  } catch {
+    // Serialization fails for another reason; only a BigInt is normalized.
+  }
+  return found;
 }

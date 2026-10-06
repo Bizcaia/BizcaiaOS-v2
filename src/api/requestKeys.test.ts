@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as operationsSchemas from '../../server/operationsSchemas';
 import * as organizationSchemas from '../../server/schemas';
-import { REQUEST_BODY_KEYS, unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
+import { REQUEST_BODY_KEYS, unknownBigIntKeys, unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
 
 // The demo adapters refuse the same request-body keys the API refuses. These
 // lists must stay equal to the server schemas' keys.
@@ -201,7 +201,7 @@ describe('uploadDocument refuses unknown input keys in live and demo mode', () =
   });
 });
 
-describe('an unknown key whose value is undefined is ignored alike in live and demo mode', () => {
+describe('unknown keys follow the serialized JSON body alike in live and demo mode', () => {
   const apiBase = 'https://api.example.com/api/v1';
   const propertyId = '70000000-0000-4000-8000-000000000001';
   type Api = Record<string, (...args: unknown[]) => Promise<unknown>>;
@@ -342,5 +342,160 @@ describe('an unknown key whose value is undefined is ignored alike in live and d
 
     const file = new File(['deed'], 'deed.pdf', { type: 'application/pdf' });
     await expect(operationsApi.uploadDocument(propertyId, { category: 'title_deed', title: 'Deed', file, unexpectedKey: undefined } as never)).resolves.toMatchObject({ title: 'Deed', storage_provider: 'local' });
+  });
+
+  describe('values JSON leaves out or cannot serialize', () => {
+    const LEFT_OUT: Record<string, () => unknown> = {
+      function: () => () => 123,
+      symbol: () => Symbol('unexpected'),
+      'toJSON() returning undefined': () => ({ toJSON: () => undefined }),
+    };
+    const KEPT: Record<string, () => unknown> = {
+      'toJSON() returning a value': () => ({ toJSON: () => 'x' }),
+      'function with toJSON() returning a value': () => Object.assign(() => 123, { toJSON: () => 'x' }),
+    };
+    const refused = (api: string) => ({ rejected: [api === 'organization' ? 'OrganizationApiError' : 'OperationsApiError', 'Request validation failed', 400, 'validation_error'] });
+
+    it('counts a key only if serialization keeps it, and a BigInt as present', () => {
+      for (const make of Object.values(LEFT_OUT)) expect(unknownRequestKeys({ title: 'T', stauts: make() }, 'updateTask')).toEqual([]);
+      for (const make of Object.values(KEPT)) expect(unknownRequestKeys({ title: 'T', stauts: make() }, 'updateTask')).toEqual(['stauts']);
+      expect(unknownRequestKeys({ title: 'T', stauts: 123n }, 'updateTask')).toEqual(['stauts']);
+      expect(unknownRequestKeys({ title: 'T', stauts: { nested: 1n } }, 'updateTask')).toEqual(['stauts']);
+      expect(unknownBigIntKeys({ title: 1n, stauts: { nested: 1n }, other: 'x' }, 'updateTask')).toEqual(['stauts']);
+      // A BigInt wrapper object makes JSON.stringify throw exactly like the primitive.
+      for (const value of [Object(1n), { nested: Object(1n) }, [Object(1n)]]) {
+        expect(unknownRequestKeys({ title: 'T', stauts: value }, 'updateTask')).toEqual(['stauts']);
+        expect(unknownBigIntKeys({ title: Object(1n), stauts: value, other: {} }, 'updateTask')).toEqual(['stauts']);
+      }
+      // Known keys and nested free-form values are outside the rule.
+      expect(unknownRequestKeys({ title: () => 1, description: 1n }, 'updateTask')).toEqual([]);
+      expect(unknownRequestKeys({ metadata: { fn: () => 1, big: 1n, sym: Symbol('s') } }, 'updateProperty')).toEqual([]);
+      expect(unknownBigIntKeys({ metadata: { big: 1n } }, 'updateProperty')).toEqual([]);
+      // A body that cannot be serialized for another reason keeps the object rule.
+      const cyclic: Record<string, unknown> = {};
+      cyclic.self = cyclic;
+      expect(unknownRequestKeys({ title: 'T', stauts: cyclic }, 'updateTask')).toEqual(['stauts']);
+    });
+
+    it.each(OPERATIONS)('%s.%s: a value JSON leaves out is treated like an absent key in both modes', async (api, name, args, input) => {
+      for (const make of Object.values(LEFT_OUT)) {
+        const live = await loadLive();
+        const plain = await outcome(live.apis[api][name](...args, withFile(name, input)));
+        const extra = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(plain).toEqual({ resolved: JSON.stringify({ id: 'server-1' }) });
+        expect(extra).toEqual(plain);
+        expect(live.sent).toHaveLength(2);
+        expect(live.sent[1]).toEqual(live.sent[0]);
+        expect(JSON.stringify(live.sent)).not.toContain('unexpectedKey');
+
+        const demoPlain = await outcome((await loadDemo())[api][name](...args, withFile(name, input)));
+        const demoExtra = await outcome((await loadDemo())[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(demoExtra).toEqual(demoPlain);
+        expect(JSON.stringify(demoExtra)).not.toContain('validation_error');
+      }
+    });
+
+    it.each(OPERATIONS)('%s.%s: a value JSON keeps through toJSON() is still refused in both modes', async (api, name, args, input) => {
+      for (const make of Object.values(KEPT)) {
+        const live = await loadLive();
+        const liveResult = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        const demoResult = await outcome((await loadDemo())[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(liveResult).toEqual(refused(api));
+        expect(demoResult).toEqual(liveResult);
+        if (name === 'uploadDocument') expect(live.fetchMock).not.toHaveBeenCalled();
+        else expect(live.sent[0].body).toMatchObject({ unexpectedKey: 'x' });
+      }
+    });
+
+    it.each(OPERATIONS)('%s.%s: a BigInt under an unknown key is refused with 400 validation_error in both modes, before any request', async (api, name, args, input) => {
+      for (const value of [123n, { nested: 1n }]) {
+        const live = await loadLive();
+        const liveResult = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: value })));
+        const demoResult = await outcome((await loadDemo())[api][name](...args, withFile(name, { ...input, unexpectedKey: value })));
+        expect(liveResult).toEqual(refused(api));
+        expect(live.fetchMock).not.toHaveBeenCalled();
+        expect(demoResult).toEqual(liveResult);
+      }
+    });
+
+    // Everything a demo write through the adapter under test could change.
+    async function demoState(demo: Awaited<ReturnType<typeof loadDemo>>, api: 'operations' | 'organization') {
+      if (api === 'organization') {
+        const me = (await demo.organization.getMe()) as { organizations: { id: string }[] };
+        const organizationId = me.organizations[0].id;
+        return JSON.stringify([me, ...(await Promise.all([demo.organization.listMembers(organizationId), demo.organization.listInvitations(organizationId)]))]);
+      }
+      const { DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      const byOrganization = ['listProjects', 'listOwners', 'listProperties', 'listNegotiations'].map((list) => demo.operations[list](DEMO_ORGANIZATION_ID));
+      const byProperty = ['listDocuments', 'listTasks', 'listPayments', 'listInteractions', 'listPropertyOwners'].map((list) => demo.operations[list](propertyId));
+      return JSON.stringify(await Promise.all([...byOrganization, ...byProperty]));
+    }
+
+    it.each(OPERATIONS)('%s.%s: a BigInt wrapper object under an unknown key is refused like a BigInt in both modes, with no request and no demo write', async (api, name, args, input) => {
+      for (const make of [() => Object(1n) as unknown, () => ({ n: Object(1n) as unknown }), () => [Object(1n) as unknown]]) {
+        const live = await loadLive();
+        const liveResult = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(liveResult).toEqual(refused(api));
+        expect(live.fetchMock).not.toHaveBeenCalled();
+
+        const demo = await loadDemo();
+        const before = await demoState(demo, api);
+        const demoResult = await outcome(demo[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(demoResult).toEqual(liveResult);
+        expect(await demoState(demo, api)).toBe(before);
+      }
+    }, 20_000);
+
+    it('refuses a BigInt unknown key in demo writes without changing anything', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo().then(() => import('./operationsApi'));
+      const { organizationApi } = await import('./organizationApi');
+      const rejection = { status: 400, code: 'validation_error', message: 'Request validation failed' };
+
+      const property = await operationsApi.getProperty(propertyId);
+      await expect(operationsApi.updateProperty(propertyId, { risk: 'high', unexpectedKey: 1n })).rejects.toMatchObject(rejection);
+      expect(await operationsApi.getProperty(propertyId)).toEqual(property);
+
+      const properties = await operationsApi.listProperties(DEMO_ORGANIZATION_ID);
+      await expect(operationsApi.createProperty({ organizationId: DEMO_ORGANIZATION_ID, projectId: property.project_id, propertyReference: 'NCP-B1', unexpectedKey: 1n } as never)).rejects.toMatchObject(rejection);
+      expect(await operationsApi.listProperties(DEMO_ORGANIZATION_ID)).toEqual(properties);
+
+      const tasks = await operationsApi.listTasks(propertyId);
+      await expect(operationsApi.createTask(propertyId, { title: 'Call owner', unexpectedKey: 1n } as never)).rejects.toMatchObject(rejection);
+      expect(await operationsApi.listTasks(propertyId)).toEqual(tasks);
+
+      const documents = await operationsApi.listDocuments(propertyId);
+      const file = new File(['deed'], 'deed.pdf', { type: 'application/pdf' });
+      await expect(operationsApi.uploadDocument(propertyId, { category: 'title_deed', title: 'Deed', file, unexpectedKey: 1n } as never)).rejects.toMatchObject(rejection);
+      expect(await operationsApi.listDocuments(propertyId)).toEqual(documents);
+
+      const { organizations: [organization] } = await organizationApi.getMe();
+      const members = await organizationApi.listMembers(organization.id);
+      await expect(organizationApi.updateMember(organization.id, members[0].user_id, { isActive: false, unexpectedKey: 1n } as never)).rejects.toMatchObject(rejection);
+      expect(await organizationApi.listMembers(organization.id)).toEqual(members);
+    });
+
+    it('leaves known keys and nested free-form values as they were', async () => {
+      // A known key whose value JSON leaves out is simply not sent.
+      let live = await loadLive();
+      await live.apis.operations.updateTask('task-1', { title: () => 1, priority: 'high' });
+      expect(live.sent[0].body).toEqual({ priority: 'high' });
+      // A known key holding a BigInt still fails with the native TypeError, before any request.
+      live = await loadLive();
+      expect(await outcome(live.apis.operations.updateTask('task-1', { title: 'T', description: 1n }))).toEqual({ rejected: ['TypeError', expect.any(String), undefined, undefined] });
+      expect(live.fetchMock).not.toHaveBeenCalled();
+      live = await loadLive();
+      expect(await outcome(live.apis.operations.updateTask('task-1', { title: 'T', description: Object(1n) }))).toEqual({ rejected: ['TypeError', expect.any(String), undefined, undefined] });
+      expect(live.fetchMock).not.toHaveBeenCalled();
+      // Nested free-form values serialize as before, including a nested BigInt's TypeError.
+      live = await loadLive();
+      await live.apis.operations.updateProperty('id-1', { metadata: { keep: 1, fn: () => 1, sym: Symbol('s') } });
+      expect(live.sent[0].body).toEqual({ metadata: { keep: 1 } });
+      live = await loadLive();
+      expect(await outcome(live.apis.operations.updateProperty('id-1', { metadata: { big: 1n } }))).toEqual({ rejected: ['TypeError', expect.any(String), undefined, undefined] });
+      expect(live.fetchMock).not.toHaveBeenCalled();
+      // Demo still accepts and keeps nested free-form values.
+      const { operationsApi } = await loadDemo().then(() => import('./operationsApi'));
+      await expect(operationsApi.updateProperty(propertyId, { metadata: { keep: 1, fn: () => 1 } })).resolves.toMatchObject({ metadata: { keep: 1 } });
+    });
   });
 });
