@@ -1,7 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { PoolClient } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
@@ -11,6 +8,7 @@ import {
   bootstrapOrg,
   createAppPool,
   expectSqlError,
+  reapplyMigration,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -106,24 +104,7 @@ describe('PostgreSQL interactions security', () => {
     await runMigrations();
     // Re-apply 011 under the migration advisory lock so function text always
     // matches the repo even when schema_migrations already recorded it.
-    const { default: pg } = await import('pg');
-    const admin = new pg.Client({ connectionString: requireDatabaseEnv().migrateUrl });
-    await admin.connect();
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      const sql = readFileSync(
-        join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', '011_interactions.sql'),
-        'utf8',
-      );
-      await admin.query(sql);
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-      await admin.end();
-    }
+    await reapplyMigration('011_interactions.sql', ['interactions']);
 
     const orgOne = await bootstrapOrg(pool, `Int North ${suffix}`, `int-north-${suffix}`, `auth0|int-admin-a-${suffix}`, 'Int Admin A', `int-admin-a-${suffix}@example.com`);
     const orgTwo = await bootstrapOrg(pool, `Int South ${suffix}`, `int-south-${suffix}`, `auth0|int-admin-b-${suffix}`, 'Int Admin B', `int-admin-b-${suffix}@example.com`);

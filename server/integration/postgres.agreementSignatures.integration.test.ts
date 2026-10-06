@@ -1,7 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { PoolClient } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
@@ -12,6 +9,7 @@ import {
   createAppPool,
   expectSqlError,
   insertPropertyFixture,
+  reapplyMigration,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -103,24 +101,7 @@ describe('PostgreSQL agreement signatures security', () => {
     await runMigrations();
     // Re-apply 010 under the migration advisory lock so function text always
     // matches the repo even when schema_migrations already recorded it.
-    const { default: pg } = await import('pg');
-    const admin = new pg.Client({ connectionString: requireDatabaseEnv().migrateUrl });
-    await admin.connect();
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      const sql = readFileSync(
-        join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', '010_agreement_signatures.sql'),
-        'utf8',
-      );
-      await admin.query(sql);
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-      await admin.end();
-    }
+    await reapplyMigration('010_agreement_signatures.sql', ['agreement_signatures', 'property_owners', 'documents']);
 
     const orgOne = await bootstrapOrg(
       pool,
