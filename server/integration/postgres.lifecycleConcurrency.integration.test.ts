@@ -13,6 +13,7 @@ import {
   bootstrapOrg,
   createAppPool,
   insertPropertyFixture,
+  reapplyWithTableLocks,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -149,28 +150,13 @@ describe('PostgreSQL lifecycle concurrency and stale screens (L-07)', () => {
     admin = new pgModule.Client({ connectionString: requireDatabaseEnv().migrateUrl });
     await admin.connect();
     // Re-apply 018 under the migration advisory lock so function text always
-    // matches the repo; properties, then the history table, are locked first.
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      await admin.query('begin');
-      try {
-        await admin.query('lock table public.properties in access exclusive mode');
-        await admin.query('lock table public.property_lifecycle_history in access exclusive mode');
-        await admin.query(
-          readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', '018_lifecycle_optimistic_concurrency.sql'), 'utf8'),
-        );
-        await admin.query('commit');
-      } catch (error) {
-        await admin.query('rollback');
-        throw error;
-      }
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-    }
+    // matches the repo; properties and the history table are locked first (see
+    // runWithTableLocks).
+    await reapplyWithTableLocks(admin, ['properties', 'property_lifecycle_history'], async () => {
+      await admin.query(
+        readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', '018_lifecycle_optimistic_concurrency.sql'), 'utf8'),
+      );
+    });
 
     const org = await bootstrapOrg(pool, `Cc North ${suffix}`, `cc-north-${suffix}`, `auth0|cc-admin-${suffix}`, 'Cc Admin', `cc-admin-${suffix}@example.com`);
     orgA = org.organization_id;

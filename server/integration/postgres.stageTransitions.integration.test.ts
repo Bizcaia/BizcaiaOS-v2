@@ -7,12 +7,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
 import { loadPropertyTimeline } from '../operationsRoutes.js';
 import {
+  LIFECYCLE_TABLES,
   addMember,
   asUser,
   bootstrapOrg,
   createAppPool,
   expectSqlError,
   insertPropertyFixture,
+  reapplyWithTableLocks,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -110,38 +112,21 @@ describe('PostgreSQL stage transitions (L-02)', () => {
     await admin.connect();
     // Re-apply 013 and the later lifecycle migrations that redefine its objects
     // (014: the field-guard trigger; 015: the stage function) under the
-    // migration advisory lock so function text always matches the repo. The
-    // strongest properties lock (drop trigger needs it) is taken first, then the
-    // history table (014 alters it), so re-applying never upgrades a lock
-    // mid-transaction and cannot deadlock with parallel suites.
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      await admin.query('begin');
-      try {
-        await admin.query('lock table public.properties in access exclusive mode');
-        await admin.query('lock table public.property_lifecycle_history in access exclusive mode');
-        for (const file of [
-          '013_property_stage_transitions.sql',
-          '014_property_status_transitions.sql',
-          '015_lifecycle_negotiation_exception.sql',
-          '016_property_creation_rules.sql',
-          '017_legacy_stage_remediation.sql',
-          '018_lifecycle_optimistic_concurrency.sql',
-        ]) {
-          await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
-        }
-        await admin.query('commit');
-      } catch (error) {
-        await admin.query('rollback');
-        throw error;
+    // migration advisory lock so function text always matches the repo. Every
+    // table the files alter is locked before the first statement (see
+    // runWithTableLocks), so re-applying cannot deadlock with parallel suites.
+    await reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
+      for (const file of [
+        '013_property_stage_transitions.sql',
+        '014_property_status_transitions.sql',
+        '015_lifecycle_negotiation_exception.sql',
+        '016_property_creation_rules.sql',
+        '017_legacy_stage_remediation.sql',
+        '018_lifecycle_optimistic_concurrency.sql',
+      ]) {
+        await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
       }
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-    }
+    });
 
     const orgOne = await bootstrapOrg(pool, `St North ${suffix}`, `st-north-${suffix}`, `auth0|st-admin-a-${suffix}`, 'St Admin A', `st-admin-a-${suffix}@example.com`);
     const orgTwo = await bootstrapOrg(pool, `St South ${suffix}`, `st-south-${suffix}`, `auth0|st-admin-b-${suffix}`, 'St Admin B', `st-admin-b-${suffix}@example.com`);

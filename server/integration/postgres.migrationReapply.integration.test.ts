@@ -4,7 +4,17 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
-import { requireDatabaseEnv, runWithTableLocks } from './postgresHarness.js';
+import { LIFECYCLE_TABLES, reapplyWithTableLocks, requireDatabaseEnv, runWithTableLocks } from './postgresHarness.js';
+
+const LIFECYCLE_MIGRATIONS = [
+  '012_property_lifecycle_history.sql',
+  '013_property_stage_transitions.sql',
+  '014_property_status_transitions.sql',
+  '015_lifecycle_negotiation_exception.sql',
+  '016_property_creation_rules.sql',
+  '017_legacy_stage_remediation.sql',
+  '018_lifecycle_optimistic_concurrency.sql',
+];
 
 /**
  * The suites re-apply migration files while parallel suites use the same tables.
@@ -100,6 +110,54 @@ describe('PostgreSQL migration re-apply locking', () => {
         await other.query('rollback').catch(() => undefined);
         await other.end();
         await observer.end();
+      }
+    },
+    60_000,
+  );
+
+  // The lifecycle suites re-apply 012-018 through reapplyWithTableLocks. They used to lock
+  // properties and then the history table one after the other, and 017 alters both
+  // remediation tables after a share lock on each.
+  it.each([
+    // A history read takes the history table and then, through its row-security function, properties.
+    ['property_lifecycle_history', 'access share', 'properties', 'access share'],
+    // A transaction reads a remediation table and then writes to it; 017 takes a share lock (create index) and then upgrades it.
+    ['property_stage_remediations', 'access share', 'property_stage_remediations', 'row exclusive'],
+    // A transaction reads the remediation events and then a property; 017 alters the events table after properties is held.
+    ['property_stage_remediation_events', 'access share', 'properties', 'access share'],
+  ])(
+    're-applies the lifecycle migrations while a transaction holds %s (%s) and then asks for %s (%s)',
+    async (heldTable, heldMode, nextTable, nextMode) => {
+      const observer = await connect();
+      const other = await connect();
+      const admin = await connect();
+      try {
+        const pid = (await admin.query<{ pid: number }>('select pg_backend_pid() as pid')).rows[0].pid;
+        await other.query('begin');
+        await other.query(`lock table public.${heldTable} in ${heldMode} mode`);
+        // The whole chain, in order: later files redefine objects of earlier ones.
+        const settled = reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
+          for (const file of LIFECYCLE_MIGRATIONS) await admin.query(migrationSql(file));
+        }).then(
+          () => 'applied',
+          (error: Error) => error,
+        );
+        try {
+          await expect
+            .poll(() => strongLocks(observer, pid), { timeout: 10_000, interval: 25 })
+            .toEqual([{ relname: heldTable, mode: 'AccessExclusiveLock', granted: false }]);
+          await other.query(`lock table public.${nextTable} in ${nextMode} mode`);
+          await other.query('commit');
+          expect(await settled).toBe('applied');
+          expect(await strongLocks(observer, pid)).toEqual([]);
+        } finally {
+          // Let the re-apply finish before its session is closed, also when an expectation failed.
+          await other.query('rollback').catch(() => undefined);
+          await settled;
+        }
+      } finally {
+        await other.query('rollback').catch(() => undefined);
+        await Promise.all([other.end(), observer.end(), admin.end()]);
       }
     },
     60_000,

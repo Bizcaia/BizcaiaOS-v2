@@ -7,11 +7,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
 import { loadPropertyTimeline } from '../operationsRoutes.js';
 import {
+  LIFECYCLE_TABLES,
   addMember,
   asUser,
   bootstrapOrg,
   createAppPool,
   insertPropertyFixture,
+  reapplyWithTableLocks,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -173,33 +175,17 @@ describe('PostgreSQL lifecycle acceptance (L-08)', () => {
 
     // V12: the lifecycle migration chain (012-018), applied twice in order, in
     // one locked transaction: no failure, one signature per function, no data change.
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      await admin.query('begin');
-      try {
-        await admin.query('lock table public.properties in access exclusive mode');
-        await admin.query('lock table public.property_lifecycle_history in access exclusive mode');
-        const fingerprintBefore = await fingerprint();
-        const signaturesAfterEachPass: unknown[] = [];
-        for (let pass = 0; pass < 2; pass += 1) {
-          for (const file of LIFECYCLE_MIGRATIONS) {
-            await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
-          }
-          signaturesAfterEachPass.push(await signatures());
+    await reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
+      const fingerprintBefore = await fingerprint();
+      const signaturesAfterEachPass: unknown[] = [];
+      for (let pass = 0; pass < 2; pass += 1) {
+        for (const file of LIFECYCLE_MIGRATIONS) {
+          await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
         }
-        chainEvidence = { signaturesAfterEachPass, fingerprintBefore, fingerprintAfter: await fingerprint() };
-        await admin.query('commit');
-      } catch (error) {
-        await admin.query('rollback');
-        throw error;
+        signaturesAfterEachPass.push(await signatures());
       }
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-    }
+      chainEvidence = { signaturesAfterEachPass, fingerprintBefore, fingerprintAfter: await fingerprint() };
+    });
 
     // The client module in demo mode (no API base configured in tests).
     const clientPath = '../../src/api/operationsApi';

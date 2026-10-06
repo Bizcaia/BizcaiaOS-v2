@@ -40,7 +40,7 @@ export async function asUser<T>(
 }
 
 /**
- * Runs migration SQL in one transaction, holding ACCESS EXCLUSIVE on every table it
+ * Runs migration SQL, or a function that runs it, in one transaction, holding ACCESS EXCLUSIVE on every table it
  * alters before the first statement, so the re-apply cannot deadlock with the parallel
  * suites that read and write those tables.
  *
@@ -56,7 +56,11 @@ export async function asUser<T>(
  * a lock cannot be part of a deadlock. The migration must not take a strong lock on a
  * table outside `tables`; that is checked before commit.
  */
-export async function runWithTableLocks(admin: pg.Client, tables: readonly string[], sql: string): Promise<void> {
+export async function runWithTableLocks(
+  admin: pg.Client,
+  tables: readonly string[],
+  work: string | (() => Promise<unknown>),
+): Promise<void> {
   if (!tables.length || tables.some((table) => !/^[a-z_]+$/.test(table))) throw new Error('runWithTableLocks needs plain public table names');
   let order = [...tables];
   for (let attempt = 1; ; attempt += 1) {
@@ -76,7 +80,8 @@ export async function runWithTableLocks(admin: pg.Client, tables: readonly strin
     }
   }
   try {
-    await admin.query(sql);
+    if (typeof work === 'string') await admin.query(work);
+    else await work();
     const undeclared = await admin.query<{ relname: string }>(
       `select distinct c.relname
          from pg_locks l
@@ -96,6 +101,29 @@ export async function runWithTableLocks(admin: pg.Client, tables: readonly strin
   } catch (error) {
     await admin.query('rollback');
     throw error;
+  }
+}
+
+/** Every table the lifecycle migrations (012-018) alter: 012-016 the first two, 017 the last three. */
+export const LIFECYCLE_TABLES = ['properties', 'property_lifecycle_history', 'property_stage_remediations', 'property_stage_remediation_events'] as const;
+
+/**
+ * runWithTableLocks under the migration advisory lock, on a session the caller keeps. The
+ * lifecycle suites (012-018) use it: they used to lock properties and then wait for the
+ * history table while holding it, which deadlocked with a history read (that table first,
+ * then properties through its row-security function); 017 also alters both remediation
+ * tables, after a share lock on each.
+ */
+export async function reapplyWithTableLocks(admin: pg.Client, tables: readonly string[], work: () => Promise<unknown>): Promise<void> {
+  try {
+    await admin.query('select pg_advisory_lock(87236401)');
+    await runWithTableLocks(admin, tables, work);
+  } finally {
+    try {
+      await admin.query('select pg_advisory_unlock(87236401)');
+    } catch {
+      // ignore unlock failures after a fatal error
+    }
   }
 }
 

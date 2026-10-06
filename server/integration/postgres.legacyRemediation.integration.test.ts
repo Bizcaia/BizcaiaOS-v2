@@ -7,12 +7,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { runMigrations } from '../migrate.js';
 import { loadPropertyTimeline, loadRemediationQueue } from '../operationsRoutes.js';
 import {
+  LIFECYCLE_TABLES,
   addMember,
   asUser,
   bootstrapOrg,
   createAppPool,
   expectSqlError,
   insertPropertyFixture,
+  reapplyWithTableLocks,
   requireDatabaseEnv,
   syncUser,
 } from './postgresHarness.js';
@@ -175,31 +177,15 @@ describe('PostgreSQL legacy stage remediation (L-06)', () => {
     admin = new pgModule.Client({ connectionString: requireDatabaseEnv().migrateUrl });
     await admin.connect();
     // Re-apply 017 under the migration advisory lock so function text always
-    // matches the repo. properties, then the history table (017 alters it), are
-    // locked first, so re-applying never upgrades a lock mid-transaction and
-    // cannot deadlock with parallel suites.
-    try {
-      await admin.query('select pg_advisory_lock(87236401)');
-      await admin.query('begin');
-      try {
-        await admin.query('lock table public.properties in access exclusive mode');
-        await admin.query('lock table public.property_lifecycle_history in access exclusive mode');
-        // 017 and 018, which replaces 017's resolve function (L-07).
-        for (const file of ['017_legacy_stage_remediation.sql', '018_lifecycle_optimistic_concurrency.sql']) {
-          await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
-        }
-        await admin.query('commit');
-      } catch (error) {
-        await admin.query('rollback');
-        throw error;
+    // matches the repo. Every table it alters is locked before its first
+    // statement (see runWithTableLocks), so re-applying cannot deadlock with
+    // parallel suites.
+    await reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
+      // 017 and 018, which replaces 017's resolve function (L-07).
+      for (const file of ['017_legacy_stage_remediation.sql', '018_lifecycle_optimistic_concurrency.sql']) {
+        await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
       }
-    } finally {
-      try {
-        await admin.query('select pg_advisory_unlock(87236401)');
-      } catch {
-        // ignore unlock failures after a fatal error
-      }
-    }
+    });
 
     const orgOne = await bootstrapOrg(pool, `Lr North ${suffix}`, `lr-north-${suffix}`, `auth0|lr-admin-a-${suffix}`, 'Lr Admin A', `lr-admin-a-${suffix}@example.com`);
     const orgTwo = await bootstrapOrg(pool, `Lr South ${suffix}`, `lr-south-${suffix}`, `auth0|lr-admin-b-${suffix}`, 'Lr Admin B', `lr-admin-b-${suffix}@example.com`);
