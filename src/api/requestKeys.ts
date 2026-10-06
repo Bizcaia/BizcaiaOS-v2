@@ -42,8 +42,8 @@ export type RequestBodyOperation = keyof typeof REQUEST_BODY_KEYS;
  * Strictness follows the serialized JSON body, not the caller's object: a key counts
  * only if JSON.stringify keeps it in the live request. A key whose value it leaves out
  * (undefined, a function, a symbol, or a toJSON() that returns undefined) never reaches
- * the API and is not counted; a value it keeps (including through toJSON()) is. A BigInt
- * cannot be serialized at all; it counts as present, so an unknown key holding one is
+ * the API and is not counted; a value it keeps (including through toJSON()) is. A BigInt,
+ * primitive or wrapped as an object, cannot be serialized at all; it counts as present, so an unknown key holding one is
  * refused with 400 validation_error in both modes (see jsonRequestBody in the adapters).
  */
 export function unknownRequestKeys(input: object, operation: RequestBodyOperation): string[] {
@@ -58,7 +58,19 @@ export function unknownBigIntKeys(input: object, operation: RequestBodyOperation
   return Object.keys(input).filter((key) => !allowed.includes(key) && holdsBigInt(key, (input as Record<string, unknown>)[key]));
 }
 
-const bigIntAsNull = (_key: string, value: unknown) => (typeof value === 'bigint' ? null : value);
+/** A BigInt, or a BigInt wrapper object such as Object(1n), which JSON.stringify unwraps and equally refuses. */
+function isBigInt(value: unknown): boolean {
+  if (typeof value === 'bigint') return true;
+  if (typeof value !== 'object' || value === null) return false;
+  try {
+    BigInt.prototype.valueOf.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const bigIntAsNull = (_key: string, value: unknown) => (isBigInt(value) ? null : value);
 
 /**
  * The top-level keys of JSON.stringify(input), keeping a BigInt value (as null) instead
@@ -78,7 +90,7 @@ function holdsBigInt(key: string, value: unknown): boolean {
   let found = false;
   try {
     JSON.stringify({ [key]: value }, (nestedKey, nested: unknown) => {
-      if (typeof nested === 'bigint') found = true;
+      if (isBigInt(nested)) found = true;
       return bigIntAsNull(nestedKey, nested);
     });
   } catch {

@@ -362,6 +362,11 @@ describe('unknown keys follow the serialized JSON body alike in live and demo mo
       expect(unknownRequestKeys({ title: 'T', stauts: 123n }, 'updateTask')).toEqual(['stauts']);
       expect(unknownRequestKeys({ title: 'T', stauts: { nested: 1n } }, 'updateTask')).toEqual(['stauts']);
       expect(unknownBigIntKeys({ title: 1n, stauts: { nested: 1n }, other: 'x' }, 'updateTask')).toEqual(['stauts']);
+      // A BigInt wrapper object makes JSON.stringify throw exactly like the primitive.
+      for (const value of [Object(1n), { nested: Object(1n) }, [Object(1n)]]) {
+        expect(unknownRequestKeys({ title: 'T', stauts: value }, 'updateTask')).toEqual(['stauts']);
+        expect(unknownBigIntKeys({ title: Object(1n), stauts: value, other: {} }, 'updateTask')).toEqual(['stauts']);
+      }
       // Known keys and nested free-form values are outside the rule.
       expect(unknownRequestKeys({ title: () => 1, description: 1n }, 'updateTask')).toEqual([]);
       expect(unknownRequestKeys({ metadata: { fn: () => 1, big: 1n, sym: Symbol('s') } }, 'updateProperty')).toEqual([]);
@@ -413,6 +418,34 @@ describe('unknown keys follow the serialized JSON body alike in live and demo mo
       }
     });
 
+    // Everything a demo write through the adapter under test could change.
+    async function demoState(demo: Awaited<ReturnType<typeof loadDemo>>, api: 'operations' | 'organization') {
+      if (api === 'organization') {
+        const me = (await demo.organization.getMe()) as { organizations: { id: string }[] };
+        const organizationId = me.organizations[0].id;
+        return JSON.stringify([me, ...(await Promise.all([demo.organization.listMembers(organizationId), demo.organization.listInvitations(organizationId)]))]);
+      }
+      const { DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      const byOrganization = ['listProjects', 'listOwners', 'listProperties', 'listNegotiations'].map((list) => demo.operations[list](DEMO_ORGANIZATION_ID));
+      const byProperty = ['listDocuments', 'listTasks', 'listPayments', 'listInteractions', 'listPropertyOwners'].map((list) => demo.operations[list](propertyId));
+      return JSON.stringify(await Promise.all([...byOrganization, ...byProperty]));
+    }
+
+    it.each(OPERATIONS)('%s.%s: a BigInt wrapper object under an unknown key is refused like a BigInt in both modes, with no request and no demo write', async (api, name, args, input) => {
+      for (const make of [() => Object(1n) as unknown, () => ({ n: Object(1n) as unknown }), () => [Object(1n) as unknown]]) {
+        const live = await loadLive();
+        const liveResult = await outcome(live.apis[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(liveResult).toEqual(refused(api));
+        expect(live.fetchMock).not.toHaveBeenCalled();
+
+        const demo = await loadDemo();
+        const before = await demoState(demo, api);
+        const demoResult = await outcome(demo[api][name](...args, withFile(name, { ...input, unexpectedKey: make() })));
+        expect(demoResult).toEqual(liveResult);
+        expect(await demoState(demo, api)).toBe(before);
+      }
+    }, 20_000);
+
     it('refuses a BigInt unknown key in demo writes without changing anything', async () => {
       const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo().then(() => import('./operationsApi'));
       const { organizationApi } = await import('./organizationApi');
@@ -449,6 +482,9 @@ describe('unknown keys follow the serialized JSON body alike in live and demo mo
       // A known key holding a BigInt still fails with the native TypeError, before any request.
       live = await loadLive();
       expect(await outcome(live.apis.operations.updateTask('task-1', { title: 'T', description: 1n }))).toEqual({ rejected: ['TypeError', expect.any(String), undefined, undefined] });
+      expect(live.fetchMock).not.toHaveBeenCalled();
+      live = await loadLive();
+      expect(await outcome(live.apis.operations.updateTask('task-1', { title: 'T', description: Object(1n) }))).toEqual({ rejected: ['TypeError', expect.any(String), undefined, undefined] });
       expect(live.fetchMock).not.toHaveBeenCalled();
       // Nested free-form values serialize as before, including a nested BigInt's TypeError.
       live = await loadLive();
