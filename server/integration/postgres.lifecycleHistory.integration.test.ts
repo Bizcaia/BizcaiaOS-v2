@@ -61,6 +61,7 @@ describe('PostgreSQL property lifecycle history', () => {
       '016_property_creation_rules.sql',
       '017_legacy_stage_remediation.sql',
       '018_lifecycle_optimistic_concurrency.sql',
+      '020_property_risk_history.sql',
     ]
       .map((file) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'))
       .join('\n');
@@ -215,7 +216,7 @@ describe('PostgreSQL property lifecycle history', () => {
 
     it('records nothing for readiness, other fields, or an unchanged stage and status', async () => {
       const property = await createProperty('LH-NOCHANGE');
-      await updateProperty(lamA, property, `readiness_percent = 55, risk = 'high', municipality = 'Calamba'`);
+      await updateProperty(lamA, property, `readiness_percent = 55, municipality = 'Calamba'`);
       await updateProperty(supervisorScoped, property, `readiness_percent = 60`);
       await updateProperty(lamA, property, `acquisition_stage = acquisition_stage, acquisition_status = 'active'`);
       expect(await history(property)).toHaveLength(2);
@@ -268,6 +269,135 @@ describe('PostgreSQL property lifecycle history', () => {
         const current = await admin.query('select acquisition_stage, acquisition_status from public.properties where id = $1', [property]);
         expect(current.rows[0]).toEqual({ acquisition_stage: legacy, acquisition_status: 'active' });
       }
+    });
+  });
+
+  describe('risk history', () => {
+    const riskRows = async (propertyId: string) => (await history(propertyId)).filter((row) => row.field === 'risk');
+    const currentRisk = async (propertyId: string) =>
+      (await admin.query<{ risk: string }>('select risk from public.properties where id = $1', [propertyId])).rows[0].risk;
+
+    it('records no risk row when a property is created, whatever its initial risk', async () => {
+      const property = await createProperty('LH-RISK-NEW');
+      expect(await riskRows(property)).toEqual([]);
+      const createdHigh = await asUser(pool, lamA, async (client) =>
+        (
+          await client.query<{ id: string }>(
+            `insert into public.properties (organization_id, project_id, property_reference, risk) values ($1, $2, $3, 'high') returning id`,
+            [orgA, projectA, `LH-RISK-HIGH-${suffix}`],
+          )
+        ).rows[0].id,
+      );
+      expect(await currentRisk(createdHigh)).toBe('high');
+      expect(await history(createdHigh)).toHaveLength(2);
+      expect(await riskRows(createdHigh)).toEqual([]);
+    });
+
+    it('records each actual change with the previous and new level, the actor and the time, and nothing else', async () => {
+      const property = await createProperty('LH-RISK-CHANGE');
+      const before = Date.now();
+      await updateProperty(lamA, property, `risk = 'high'`);
+      await updateProperty(supervisorScoped, property, `risk = 'low'`);
+      expect(await riskRows(property)).toEqual([
+        { organization_id: orgA, property_id: property, field: 'risk', from_value: 'medium', to_value: 'high', reason: null, actor_user_id: lamA },
+        { organization_id: orgA, property_id: property, field: 'risk', from_value: 'high', to_value: 'low', reason: null, actor_user_id: supervisorScoped },
+      ]);
+      const extra = await admin.query<{ is_override: boolean; overridden_rules: string[] | null; remediation_id: string | null; changed_at: Date }>(
+        `select is_override, overridden_rules, remediation_id, changed_at from public.property_lifecycle_history where property_id = $1 and field = 'risk'`,
+        [property],
+      );
+      expect(extra.rows).toHaveLength(2);
+      for (const row of extra.rows) {
+        expect(row).toMatchObject({ is_override: false, overridden_rules: null, remediation_id: null });
+        expect(row.changed_at.getTime()).toBeGreaterThanOrEqual(before - 5000);
+        expect(row.changed_at.getTime()).toBeLessThanOrEqual(Date.now() + 5000);
+      }
+      // Stage and status history is untouched by a risk change.
+      expect(await history(property)).toHaveLength(4);
+    });
+
+    it('records nothing when risk is written with its current value or only other fields change', async () => {
+      const property = await createProperty('LH-RISK-SAME');
+      await updateProperty(lamA, property, `risk = 'medium'`);
+      await updateProperty(lamA, property, `risk = risk, readiness_percent = 40, municipality = 'Calamba'`);
+      await updateProperty(supervisorScoped, property, `readiness_percent = 45`);
+      expect(await history(property)).toHaveLength(2);
+    });
+
+    it('never stores a reason or override with a risk change, even beside a lifecycle change in the same transaction', async () => {
+      const property = await createProperty('LH-RISK-REASON');
+      await updateProperty(lamA, property, `risk = 'high'`, 'A reason set for the transaction');
+      await asUser(pool, lamA, async (client) => {
+        await client.query('select * from public.transition_property_status($1, $2, $3)', [property, 'on_hold', 'Owner travelling until March']);
+        await client.query(`update public.properties set risk = 'low' where id = $1`, [property]);
+      });
+      expect((await history(property)).slice(2).map((row) => [row.field, row.from_value, row.to_value, row.reason]).sort()).toEqual([
+        ['acquisition_status', 'active', 'on_hold', 'Owner travelling until March'],
+        ['risk', 'high', 'low', null],
+        ['risk', 'medium', 'high', null],
+      ]);
+    });
+
+    it.each([
+      ['legal_documentation', () => legalA],
+      ['finance', () => financeA],
+    ])('records nothing when %s, who may not change risk, tries to', async (_label, actor) => {
+      const property = await createProperty(`LH-RISK-DENY-${randomUUID().slice(0, 4)}`);
+      await expectSqlError(() => updateProperty(actor(), property, `risk = 'high'`), '42501');
+      expect(await currentRisk(property)).toBe('medium');
+      expect(await riskRows(property)).toEqual([]);
+    });
+
+    it('records nothing when a viewer or a user outside the property tries to change risk', async () => {
+      const property = await createProperty('LH-RISK-OUTSIDE');
+      for (const actor of [viewerA, supervisorOther, negotiatorOther, adminB]) {
+        await updateProperty(actor, property, `risk = 'high'`).catch(() => undefined);
+      }
+      expect(await currentRisk(property)).toBe('medium');
+      expect(await riskRows(property)).toEqual([]);
+    });
+
+    it('keeps a risk row immutable and visible exactly where the property is', async () => {
+      const property = await createProperty('LH-RISK-KEEP');
+      await updateProperty(lamA, property, `risk = 'high'`);
+      for (const actor of [adminA, lamA, supervisorScoped]) {
+        expect(await asUser(pool, actor, async (client) =>
+          (await client.query(`update public.property_lifecycle_history set to_value = 'low' where property_id = $1 and field = 'risk'`, [property])).rowCount,
+        )).toBe(0);
+        expect(await asUser(pool, actor, async (client) =>
+          (await client.query(`delete from public.property_lifecycle_history where property_id = $1 and field = 'risk'`, [property])).rowCount,
+        )).toBe(0);
+      }
+      await expectSqlError(() => admin.query(`update public.property_lifecycle_history set to_value = 'low' where property_id = $1 and field = 'risk'`, [property]), '42501');
+      await expectSqlError(() => admin.query(`delete from public.property_lifecycle_history where property_id = $1 and field = 'risk'`, [property]), '42501');
+      expect((await riskRows(property)).map((row) => [row.from_value, row.to_value])).toEqual([['medium', 'high']]);
+
+      for (const actor of [adminA, lamA, supervisorScoped, negotiatorAssigned, legalA, financeA, viewerA]) {
+        expect(await visibleHistory(actor, property)).toBe(3);
+      }
+      for (const actor of [supervisorOther, negotiatorOther, adminB]) {
+        expect(await visibleHistory(actor, property)).toBe(0);
+      }
+    });
+
+    it('accepts risk as a history field and still rejects other fields and unchanged values', async () => {
+      const property = await createProperty('LH-RISK-CHECK');
+      await expectSqlError(
+        () =>
+          admin.query(
+            `insert into public.property_lifecycle_history (organization_id, property_id, field, from_value, to_value) values ($1, $2, 'risk', 'high', 'high')`,
+            [orgA, property],
+          ),
+        '23514',
+      );
+      await expectSqlError(
+        () =>
+          admin.query(
+            `insert into public.property_lifecycle_history (organization_id, property_id, field, to_value) values ($1, $2, 'legal_status', 'blocked')`,
+            [orgA, property],
+          ),
+        '23514',
+      );
     });
   });
 
@@ -383,6 +513,31 @@ describe('PostgreSQL property lifecycle history', () => {
       const expected = entries.map((entry) => entry.id);
       for (const actor of [lamA, supervisorScoped, negotiatorAssigned, legalA, financeA, viewerA]) {
         expect((await timeline(actor, property)).map((entry) => entry.id)).toEqual(expected);
+      }
+    });
+
+    it('shows a risk change as a risk_changed entry to every property-visible role, and no entry for the initial risk', async () => {
+      const property = await createProperty('LH-TL-RISK');
+      await updateProperty(lamA, property, `risk = 'high'`);
+      await updateProperty(supervisorScoped, property, `risk = 'low'`);
+
+      const entries = await timeline(adminA, property);
+      const risk = entries.filter((entry) => entry.kind === 'risk_changed');
+      // Newest first.
+      expect(risk.map((entry) => [entry.summary, entry.actor?.id])).toEqual([
+        ['Risk changed from High to Low', supervisorScoped],
+        ['Risk changed from Medium to High', lamA],
+      ]);
+      expect(risk.every((entry) => entry.source_type === 'lifecycle' && entry.basis === 'occurrence' && entry.precision === 'timestamp')).toBe(true);
+      expect(entries.map((entry) => entry.summary).filter((summary) => summary.startsWith('Risk'))).toHaveLength(2);
+      expect(entries).toHaveLength(4);
+
+      const expected = entries.map((entry) => entry.id);
+      for (const actor of [lamA, supervisorScoped, negotiatorAssigned, legalA, financeA, viewerA]) {
+        expect((await timeline(actor, property)).map((entry) => entry.id)).toEqual(expected);
+      }
+      for (const actor of [supervisorOther, negotiatorOther, adminB]) {
+        await expect(timeline(actor, property)).rejects.toMatchObject({ status: 404 });
       }
     });
   });

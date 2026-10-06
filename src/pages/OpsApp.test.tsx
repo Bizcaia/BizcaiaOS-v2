@@ -683,6 +683,19 @@ describe('OpsApp property workflow', () => {
     expect(await screen.findByText('Acquisition status changed from Active to On hold')).toBeVisible();
   });
 
+  it('shows a risk change in the Timeline after it is saved from the drawer', async () => {
+    const { user, propertyId } = await openProperty118();
+    expect(screen.queryByText(/^Risk changed/)).not.toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText('Risk'), 'high');
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+    // Saving closes the drawer; the Timeline shows the change when the property is opened again.
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Timeline' })).not.toBeInTheDocument());
+    await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
+    const timeline = (await screen.findByRole('heading', { name: 'Timeline' })).closest('section')!;
+    expect(await within(timeline).findByText('Risk changed from Low to High')).toBeVisible();
+    expect((await operationsApi.getPropertyTimeline(propertyId)).filter((entry) => entry.kind === 'risk_changed')).toHaveLength(1);
+  });
+
   it('shows a stale-screen conflict with the current and stale values, reloads, and records nothing from the stale attempt', async () => {
     const { user, lifecycle, propertyId } = await openProperty118();
     // Another user moves the property after this screen was loaded.

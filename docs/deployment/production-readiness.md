@@ -5,7 +5,7 @@ exists yet**, and nothing below claims one does. This guide records the
 accepted architecture and the configuration contract, so that moving to
 staging and production later means supplying configuration and provisioning
 infrastructure (each separately authorized), not redesigning the
-application. The same code and the same migration history (`001`–`019`) run
+application. The same code and the same migration history (`001`–`020`) run
 in every environment; only the configuration differs.
 
 ## Accepted architecture
@@ -324,7 +324,7 @@ After the first staging migration, verify the following. The
 items 1–8 in one read-only run:
 
 1. `select current_user` on `DATABASE_MIGRATE_URL` is `bizcaiaos_migrator`.
-2. `schema_migrations` holds `001`–`019`, `019` exactly once.
+2. `schema_migrations` holds `001`–`020`, `019` exactly once.
 3. `PUBLIC` cannot execute any non-extension function in `public`;
    `bizcaiaos_app` can execute all of them.
 4. `anon` and `authenticated` hold no table (including `schema_migrations`),
@@ -604,7 +604,7 @@ retention · Auth: email provider on, "Allow new users to sign up" off,
 anonymous and phone off, asymmetric JWT signing keys, Site URL and redirect
 allowlist · Data API off · roles `bizcaiaos_migrator` and `bizcaiaos_app` ·
 migration connection · `npm run config:check -- --scope migration` ·
-migrations `001`–`019` twice · `npm run db:verify-boundary` and the
+migrations `001`–`020` twice · `npm run db:verify-boundary` and the
 verification list above · sign-in smoke test with the Data API off.
 
 **Render** (per environment): Static Site · Web Service (one instance, paid

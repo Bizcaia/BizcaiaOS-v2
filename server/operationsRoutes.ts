@@ -1513,7 +1513,8 @@ export type TimelineKind =
   | 'agreement_signed'
   | 'interaction'
   | 'stage_changed'
-  | 'status_changed';
+  | 'status_changed'
+  | 'risk_changed';
 
 export type TimelineEntry = {
   id: string;
@@ -1624,6 +1625,12 @@ const timelineStatusLabels: Record<string, string> = {
   complete: 'Complete',
 };
 
+const timelineRiskLabels: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+};
+
 function timelineLifecycleSummary(noun: string, labels: Record<string, string>, fromValue: string | null, toValue: string | null) {
   const to = labels[toValue ?? ''] ?? toValue ?? '';
   // The reason recorded with a change is never part of the summary.
@@ -1676,6 +1683,8 @@ function timelineSummary(row: TimelineRow): string {
       // A legacy remediation is shown as such; its reason and evidence stay out of the summary.
       return row.status === 'remediation' ? `${summary} (legacy remediation)` : summary;
     }
+    case 'risk_changed':
+      return timelineLifecycleSummary('Risk', timelineRiskLabels, row.title, row.secondary);
   }
 }
 
@@ -1697,7 +1706,7 @@ export function toTimelineEntry(row: TimelineRow): TimelineEntry {
 
 // One branch per entry kind. Tie ranks: negotiation_event 1, negotiation 2,
 // document 3, task 4, payment 5, agreement_signature 6, interaction 7,
-// lifecycle 8 (stage and status history, visible wherever the property is).
+// lifecycle 8 (stage, status and risk history, visible wherever the property is).
 // Timestamps are eligible once reached; dates once reached in the
 // organization's timezone ($3). Date-only entries sort at the end of their
 // calendar day and are never given a time. Each table's own RLS still applies
@@ -1754,7 +1763,7 @@ const timelineSql = `
      where i.property_id = $1 and i.archived_at is null and i.occurred_at <= now()
     union all
     select 'lifecycle', 8, h.id::text,
-           case when h.field = 'acquisition_stage' then 'stage_changed' else 'status_changed' end,
+           case h.field when 'acquisition_stage' then 'stage_changed' when 'acquisition_status' then 'status_changed' else 'risk_changed' end,
            h.changed_at, null, 'occurrence', h.actor_user_id,
            h.field, case when h.is_override then 'override' when h.remediation_id is not null then 'remediation' end,
            null, null, h.from_value, h.to_value

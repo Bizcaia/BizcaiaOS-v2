@@ -1,5 +1,5 @@
 -- BizcaiaOS staging: read-only Migration 019 security verification AFTER
--- migrations 001-019. Runbook: docs/deployment/staging-provisioning.md,
+-- migrations 001-020. Runbook: docs/deployment/staging-provisioning.md,
 -- section C (steps 8 and 11-16).
 --
 --   psql "$DATABASE_MIGRATE_URL" -X -f deploy/sql/staging-post-migration.sql
@@ -16,7 +16,7 @@ begin transaction read only;
 select current_user, current_database(), split_part(version(), ' on ', 1) as server,
        current_setting('transaction_read_only') as read_only;
 
-\echo '== POST-2 migrations -- expect: recorded 19, m019 1, first 001_core_schema.sql, last 019_revoke_public_function_execute.sql'
+\echo '== POST-2 migrations -- expect: recorded 20, m019 1, first 001_core_schema.sql, last 020_property_risk_history.sql'
 select count(*) as recorded,
        count(*) filter (where id = '019_revoke_public_function_execute.sql') as m019,
        min(id) as first, max(id) as last

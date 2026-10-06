@@ -419,7 +419,7 @@ describe('R1 database evaluation (synthetic snapshots)', () => {
 
   it('fails on migration history drift, including a missing Migration 019', () => {
     const without019 = supabaseSnapshot();
-    without019.migrations = MIGRATION_FILES.slice(0, -1);
+    without019.migrations = MIGRATION_FILES.filter((id) => id !== '019_revoke_public_function_execute.sql');
     expect(failed(run(without019))).toEqual(['R1-DB-MIGRATIONS']);
     expect(evidence(run(without019), 'R1-DB-MIGRATIONS')).toContain('not applied: 019_revoke_public_function_execute.sql');
     const none = supabaseSnapshot();

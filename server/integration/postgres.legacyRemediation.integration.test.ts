@@ -181,8 +181,9 @@ describe('PostgreSQL legacy stage remediation (L-06)', () => {
     // statement (see runWithTableLocks), so re-applying cannot deadlock with
     // parallel suites.
     await reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
-      // 017 and 018, which replaces 017's resolve function (L-07).
-      for (const file of ['017_legacy_stage_remediation.sql', '018_lifecycle_optimistic_concurrency.sql']) {
+      // 017, 018, which replaces 017's resolve function (L-07), and 020, which
+      // replaces 017's capture function (risk history).
+      for (const file of ['017_legacy_stage_remediation.sql', '018_lifecycle_optimistic_concurrency.sql', '020_property_risk_history.sql']) {
         await admin.query(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'database', file), 'utf8'));
       }
     });

@@ -104,7 +104,7 @@ export async function runWithTableLocks(
   }
 }
 
-/** Every table the lifecycle migrations (012-018) alter: 012-016 the first two, 017 the last three. */
+/** Every table the lifecycle migrations (012-018, 020) alter: 012-016 and 020 the first two, 017 the last three. */
 export const LIFECYCLE_TABLES = ['properties', 'property_lifecycle_history', 'property_stage_remediations', 'property_stage_remediation_events'] as const;
 
 /**

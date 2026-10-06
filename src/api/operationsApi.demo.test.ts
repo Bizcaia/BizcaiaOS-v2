@@ -986,7 +986,7 @@ describe('operationsApi demo adapter', () => {
     expect(created.every((entry) => entry.actor?.id === alex && entry.basis === 'occurrence')).toBe(true);
 
     // Readiness and other non-lifecycle fields record nothing.
-    await operationsApi.updateProperty(property.id, { risk: 'high', readinessPercent: 40 });
+    await operationsApi.updateProperty(property.id, { readinessPercent: 40 });
     expect(await operationsApi.getPropertyTimeline(property.id)).toHaveLength(2);
 
     // Stage and status in one update: one entry each.
@@ -1001,6 +1001,30 @@ describe('operationsApi demo adapter', () => {
         'Acquisition status changed from Active to On hold',
       ]),
     );
+  });
+
+  it('records each actual risk change on update, with no entry for the initial risk, an unchanged risk or another field', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+    const property = await operationsApi.createProperty({
+      organizationId: DEMO_ORGANIZATION_ID,
+      projectId: '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001',
+      propertyReference: 'RH-DEMO-1',
+      risk: 'high',
+    } as never);
+    const riskEntries = async () => (await operationsApi.getPropertyTimeline(property.id)).filter((entry) => entry.kind === 'risk_changed');
+    expect(await riskEntries()).toEqual([]);
+
+    await operationsApi.updateProperty(property.id, { risk: 'high' });
+    await operationsApi.updateProperty(property.id, { readinessPercent: 40 });
+    expect(await riskEntries()).toEqual([]);
+
+    await operationsApi.updateProperty(property.id, { risk: 'low' });
+    await operationsApi.updateProperty(property.id, { risk: 'medium', readinessPercent: 55 });
+    const entries = await riskEntries();
+    expect(entries.map((entry) => entry.summary).sort()).toEqual(['Risk changed from High to Low', 'Risk changed from Low to Medium']);
+    expect(entries.every((entry) => entry.source_type === 'lifecycle' && entry.basis === 'occurrence' && entry.precision === 'timestamp' && entry.actor?.id === alex)).toBe(true);
+    // Stage and status entries are unaffected.
+    expect(await operationsApi.getPropertyTimeline(property.id)).toHaveLength(4);
   });
 
   it('has no lifecycle history for seeded properties (no backfill)', async () => {

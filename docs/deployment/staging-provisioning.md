@@ -29,7 +29,7 @@ date. Passing an earlier gate never authorizes a later one.
 |---|---|---|
 | G1 | Supabase billing: Pro plan, compute size, PITR add-on and retention | NOT AUTHORIZED |
 | G2 | Create and configure the staging Supabase project (sections B1 to B5) | NOT AUTHORIZED |
-| G3 | Create roles and run migrations `001`–`019` on staging (section C, steps 1 to 17) | NOT AUTHORIZED |
+| G3 | Create roles and run migrations `001`–`020` on staging (section C, steps 1 to 17) | NOT AUTHORIZED |
 | G4 | Render billing and services: Static Site, Web Service, persistent disk (section D) | NOT AUTHORIZED |
 | G5 | DNS records for `staging.<domain>` and `api-staging.<domain>` (section E) | NOT AUTHORIZED |
 | G6 | Smoke tests that write data, and the recovery rehearsal (section F) | NOT AUTHORIZED |
@@ -218,8 +218,8 @@ Record a UTC timestamp and the evidence for every step in the checklist.
 | 4 | Verify RLS baseline | PRE-5 and PRE-6 | Empty project: no `schema_migrations`, 0 relations, 0 functions in `public`, no tables. Anything else means stop: this is not a fresh staging project |
 | 5 | Verify the Data API is OFF | Dashboard setting off. Then `curl -s -o /dev/null -w '%{http_code}\n' -H "apikey: <publishable key>" https://<ref>.supabase.co/rest/v1/` | Setting off; the response is not `200` and returns no OpenAPI document. Record the status code (the local rehearsal returned 503) |
 | 6 | Verify Auth configuration | Section B2 settings. `curl -s https://<ref>.supabase.co/auth/v1/.well-known/jwks.json`. A sign-up attempt with the publishable key: `curl -s -X POST -H "apikey: <publishable key>" -H 'Content-Type: application/json' -d '{"email":"signup-probe@<domain>","password":"<random>"}' https://<ref>.supabase.co/auth/v1/signup` | JWKS lists only asymmetric keys (`kty` `EC` or `RSA`), no `oct`. Sign-up refused (`signup_disabled`) and no user created |
-| 7 | Run migrations `001`–`019` | `npm run db:migrate` | Preflight passes, then `applied 001_…` through `applied 019_…`, then `migrations complete` |
-| 8 | Confirm 019 applied exactly once | `psql "$DATABASE_MIGRATE_URL" -X -f deploy/sql/staging-post-migration.sql`, POST-2 | `recorded 19`, `m019 1`, last `019_revoke_public_function_execute.sql` |
+| 7 | Run migrations `001`–`020` | `npm run db:migrate` | Preflight passes, then `applied 001_…` through `applied 020_…`, then `migrations complete` |
+| 8 | Confirm 019 applied exactly once | `psql "$DATABASE_MIGRATE_URL" -X -f deploy/sql/staging-post-migration.sql`, POST-2 | `recorded 20`, `m019 1`, last `020_property_risk_history.sql` |
 | 9 | Second migration pass | `npm run db:migrate` | Nothing applied |
 | 10 | Confirm zero applied | Output of step 9 | No `applied` lines; `migrations complete` |
 | 11 | Migration 019 security verification | Re-run `staging-post-migration.sql` and keep the full output. Then run R1: `npm run db:verify-boundary -- --target staging --env-file <file> --database --strict` (read-only; uses `DATABASE_MIGRATE_URL` from the shell; R1 does not read `.env`) and keep its output (`--json` for the record) | Every "expect" line holds. R1 exits `0` (`RESULT: NO_FINDINGS`): no `FAIL`, and only `R1-PROVIDER-DATA-API` and `R1-PROVIDER-AUTH-SETTINGS` are `NOT_VERIFIED` (steps 5 and 6) |
