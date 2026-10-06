@@ -105,14 +105,18 @@ describe('PostgreSQL migration re-apply locking', () => {
     60_000,
   );
 
-  it('refuses a migration that locks a table it did not declare, and applies nothing', async () => {
+  it('refuses SQL that takes a strong lock on a table it did not declare, and rolls everything back', async () => {
     const observer = await connect();
     try {
       await asReapplier(async (admin, pid) => {
-        await expect(runWithTableLocks(admin, ['negotiations'], migrationSql('006_negotiations_rls.sql'))).rejects.toThrow(
-          'The migration locks tables that were not locked up front: negotiation_events',
+        // The undeclared lock is one that ordinary reads and writes do not conflict with, so
+        // this deliberately wrong call cannot itself wait behind a parallel suite.
+        const sql = `create table public.zz_reapply_guard (); lock table public.negotiations in share update exclusive mode;`;
+        await expect(runWithTableLocks(admin, ['negotiation_events'], sql)).rejects.toThrow(
+          'The migration locks tables that were not locked up front: negotiations, zz_reapply_guard',
         );
         expect(await strongLocks(observer, pid)).toEqual([]);
+        expect((await admin.query<{ found: string | null }>(`select to_regclass('public.zz_reapply_guard')::text as found`)).rows[0].found).toBeNull();
       });
     } finally {
       await observer.end();
