@@ -130,34 +130,36 @@ describe('PostgreSQL migration re-apply locking', () => {
     async (heldTable, heldMode, nextTable, nextMode) => {
       const observer = await connect();
       const other = await connect();
-      const admin = await connect();
       try {
-        const pid = (await admin.query<{ pid: number }>('select pg_backend_pid() as pid')).rows[0].pid;
-        await other.query('begin');
-        await other.query(`lock table public.${heldTable} in ${heldMode} mode`);
-        // The whole chain, in order: later files redefine objects of earlier ones.
-        const settled = reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
-          for (const file of LIFECYCLE_MIGRATIONS) await admin.query(migrationSql(file));
-        }).then(
-          () => 'applied',
-          (error: Error) => error,
-        );
-        try {
-          await expect
-            .poll(() => strongLocks(observer, pid), { timeout: 10_000, interval: 25 })
-            .toEqual([{ relname: heldTable, mode: 'AccessExclusiveLock', granted: false }]);
-          await other.query(`lock table public.${nextTable} in ${nextMode} mode`);
-          await other.query('commit');
-          expect(await settled).toBe('applied');
-          expect(await strongLocks(observer, pid)).toEqual([]);
-        } finally {
-          // Let the re-apply finish before its session is closed, also when an expectation failed.
-          await other.query('rollback').catch(() => undefined);
-          await settled;
-        }
+        // The advisory lock is held before the other transaction takes its table, as in the
+        // cases above: no other suite's re-apply can then be waiting behind that transaction.
+        await asReapplier(async (admin, pid) => {
+          await other.query('begin');
+          await other.query(`lock table public.${heldTable} in ${heldMode} mode`);
+          // The whole chain, in order: later files redefine objects of earlier ones.
+          const settled = reapplyWithTableLocks(admin, LIFECYCLE_TABLES, async () => {
+            for (const file of LIFECYCLE_MIGRATIONS) await admin.query(migrationSql(file));
+          }).then(
+            () => 'applied',
+            (error: Error) => error,
+          );
+          try {
+            await expect
+              .poll(() => strongLocks(observer, pid), { timeout: 10_000, interval: 25 })
+              .toEqual([{ relname: heldTable, mode: 'AccessExclusiveLock', granted: false }]);
+            await other.query(`lock table public.${nextTable} in ${nextMode} mode`);
+            await other.query('commit');
+            expect(await settled).toBe('applied');
+            expect(await strongLocks(observer, pid)).toEqual([]);
+          } finally {
+            // Let the re-apply finish before its session is closed, also when an expectation failed.
+            await other.query('rollback').catch(() => undefined);
+            await settled;
+          }
+        });
       } finally {
         await other.query('rollback').catch(() => undefined);
-        await Promise.all([other.end(), observer.end(), admin.end()]);
+        await Promise.all([other.end(), observer.end()]);
       }
     },
     60_000,
