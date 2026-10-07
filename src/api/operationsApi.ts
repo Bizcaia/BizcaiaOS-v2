@@ -272,6 +272,39 @@ export type TimelineEntry = {
   archived: boolean;
 };
 
+/** One row of an attention task list; `overdue` is decided against the organization's calendar day. */
+export type AttentionTask = {
+  id: string;
+  property_id: string;
+  property_reference: string;
+  title: string;
+  status: TaskStatus;
+  priority: TaskPriority;
+  assigned_user_id: string | null;
+  assigned_user_name: string | null;
+  due_on: string | null;
+  overdue: boolean;
+};
+
+export type AttentionProperty = {
+  id: string;
+  property_reference: string;
+  acquisition_stage: AcquisitionStage;
+  acquisition_status: AcquisitionStatus;
+  risk: 'low' | 'medium' | 'high';
+  legal_status: string;
+};
+
+/** Each list holds at most ATTENTION_LIST_LIMIT rows; `total` is the full count. */
+export type Attention = {
+  today: string;
+  my_tasks: { total: number; items: AttentionTask[] };
+  overdue_tasks: { total: number; items: AttentionTask[] };
+  properties: { total: number; items: AttentionProperty[] };
+};
+
+export const ATTENTION_LIST_LIMIT = 50;
+
 /** Same VITE_API_BASE_URL as organizationApi (/api/v1). Live ops paths are prefixed with /ops. */
 const apiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 export const operationsApiMode = apiBase ? 'live' : 'demo';
@@ -1214,6 +1247,85 @@ function demoPropertyTimeline(property: Property, timeZone: string, page: { limi
     })
     .map(({ entry }) => entry)
     .slice(page.offset, page.offset + page.limit);
+}
+
+const taskPriorityRank: Record<TaskPriority, number> = { low: 0, normal: 1, high: 2, urgent: 3 };
+
+/** The organization's calendar day; an unrecognized zone falls back to UTC, as on the server. */
+function attentionToday(instant: Date, timeZone: string) {
+  try {
+    return calendarDay(instant, timeZone);
+  } catch {
+    return calendarDay(instant, 'UTC');
+  }
+}
+
+function attentionList<Row>(rows: Row[]) {
+  return { total: rows.length, items: rows.slice(0, ATTENTION_LIST_LIMIT) };
+}
+
+/** Mirrors loadAttention on the server: same rules, ordering and limits. */
+function demoAttention(organizationId: string, timeZone: string): Attention {
+  const member = demoActorMembership();
+  if (!member || member.organization_id !== organizationId) {
+    throw new Error('You do not have permission for this operation');
+  }
+  const today = attentionToday(new Date(), timeZone);
+  const visible = demoProperties.filter((property) => property.organization_id === organizationId && demoCanReadProperty(property));
+  const references = new Map(visible.map((property) => [property.id, property.property_reference]));
+  const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+  // Open or in progress, not archived, and on a property the actor can see.
+  const openTasks = demoTasks
+    .filter((task) => task.organization_id === organizationId && !task.archived_at && references.has(task.property_id))
+    .filter((task) => task.status === 'open' || task.status === 'in_progress')
+    .map(
+      (task): AttentionTask => ({
+        id: task.id,
+        property_id: task.property_id,
+        property_reference: references.get(task.property_id) ?? '',
+        title: task.title,
+        status: task.status,
+        priority: task.priority,
+        assigned_user_id: task.assigned_user_id,
+        assigned_user_name: demoTimelineActor(task.assigned_user_id)?.display_name ?? null,
+        due_on: task.due_on,
+        overdue: task.due_on !== null && task.due_on < today,
+      }),
+    )
+    // Earliest due date first, undated last, then the most urgent.
+    .sort((a, b) => {
+      if (a.due_on !== b.due_on) {
+        if (a.due_on === null) return 1;
+        if (b.due_on === null) return -1;
+        return a.due_on < b.due_on ? -1 : 1;
+      }
+      return taskPriorityRank[b.priority] - taskPriorityRank[a.priority] || byId(a, b);
+    });
+
+  const properties = visible
+    .filter((property) => property.acquisition_status === 'active' || property.acquisition_status === 'on_hold')
+    .filter((property) => property.legal_status === 'blocked' || property.risk === 'high')
+    .map(
+      (property): AttentionProperty => ({
+        id: property.id,
+        property_reference: property.property_reference,
+        acquisition_stage: property.acquisition_stage,
+        acquisition_status: property.acquisition_status,
+        risk: property.risk,
+        legal_status: property.legal_status,
+      }),
+    )
+    .sort((a, b) =>
+      a.property_reference < b.property_reference ? -1 : a.property_reference > b.property_reference ? 1 : byId(a, b),
+    );
+
+  return {
+    today,
+    my_tasks: attentionList(openTasks.filter((task) => task.assigned_user_id === DEMO_ACTOR_ID)),
+    overdue_tasks: attentionList(openTasks.filter((task) => task.overdue && task.assigned_user_id !== DEMO_ACTOR_ID)),
+    properties: attentionList(properties),
+  };
 }
 
 function decorateProperty(property: Property): Property {
@@ -2755,6 +2867,15 @@ export const operationsApi = {
     if (!property) throw new Error('Property not found');
     const organization = await organizationApi.getOrganization(property.organization_id);
     return demoPropertyTimeline(property, organization.timezone, { limit, offset });
+  },
+
+  /** Read-only: what needs the caller's attention across the organization. */
+  async getAttention(organizationId: string) {
+    if (operationsApiMode === 'live') {
+      return request<Attention>(`/ops/attention?${new URLSearchParams({ organizationId })}`);
+    }
+    const organization = await organizationApi.getOrganization(organizationId);
+    return demoAttention(organizationId, organization.timezone);
   },
 
   async dashboard(orgId: string) {

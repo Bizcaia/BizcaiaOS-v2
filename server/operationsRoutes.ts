@@ -23,6 +23,7 @@ import {
   stageTransitionSchema,
   statusTransitionSchema,
   remediationQueueQuerySchema,
+  attentionQuerySchema,
   remediationResolveSchema,
   remediationStepSchema,
   createDocumentFieldsSchema,
@@ -202,6 +203,140 @@ operationsRouter.get('/dashboard', async (request, response) => {
       [organizationId.organizationId],
     );
     return { ...counts.rows[0], stages: stages.rows };
+  });
+  response.json({ data });
+});
+
+/** Rows returned per attention list; each list also reports its full count. */
+export const ATTENTION_LIST_LIMIT = 50;
+
+export type AttentionTask = {
+  id: string;
+  property_id: string;
+  property_reference: string;
+  title: string;
+  status: string;
+  priority: string;
+  assigned_user_id: string | null;
+  assigned_user_name: string | null;
+  due_on: string | null;
+  overdue: boolean;
+};
+
+export type AttentionProperty = {
+  id: string;
+  property_reference: string;
+  acquisition_stage: string;
+  acquisition_status: string;
+  risk: string;
+  legal_status: string;
+};
+
+export type Attention = {
+  today: string;
+  my_tasks: { total: number; items: AttentionTask[] };
+  overdue_tasks: { total: number; items: AttentionTask[] };
+  properties: { total: number; items: AttentionProperty[] };
+};
+
+/**
+ * The organization's calendar day, which decides what is overdue. Unlike the
+ * Timeline, a timezone PostgreSQL does not recognize (22023) falls back to
+ * UTC, so the view still loads. `at` replaces the current time in tests.
+ */
+async function attentionToday(client: PoolClient, organizationId: string, at?: Date) {
+  const read = (zone: string | null) =>
+    client.query<{ today: string }>(
+      `select to_char((coalesce($2::timestamptz, now()) at time zone coalesce($3::text, o.timezone))::date, 'YYYY-MM-DD') as today
+         from public.organizations o
+        where o.id=$1`,
+      [organizationId, at ?? null, zone],
+    );
+  await client.query('savepoint attention_today');
+  try {
+    const result = await read(null);
+    await client.query('release savepoint attention_today');
+    return firstRow(result.rows, 'Organization not found').today;
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== '22023') throw error;
+    await client.query('rollback to savepoint attention_today');
+    return firstRow((await read('UTC')).rows, 'Organization not found').today;
+  }
+}
+
+// An open task is one still to be done: open or in progress, and not archived.
+// The join to properties applies property visibility, so a task on a property
+// the caller cannot see is left out, as it is from the property's own task list.
+const attentionTaskSelect = `
+  select t.id, t.property_id, p.property_reference, t.title, t.status, t.priority,
+         t.assigned_user_id, u.display_name as assigned_user_name,
+         to_char(t.due_on, 'YYYY-MM-DD') as due_on,
+         (t.due_on is not null and t.due_on < $2::date) as overdue,
+         count(*) over () as total
+    from public.tasks t
+    join public.properties p on p.id = t.property_id
+    left join public.app_users u on u.id = t.assigned_user_id
+   where t.organization_id = $1
+     and t.archived_at is null
+     and t.status in ('open', 'in_progress')`;
+
+// Earliest due date first (so overdue tasks lead), undated last, then the most urgent.
+const attentionTaskOrder = `
+   order by t.due_on asc nulls last, t.priority desc, t.id
+   limit ${ATTENTION_LIST_LIMIT}`;
+
+function attentionList<Row extends { total: string }>(rows: Row[]) {
+  return {
+    total: rows.length ? Number(rows[0].total) : 0,
+    items: rows.map(({ total: _total, ...item }) => item),
+  };
+}
+
+/**
+ * What needs the caller's attention across the organization, read-only:
+ * their own open tasks, other people's (or nobody's) overdue tasks, and
+ * properties still being acquired that are legally blocked or high risk.
+ * Row-level security narrows every list to what the caller can already see.
+ */
+export async function loadAttention(client: PoolClient, userId: string, organizationId: string, at?: Date): Promise<Attention> {
+  const today = await attentionToday(client, organizationId, at);
+  const myTasks = await client.query<AttentionTask & { total: string }>(
+    `${attentionTaskSelect}
+     and t.assigned_user_id = $3::uuid${attentionTaskOrder}`,
+    [organizationId, today, userId],
+  );
+  const overdueTasks = await client.query<AttentionTask & { total: string }>(
+    `${attentionTaskSelect}
+     and t.due_on < $2::date
+     and t.assigned_user_id is distinct from $3::uuid${attentionTaskOrder}`,
+    [organizationId, today, userId],
+  );
+  const properties = await client.query<AttentionProperty & { total: string }>(
+    `select p.id, p.property_reference, p.acquisition_stage, p.acquisition_status, p.risk, p.legal_status,
+            count(*) over () as total
+       from public.properties p
+      where p.organization_id = $1
+        and p.status = 'active'
+        and p.acquisition_status in ('active', 'on_hold')
+        and (p.legal_status = 'blocked' or p.risk = 'high')
+      order by p.property_reference collate "C", p.id
+      limit ${ATTENTION_LIST_LIMIT}`,
+    [organizationId],
+  );
+  return {
+    today,
+    my_tasks: attentionList(myTasks.rows),
+    overdue_tasks: attentionList(overdueTasks.rows),
+    properties: attentionList(properties.rows),
+  };
+}
+
+operationsRouter.get('/attention', async (request, response) => {
+  const user = requireUser(request);
+  const { organizationId } = attentionQuerySchema.parse(request.query);
+  const data = await withActorTransaction(user.id, async (client) => {
+    await requireMembership(client, organizationId, user.id);
+    return loadAttention(client, user.id, organizationId);
   });
   response.json({ data });
 });

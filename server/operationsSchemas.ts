@@ -68,6 +68,7 @@ export const remediationResolveSchema = z.strictObject({
 });
 
 export const remediationQueueQuerySchema = z.object({ organizationId: z.uuid() });
+export const attentionQuerySchema = z.object({ organizationId: z.uuid() });
 
 export const ownerTypeSchema = z.enum(['individual', 'corporate', 'estate', 'government', 'other']);
 export const ownerListQuerySchema = z.object({ organizationId: z.uuid() });
