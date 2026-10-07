@@ -372,6 +372,17 @@ describe('attention view against real PostgreSQL', () => {
     expect(result.overdue_tasks).toEqual({ total: 0, items: [] });
     expect(result.properties.items.map((item) => item.id)).toEqual([property.orgB]);
     await expect(attention(adminA, orgB)).rejects.toMatchObject({ status: 404 });
+
+    // A member of both organizations gets only the rows of the one asked for.
+    await addMember(pool, adminB, orgB, legalA, 'legal_documentation');
+    const inB = await attention(legalA, orgB);
+    expect(titles(inB.my_tasks)).toEqual([]);
+    expect(titles(inB.overdue_tasks)).toEqual(['Other organization, late']);
+    expect(inB.properties.items.map((item) => item.id)).toEqual([property.orgB]);
+    const inA = await attention(legalA, orgA);
+    expect(titles(inA.my_tasks)).toEqual(['Legal, late']);
+    expect(titles(inA.overdue_tasks)).not.toContain('Other organization, late');
+    expect(references(inA.properties)).toEqual(['ATT-001', 'ATT-002', 'ATT-003', 'att-000']);
   });
 
   it('returns at most the list limit and the full count of each list', async () => {
