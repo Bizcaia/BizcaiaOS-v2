@@ -631,7 +631,7 @@ function AttentionSection({
         !error && <p>Loading…</p>
       ) : (
         <div className="attention-grid">
-          <div aria-label="My tasks">
+          <div role="group" aria-label="My tasks">
             <h3>My tasks · {attention.my_tasks.total}</h3>
             {attention.my_tasks.items.length === 0 ? (
               <p>No open tasks assigned to you.</p>
@@ -640,7 +640,7 @@ function AttentionSection({
             )}
             {more(attention.my_tasks)}
           </div>
-          <div aria-label="Overdue, not mine">
+          <div role="group" aria-label="Overdue, not mine">
             <h3>Overdue, not mine · {attention.overdue_tasks.total}</h3>
             {attention.overdue_tasks.items.length === 0 ? (
               <p>No overdue tasks.</p>
@@ -649,7 +649,7 @@ function AttentionSection({
             )}
             {more(attention.overdue_tasks)}
           </div>
-          <div aria-label="Blocked or high risk">
+          <div role="group" aria-label="Blocked or high risk">
             <h3>Blocked or high risk · {attention.properties.total}</h3>
             {attention.properties.items.length === 0 ? (
               <p>No blocked or high-risk properties.</p>
