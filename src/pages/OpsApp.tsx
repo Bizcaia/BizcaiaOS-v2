@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, FolderKanban, LayoutDashboard, LogOut, Map, Plus, Search, ShieldCheck } from 'lucide-react';
 import { organizationApi, organizationApiMode, type Member, type OrganizationRole } from '../api/organizationApi';
 import {
@@ -283,6 +283,10 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   }, [isDemo]);
 
   const propertyFilters = { search, stage: stage || undefined, projectId: selectedProjectId || undefined };
+  // Which list is on screen now: a page asked for under another organization or filter is not part of it.
+  const propertyListKey = JSON.stringify([organizationId, search, stage, selectedProjectId]);
+  const currentPropertyListKey = useRef(propertyListKey);
+  currentPropertyListKey.current = propertyListKey;
 
   // Always starts again from the first page: a changed filter or a saved change restarts the list.
   const load = async () => {
@@ -304,9 +308,12 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
 
   const loadMoreProperties = async () => {
     if (!organizationId || loadingMore) return;
+    const requestedFor = propertyListKey;
     setLoadingMore(true);
     try {
       const page = await operationsApi.listProperties(organizationId, { ...propertyFilters, limit: PROPERTY_PAGE_SIZE, offset: properties.length });
+      // The filter changed while this page was on its way: it belongs to the list that was replaced, so it is dropped.
+      if (currentPropertyListKey.current !== requestedFor) return;
       // A property changed since the previous page was read can come back again; it is shown once.
       setProperties((current) => [...current, ...page.filter((property) => !current.some((entry) => entry.id === property.id))]);
       setHasMoreProperties(page.length === PROPERTY_PAGE_SIZE);

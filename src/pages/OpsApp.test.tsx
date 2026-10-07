@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEMO_ORGANIZATION_ID, operationsApi, resetOperationsDemoState, type TimelineEntry } from '../api/operationsApi';
@@ -1051,6 +1051,58 @@ describe('OpsApp property workflow', () => {
       const references = rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
       expect(new Set(references).size).toBe(references.length);
       expect(references[0]).toBe(first.property_reference);
+    });
+
+    it('drops a Load more answer that arrives after the filter changed, and pages the new filter from its first row', async () => {
+      await seedProperties(116);
+      const shown = () => rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await screen.findByRole('button', { name: 'Properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(50));
+
+      // The answer to the second page of the unfiltered list is held back until the test lets it go.
+      const real = operationsApi.listProperties.bind(operationsApi);
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const late: Array<Promise<unknown>> = [];
+      const spy = vi.spyOn(operationsApi, 'listProperties').mockImplementation((org, filters) => {
+        const answer = real(org, filters);
+        if (filters?.offset !== 50 || filters?.search) return answer;
+        const delayed = held.then(() => answer);
+        late.push(delayed);
+        return delayed;
+      });
+      try {
+        await user.click(screen.getByRole('button', { name: 'Load more properties' }));
+        expect(late).toHaveLength(1);
+
+        // The filter changes while that page is still on its way.
+        const calamba = (await real(DEMO_ORGANIZATION_ID, { search: 'Calamba', limit: 200 })).map((property) => property.property_reference);
+        expect(calamba.length).toBeGreaterThan(50);
+        await user.type(screen.getByPlaceholderText('Search property, lot, municipality'), 'Calamba');
+        await waitFor(() => expect(shown()).toEqual(calamba.slice(0, 50)));
+
+        // The late page arrives now. Its 50 rows include properties that do not match the search.
+        const stale = (await real(DEMO_ORGANIZATION_ID, { limit: 50, offset: 50 })).map((property) => property.property_reference);
+        expect(stale.some((reference) => !calamba.includes(reference))).toBe(true);
+        release();
+        await act(async () => {
+          await late[0];
+        });
+        expect(shown()).toEqual(calamba.slice(0, 50));
+
+        // The new filter still pages from its own first row to its end.
+        const more = screen.getByRole('button', { name: 'Load more properties' });
+        expect(more).toBeEnabled();
+        await user.click(more);
+        await waitFor(() => expect(shown()).toEqual(calamba));
+        expect(screen.queryByRole('button', { name: 'Load more properties' })).not.toBeInTheDocument();
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('offers no Load more when everything fits on one page', async () => {
