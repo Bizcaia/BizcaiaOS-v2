@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEMO_ORGANIZATION_ID, operationsApi, resetOperationsDemoState, type TimelineEntry } from '../api/operationsApi';
@@ -940,6 +940,203 @@ describe('OpsApp property workflow', () => {
       } finally {
         spy.mockRestore();
       }
+    });
+  });
+
+  describe('Dashboard counts and the property list (L1)', () => {
+    const PROJECT = '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001';
+    const tileValue = (label: string) => within(screen.getByText(label, { selector: '.ops-metric span' }).closest('.ops-metric') as HTMLElement).getByRole('strong').textContent;
+    const stageCount = (label: string) => {
+      const card = screen.getAllByRole('button').find((button) => button.classList.contains('stage-card') && within(button).queryByText(label, { selector: 'span' }));
+      return card ? within(card).getByRole('strong').textContent : null;
+    };
+    const rows = () => Array.from(document.querySelectorAll('.property-row'));
+
+    async function seedProperties(count: number) {
+      for (let index = 0; index < count; index += 1) {
+        await operationsApi.createProperty({ organizationId: DEMO_ORGANIZATION_ID, projectId: PROJECT, propertyReference: `BULK-${String(index).padStart(3, '0')}`, municipality: index < 70 ? 'Calamba' : 'Biñan' });
+      }
+    }
+
+    it('shows the server counts on the three tiles and the stage grid, whatever the Properties tab is filtered to', async () => {
+      await seedProperties(116);
+      await operationsApi.updateProperty('70000000-0000-4000-8000-000000000001', { readinessPercent: 85 });
+      await operationsApi.updateProperty('70000000-0000-4000-8000-000000000002', { readinessPercent: 90 });
+      // Ready and the stage grid count properties being acquired: the paused one leaves both.
+      await operationsApi.transitionPropertyStatus('70000000-0000-4000-8000-000000000002', { targetStatus: 'on_hold', expectedStatus: 'active' });
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+
+      const counts = async () => {
+        await waitFor(() => expect(tileValue('Properties')).toBe('120'));
+        return [tileValue('Properties'), tileValue('Acquisition-ready'), tileValue('Active negotiations'), stageCount('Identified'), stageCount('Negotiation'), stageCount('Commercial review'), stageCount('Signing')];
+      };
+      await screen.findByRole('heading', { name: 'Portfolio overview' });
+      const expected = ['120', '1', '1', '116', '1', '0', '0'];
+      expect(await counts()).toEqual(expected);
+
+      // A stage filter, a search and a project filter on the Properties tab leave the Dashboard as it was.
+      await user.click(screen.getByRole('button', { name: 'Properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(50));
+      await user.selectOptions(screen.getByDisplayValue('All stages'), 'negotiation');
+      await waitFor(() => expect(rows()).toHaveLength(1));
+      await user.click(screen.getByRole('button', { name: 'Dashboard' }));
+      expect(await counts()).toEqual(expected);
+
+      await user.click(screen.getByRole('button', { name: 'Properties' }));
+      await user.type(screen.getByPlaceholderText('Search property, lot, municipality'), 'NCP-00131');
+      await waitFor(() => expect(rows()).toHaveLength(0));
+      await user.selectOptions(screen.getByLabelText('Filter by project'), PROJECT);
+      await user.click(screen.getByRole('button', { name: 'Dashboard' }));
+      expect(await counts()).toEqual(expected);
+    });
+
+    it('opens the Properties tab on a stage from the grid, as before', async () => {
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await waitFor(() => expect(stageCount('Negotiation')).toBe('1'));
+      const card = screen.getAllByRole('button').find((button) => button.classList.contains('stage-card') && within(button).queryByText('Negotiation', { selector: 'span' }))!;
+      await user.click(card);
+      expect(await screen.findByRole('heading', { name: 'Properties' })).toBeVisible();
+      await waitFor(() => expect(rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent)).toEqual(['NCP-00102']));
+    });
+
+    it('reads the list 50 at a time with Load more, reaches all 120 once, and restarts when a filter changes', async () => {
+      await seedProperties(116);
+      const expected = (await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { limit: 200 })).map((property) => property.property_reference);
+      expect(expected).toHaveLength(120);
+      const shown = () => rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await screen.findByRole('button', { name: 'Properties' }));
+
+      await waitFor(() => expect(rows()).toHaveLength(50));
+      expect(shown()).toEqual(expected.slice(0, 50));
+      await user.click(screen.getByRole('button', { name: 'Load more properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(100));
+      await user.click(screen.getByRole('button', { name: 'Load more properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(120));
+      expect(shown()).toEqual(expected);
+      expect(new Set(shown()).size).toBe(120);
+      // The last page was short: nothing more to load.
+      expect(screen.queryByRole('button', { name: 'Load more properties' })).not.toBeInTheDocument();
+
+      // A filter starts again from its own first page.
+      const calamba = (await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { search: 'Calamba', limit: 200 })).map((property) => property.property_reference);
+      expect(calamba.length).toBeGreaterThan(50);
+      await user.type(screen.getByPlaceholderText('Search property, lot, municipality'), 'Calamba');
+      await waitFor(() => expect(shown()).toEqual(calamba.slice(0, 50)));
+      await user.click(screen.getByRole('button', { name: 'Load more properties' }));
+      await waitFor(() => expect(shown()).toEqual(calamba));
+      expect(screen.queryByRole('button', { name: 'Load more properties' })).not.toBeInTheDocument();
+
+      await user.clear(screen.getByPlaceholderText('Search property, lot, municipality'));
+      await waitFor(() => expect(shown()).toEqual(expected.slice(0, 50)));
+      expect(screen.getByRole('button', { name: 'Load more properties' })).toBeVisible();
+    });
+
+    it('shows a property once when it changed between two pages', async () => {
+      await seedProperties(116);
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await screen.findByRole('button', { name: 'Properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(50));
+      // Another user changes the first row: it moves to the front and pushes every row one place down.
+      const first = (await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { limit: 1 }))[0];
+      const last = (await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { limit: 1, offset: 60 }))[0];
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await operationsApi.updateProperty(last.id, { readinessPercent: 10 });
+      await user.click(screen.getByRole('button', { name: 'Load more properties' }));
+      await waitFor(() => expect(rows().length).toBeGreaterThan(50));
+      const references = rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
+      expect(new Set(references).size).toBe(references.length);
+      expect(references[0]).toBe(first.property_reference);
+    });
+
+    it('drops a Load more answer that arrives after the filter changed, and pages the new filter from its first row', async () => {
+      await seedProperties(116);
+      const shown = () => rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await screen.findByRole('button', { name: 'Properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(50));
+
+      // The answer to the second page of the unfiltered list is held back until the test lets it go.
+      const real = operationsApi.listProperties.bind(operationsApi);
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const late: Array<Promise<unknown>> = [];
+      const spy = vi.spyOn(operationsApi, 'listProperties').mockImplementation((org, filters) => {
+        const answer = real(org, filters);
+        if (filters?.offset !== 50 || filters?.search) return answer;
+        const delayed = held.then(() => answer);
+        late.push(delayed);
+        return delayed;
+      });
+      try {
+        await user.click(screen.getByRole('button', { name: 'Load more properties' }));
+        expect(late).toHaveLength(1);
+
+        // The filter changes while that page is still on its way.
+        const calamba = (await real(DEMO_ORGANIZATION_ID, { search: 'Calamba', limit: 200 })).map((property) => property.property_reference);
+        expect(calamba.length).toBeGreaterThan(50);
+        await user.type(screen.getByPlaceholderText('Search property, lot, municipality'), 'Calamba');
+        await waitFor(() => expect(shown()).toEqual(calamba.slice(0, 50)));
+
+        // The late page arrives now. Its 50 rows include properties that do not match the search.
+        const stale = (await real(DEMO_ORGANIZATION_ID, { limit: 50, offset: 50 })).map((property) => property.property_reference);
+        expect(stale.some((reference) => !calamba.includes(reference))).toBe(true);
+        release();
+        await act(async () => {
+          await late[0];
+        });
+        expect(shown()).toEqual(calamba.slice(0, 50));
+
+        // The new filter still pages from its own first row to its end.
+        const more = screen.getByRole('button', { name: 'Load more properties' });
+        expect(more).toBeEnabled();
+        await user.click(more);
+        await waitFor(() => expect(shown()).toEqual(calamba));
+        expect(screen.queryByRole('button', { name: 'Load more properties' })).not.toBeInTheDocument();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('offers no Load more when everything fits on one page', async () => {
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await screen.findByRole('button', { name: 'Properties' }));
+      await waitFor(() => expect(rows()).toHaveLength(4));
+      expect(screen.queryByRole('button', { name: 'Load more properties' })).not.toBeInTheDocument();
+    });
+
+    it('shows the failure and no numbers when the counts cannot be read', async () => {
+      const spy = vi.spyOn(operationsApi, 'dashboard').mockRejectedValue(new Error('You do not have permission for this operation'));
+      try {
+        render(<OpsApp onExit={vi.fn()} />);
+        expect(await screen.findByText('You do not have permission for this operation')).toBeVisible();
+        expect([tileValue('Properties'), tileValue('Acquisition-ready'), tileValue('Active negotiations'), stageCount('Identified')]).toEqual(['—', '—', '—', '—']);
+        // The attention section and its tile are read separately and still load.
+        await waitFor(() => expect(tileValue('Blocked / high risk')).toBe('1'));
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('shows a task due date as the stored day, in the list and in its date field', async () => {
+      const property = '70000000-0000-4000-8000-000000000001';
+      await operationsApi.createTask(property, { title: 'Dated follow-up', dueOn: '2026-09-26', assignedUserId: members[0].user_id });
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await screen.findByRole('button', { name: 'Properties' }));
+      await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
+      const tasks = (await screen.findByRole('heading', { name: 'Tasks' })).closest('section')!;
+      const item = (await within(tasks).findByText('Dated follow-up')).closest('li')!;
+      expect(within(item).getByText(/· Due 2026-09-26$/)).toBeVisible();
+      expect(Array.from(item.querySelectorAll('input[type="date"]')).map((input) => (input as HTMLInputElement).value)).toEqual(['2026-09-26']);
     });
   });
 });

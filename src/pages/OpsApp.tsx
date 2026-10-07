@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, FolderKanban, LayoutDashboard, LogOut, Map, Plus, Search, ShieldCheck } from 'lucide-react';
 import { organizationApi, organizationApiMode, type Member, type OrganizationRole } from '../api/organizationApi';
 import {
   DEMO_ORGANIZATION_ID,
+  PROPERTY_PAGE_SIZE,
   operationsApi,
   type AcquisitionStage,
   type AgreementSignature,
   type Attention,
   type AttentionTask,
+  type DashboardSummary,
   type DocumentCategory,
   type DocumentStatus,
   type Negotiation,
@@ -231,6 +233,10 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   const [role, setRole] = useState<OrganizationRole>('viewer');
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [orgContextError, setOrgContextError] = useState('');
+  const [hasMoreProperties, setHasMoreProperties] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [dashboard, setDashboard] = useState<DashboardSummary | null>(null);
+  const [dashboardError, setDashboardError] = useState('');
   const [attention, setAttention] = useState<Attention | null>(null);
   const [attentionError, setAttentionError] = useState('');
   const isDemo = organizationApiMode === 'demo';
@@ -276,24 +282,44 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
     };
   }, [isDemo]);
 
+  const propertyFilters = { search, stage: stage || undefined, projectId: selectedProjectId || undefined };
+  // Which list is on screen now: a page asked for under another organization or filter is not part of it.
+  const propertyListKey = JSON.stringify([organizationId, search, stage, selectedProjectId]);
+  const currentPropertyListKey = useRef(propertyListKey);
+  currentPropertyListKey.current = propertyListKey;
+
+  // Always starts again from the first page: a changed filter or a saved change restarts the list.
   const load = async () => {
     if (!organizationId) return;
     setLoading(true);
     const [listedProperties, listedProjects, listedMembers, listedOwners] = await Promise.all([
-      operationsApi.listProperties(organizationId, {
-        search,
-        stage: stage || undefined,
-        projectId: selectedProjectId || undefined,
-      }),
+      operationsApi.listProperties(organizationId, { ...propertyFilters, limit: PROPERTY_PAGE_SIZE, offset: 0 }),
       operationsApi.listProjects(organizationId),
       organizationApi.listMembers(organizationId),
       operationsApi.listOwners(organizationId),
     ]);
     setProperties(listedProperties);
+    setHasMoreProperties(listedProperties.length === PROPERTY_PAGE_SIZE);
     setProjects(listedProjects);
     setMembers(listedMembers.filter((member) => member.is_active));
     setOwners(listedOwners);
     setLoading(false);
+  };
+
+  const loadMoreProperties = async () => {
+    if (!organizationId || loadingMore) return;
+    const requestedFor = propertyListKey;
+    setLoadingMore(true);
+    try {
+      const page = await operationsApi.listProperties(organizationId, { ...propertyFilters, limit: PROPERTY_PAGE_SIZE, offset: properties.length });
+      // The filter changed while this page was on its way: it belongs to the list that was replaced, so it is dropped.
+      if (currentPropertyListKey.current !== requestedFor) return;
+      // A property changed since the previous page was read can come back again; it is shown once.
+      setProperties((current) => [...current, ...page.filter((property) => !current.some((entry) => entry.id === property.id))]);
+      setHasMoreProperties(page.length === PROPERTY_PAGE_SIZE);
+    } finally {
+      setLoadingMore(false);
+    }
   };
 
   useEffect(() => {
@@ -326,13 +352,31 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
     setTab('properties');
   };
 
-  const dashboard = useMemo(
-    () => ({
-      total: properties.length,
-      ready: properties.filter((property) => property.readiness_percent >= 80).length,
-      negotiation: properties.filter((property) => property.acquisition_stage === 'negotiation').length,
-    }),
-    [properties],
+  // Portfolio counts come from the server, so they cover every visible property
+  // and do not follow the Properties tab's filters or the rows loaded so far.
+  useEffect(() => {
+    if (!organizationId || tab !== 'dashboard') return;
+    let cancelled = false;
+    void operationsApi
+      .dashboard(organizationId)
+      .then((result) => {
+        if (cancelled) return;
+        setDashboard(result);
+        setDashboardError('');
+      })
+      .catch((cause) => {
+        if (cancelled) return;
+        setDashboard(null);
+        setDashboardError(cause instanceof Error ? cause.message : 'Unable to load the portfolio counts');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId, tab]);
+
+  const stageCounts = useMemo(
+    () => Object.fromEntries((dashboard?.stages ?? []).map((entry) => [entry.acquisition_stage, entry.count])) as Partial<Record<AcquisitionStage, number>>,
+    [dashboard],
   );
 
   if (showOnboarding) {
@@ -435,11 +479,12 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
         ) : tab === 'dashboard' ? (
           <>
             <div className="ops-metrics">
-              <Metric label="Properties" value={dashboard.total} />
-              <Metric label="Acquisition-ready" value={dashboard.ready} />
-              <Metric label="Active negotiations" value={dashboard.negotiation} />
+              <Metric label="Properties" value={dashboard ? dashboard.total : '—'} />
+              <Metric label="Acquisition-ready" value={dashboard ? dashboard.ready : '—'} />
+              <Metric label="Active negotiations" value={dashboard ? dashboard.negotiation : '—'} />
               <Metric label="Blocked / high risk" value={attention ? attention.properties.total : '—'} />
             </div>
+            {dashboardError && <p className="form-error">{dashboardError}</p>}
             <AttentionSection attention={attention} error={attentionError} onOpenProperty={openProperty} />
             <section className="ops-panel">
               <div className="panel-head">
@@ -450,7 +495,7 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
               </div>
               <div className="stage-grid">
                 {Object.entries(stageLabels).map(([key, label]) => {
-                  const count = properties.filter((property) => property.acquisition_stage === key).length;
+                  const count = dashboard ? stageCounts[key as AcquisitionStage] ?? 0 : '—';
                   return (
                     <button
                       key={key}
@@ -536,6 +581,11 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
                   </button>
                 ))}
               </div>
+            )}
+            {!loading && hasMoreProperties && (
+              <button className="secondary-button" aria-label="Load more properties" disabled={loadingMore} onClick={() => void loadMoreProperties()}>
+                {loadingMore ? 'Loading…' : 'Load more'}
+              </button>
             )}
             {selected && (
               <PropertyDrawer

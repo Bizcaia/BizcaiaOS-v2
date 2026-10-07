@@ -9,8 +9,21 @@ if (!connectionString) {
   console.warn('DATABASE_URL is not configured; API database calls will fail.');
 }
 
+// A PostgreSQL date is a calendar day, not an instant. The driver would turn
+// it into a Date at the server's local midnight, which reaches the client as
+// a timestamp that depends on the server timezone (and can be the day
+// before). The API returns the stored day, YYYY-MM-DD, instead.
+const DATE_OID = 1082;
+const types = {
+  getTypeParser: ((oid: number, format?: 'text' | 'binary') =>
+    oid === DATE_OID && format !== 'binary'
+      ? (value: string) => value
+      : pg.types.getTypeParser(oid, format as 'text')) as typeof pg.types.getTypeParser,
+};
+
 export const pool = new Pool({
   connectionString,
+  types,
   max: Number(process.env.DATABASE_POOL_SIZE ?? 10),
   ssl: process.env.DATABASE_SSL === 'require' ? { rejectUnauthorized: true } : undefined,
 });
