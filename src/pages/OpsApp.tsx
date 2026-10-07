@@ -6,6 +6,8 @@ import {
   operationsApi,
   type AcquisitionStage,
   type AgreementSignature,
+  type Attention,
+  type AttentionTask,
   type DocumentCategory,
   type DocumentStatus,
   type Negotiation,
@@ -229,6 +231,8 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   const [role, setRole] = useState<OrganizationRole>('viewer');
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [orgContextError, setOrgContextError] = useState('');
+  const [attention, setAttention] = useState<Attention | null>(null);
+  const [attentionError, setAttentionError] = useState('');
   const isDemo = organizationApiMode === 'demo';
   const canManageProperties = propertyCreateRoles.includes(role);
   const canManageOwners = ownerManagerRoles.includes(role);
@@ -296,12 +300,37 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
     void load();
   }, [organizationId, search, stage, selectedProjectId]);
 
+  // Read again whenever the Dashboard is shown, so changes made in a property are reflected.
+  useEffect(() => {
+    if (!organizationId || tab !== 'dashboard') return;
+    let cancelled = false;
+    void operationsApi
+      .getAttention(organizationId)
+      .then((result) => {
+        if (cancelled) return;
+        setAttention(result);
+        setAttentionError('');
+      })
+      .catch((cause) => {
+        if (cancelled) return;
+        setAttention(null);
+        setAttentionError(cause instanceof Error ? cause.message : 'Unable to load what needs attention');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId, tab]);
+
+  const openProperty = async (propertyId: string) => {
+    setSelected(await operationsApi.getProperty(propertyId));
+    setTab('properties');
+  };
+
   const dashboard = useMemo(
     () => ({
       total: properties.length,
       ready: properties.filter((property) => property.readiness_percent >= 80).length,
       negotiation: properties.filter((property) => property.acquisition_stage === 'negotiation').length,
-      blocked: properties.filter((property) => property.legal_status === 'blocked' || property.risk === 'high').length,
     }),
     [properties],
   );
@@ -409,8 +438,9 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
               <Metric label="Properties" value={dashboard.total} />
               <Metric label="Acquisition-ready" value={dashboard.ready} />
               <Metric label="Active negotiations" value={dashboard.negotiation} />
-              <Metric label="Blocked / high risk" value={dashboard.blocked} />
+              <Metric label="Blocked / high risk" value={attention ? attention.properties.total : '—'} />
             </div>
+            <AttentionSection attention={attention} error={attentionError} onOpenProperty={openProperty} />
             <section className="ops-panel">
               <div className="panel-head">
                 <div>
@@ -557,7 +587,99 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function AttentionSection({
+  attention,
+  error,
+  onOpenProperty,
+}: {
+  attention: Attention | null;
+  error: string;
+  onOpenProperty: (propertyId: string) => Promise<void>;
+}) {
+  const taskRow = (task: AttentionTask, showAssignee: boolean) => (
+    <li key={task.id}>
+      <button className="attention-row" onClick={() => void onOpenProperty(task.property_id)}>
+        <strong>
+          {task.title}
+          {task.overdue && <em className="attention-tag">Overdue</em>}
+        </strong>
+        <small>
+          {task.property_reference} · {taskPriorityLabels[task.priority]} · {taskStatusLabels[task.status]}
+          {task.due_on ? ` · Due ${task.due_on}` : ' · No due date'}
+          {showAssignee && ` · ${task.assigned_user_id ? task.assigned_user_name ?? 'Assigned' : 'Unassigned'}`}
+        </small>
+      </button>
+    </li>
+  );
+  const more = (list: { total: number; items: unknown[] }) =>
+    list.total > list.items.length && (
+      <p className="attention-more">
+        Showing {list.items.length} of {list.total}
+      </p>
+    );
+
+  return (
+    <section className="ops-panel attention-panel" aria-label="Needs attention">
+      <div className="panel-head">
+        <div>
+          <span className="panel-kicker">{attention ? `TODAY · ${attention.today}` : 'TODAY'}</span>
+          <h2>Needs attention</h2>
+        </div>
+      </div>
+      {error && <p className="form-error">{error}</p>}
+      {!attention ? (
+        !error && <p>Loading…</p>
+      ) : (
+        <div className="attention-grid">
+          <div role="group" aria-label="My tasks">
+            <h3>My tasks · {attention.my_tasks.total}</h3>
+            {attention.my_tasks.items.length === 0 ? (
+              <p>No open tasks assigned to you.</p>
+            ) : (
+              <ul className="attention-list">{attention.my_tasks.items.map((task) => taskRow(task, false))}</ul>
+            )}
+            {more(attention.my_tasks)}
+          </div>
+          <div role="group" aria-label="Overdue, not mine">
+            <h3>Overdue, not mine · {attention.overdue_tasks.total}</h3>
+            {attention.overdue_tasks.items.length === 0 ? (
+              <p>No overdue tasks.</p>
+            ) : (
+              <ul className="attention-list">{attention.overdue_tasks.items.map((task) => taskRow(task, true))}</ul>
+            )}
+            {more(attention.overdue_tasks)}
+          </div>
+          <div role="group" aria-label="Blocked or high risk">
+            <h3>Blocked or high risk · {attention.properties.total}</h3>
+            {attention.properties.items.length === 0 ? (
+              <p>No blocked or high-risk properties.</p>
+            ) : (
+              <ul className="attention-list">
+                {attention.properties.items.map((property) => (
+                  <li key={property.id}>
+                    <button className="attention-row" onClick={() => void onOpenProperty(property.id)}>
+                      <strong>
+                        {property.property_reference}
+                        {property.legal_status === 'blocked' && <em className="attention-tag">Legal blocked</em>}
+                        {property.risk === 'high' && <em className="attention-tag">High risk</em>}
+                      </strong>
+                      <small>
+                        {stageLabels[property.acquisition_stage]} · {statusLabels[property.acquisition_status]}
+                      </small>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {more(attention.properties)}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="ops-metric">
       <span>{label}</span>

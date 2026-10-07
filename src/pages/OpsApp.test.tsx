@@ -825,4 +825,121 @@ describe('OpsApp property workflow', () => {
     expect(within(section).getByText(/Needs review/)).toBeVisible();
     expect(within(section).queryByRole('button')).not.toBeInTheDocument();
   });
+
+  describe('Dashboard attention section', () => {
+    const attentionSection = async () => screen.findByRole('region', { name: 'Needs attention' });
+    const tile = () => screen.getByText('Blocked / high risk').closest('.ops-metric') as HTMLElement;
+
+    it('shows what needs attention on the Dashboard and makes the blocked / high risk tile agree with the list', async () => {
+      render(<OpsApp onExit={vi.fn()} />);
+      const section = await attentionSection();
+      const mine = await within(section).findByLabelText('My tasks');
+      const overdue = within(section).getByLabelText('Overdue, not mine');
+      const blocked = within(section).getByLabelText('Blocked or high risk');
+
+      expect(await within(mine).findByText('No open tasks assigned to you.')).toBeVisible();
+      expect(within(mine).getByRole('heading', { name: 'My tasks · 0' })).toBeVisible();
+
+      expect(within(overdue).getByRole('heading', { name: 'Overdue, not mine · 1' })).toBeVisible();
+      const task = within(overdue).getByRole('button', { name: /Follow up on survey plan/ });
+      expect(task).toHaveTextContent('Overdue');
+      expect(task).toHaveTextContent('NCP-00102 · High · Open · Due 2026-09-26 · Luis Reyes');
+
+      expect(within(blocked).getByRole('heading', { name: 'Blocked or high risk · 1' })).toBeVisible();
+      const property = within(blocked).getByRole('button', { name: /NCP-00131/ });
+      expect(property).toHaveTextContent('Legal blocked');
+      expect(property).toHaveTextContent('High risk');
+      expect(property).toHaveTextContent('Documentation · Active');
+
+      expect(within(tile()).getByText('1')).toBeVisible();
+      expect(within(section).getByText(/^TODAY · \d{4}-\d{2}-\d{2}$/)).toBeVisible();
+      // Read-only: a row is a single link to the property, with no task controls.
+      expect(within(section).queryByRole('combobox')).not.toBeInTheDocument();
+      expect(within(section).queryByRole('checkbox')).not.toBeInTheDocument();
+    });
+
+    it('opens the property of a task row and of a property row', async () => {
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      await user.click(await within(await attentionSection()).findByRole('button', { name: /Follow up on survey plan/ }));
+      expect(await screen.findByRole('heading', { name: 'NCP-00102', level: 2 })).toBeVisible();
+      expect(screen.getByRole('heading', { name: 'Properties' })).toBeVisible();
+
+      await user.click(screen.getByRole('button', { name: 'Dashboard' }));
+      await user.click(await within(await attentionSection()).findByRole('button', { name: /NCP-00131/ }));
+      expect(await screen.findByRole('heading', { name: 'NCP-00131', level: 2 })).toBeVisible();
+    });
+
+    it('lists my own open tasks, and reads again when the Dashboard is shown after a change', async () => {
+      await operationsApi.createTask('70000000-0000-4000-8000-000000000001', {
+        title: 'Confirm survey date',
+        assignedUserId: members[0].user_id,
+        dueOn: '2026-01-15',
+        priority: 'urgent',
+      });
+      const user = userEvent.setup();
+      render(<OpsApp onExit={vi.fn()} />);
+      const mine = await within(await attentionSection()).findByLabelText('My tasks');
+      const row = await within(mine).findByRole('button', { name: /Confirm survey date/ });
+      expect(row).toHaveTextContent('Overdue');
+      expect(row).toHaveTextContent('NCP-00102 · Urgent · Open · Due 2026-01-15');
+      expect(within(mine).getByRole('heading', { name: 'My tasks · 1' })).toBeVisible();
+      // My own task is not repeated under the overdue tasks of others.
+      expect(within(screen.getByLabelText('Overdue, not mine')).queryByText(/Confirm survey date/)).not.toBeInTheDocument();
+
+      // A risk change saved in a property is reflected once the Dashboard is shown again.
+      await user.click(screen.getByRole('button', { name: 'Properties' }));
+      await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
+      await user.selectOptions(await screen.findByLabelText('Risk'), 'high');
+      await user.click(screen.getByRole('button', { name: 'Save changes' }));
+      await waitFor(() => expect(screen.queryByRole('heading', { name: 'NCP-00118', level: 2 })).not.toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: 'Dashboard' }));
+      const blocked = await within(await attentionSection()).findByLabelText('Blocked or high risk');
+      expect(await within(blocked).findByRole('button', { name: /NCP-00118/ })).toHaveTextContent('High risk');
+      expect(within(blocked).getByRole('heading', { name: 'Blocked or high risk · 2' })).toBeVisible();
+      expect(within(tile()).getByText('2')).toBeVisible();
+    });
+
+    it('says how many rows are shown when a list is longer than the page, and uses the full count on the tile', async () => {
+      const items = Array.from({ length: 50 }, (_, index) => ({
+        id: `70000000-0000-4000-8000-0000000001${String(index).padStart(2, '0')}`,
+        property_reference: `LIM-${String(index + 1).padStart(3, '0')}`,
+        acquisition_stage: 'identified' as const,
+        acquisition_status: 'active' as const,
+        risk: 'high' as const,
+        legal_status: 'unknown',
+      }));
+      const spy = vi.spyOn(operationsApi, 'getAttention').mockResolvedValue({
+        today: '2026-10-07',
+        my_tasks: { total: 0, items: [] },
+        overdue_tasks: { total: 0, items: [] },
+        properties: { total: 61, items },
+      });
+      try {
+        render(<OpsApp onExit={vi.fn()} />);
+        const blocked = await within(await attentionSection()).findByLabelText('Blocked or high risk');
+        expect(await within(blocked).findByText('Showing 50 of 61')).toBeVisible();
+        expect(within(blocked).getAllByRole('button')).toHaveLength(50);
+        expect(within(tile()).getByText('61')).toBeVisible();
+        expect(within(screen.getByLabelText('Overdue, not mine')).getByText('No overdue tasks.')).toBeVisible();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('shows the failure instead of the lists, and no number on the tile, when the view cannot be read', async () => {
+      const spy = vi.spyOn(operationsApi, 'getAttention').mockRejectedValue(new Error('You do not have permission for this operation'));
+      try {
+        render(<OpsApp onExit={vi.fn()} />);
+        const section = await attentionSection();
+        expect(await within(section).findByText('You do not have permission for this operation')).toBeVisible();
+        expect(within(section).queryByLabelText('My tasks')).not.toBeInTheDocument();
+        expect(within(tile()).getByText('—')).toBeVisible();
+        // The other tiles are unaffected.
+        expect(screen.getByText('Acquisition-ready')).toBeVisible();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
 });

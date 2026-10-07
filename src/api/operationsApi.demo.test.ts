@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 describe('operationsApi demo adapter', () => {
   beforeEach(() => {
@@ -1405,5 +1405,202 @@ describe('operationsApi demo adapter', () => {
       .transitionPropertyStage(property.id, { targetStage: 'identified', expectedStage: 'documentation' })
       .catch((error: unknown) => error);
     expect(isLifecycleConflict(invalid)).toBe(false);
+  });
+
+  describe('attention view', () => {
+    const NCP_102 = '70000000-0000-4000-8000-000000000001';
+    const ALEX = '758d5718-53d9-4ea2-b9d5-02828fcc0e2c';
+    const LUIS = '5517eab7-57db-412f-b381-33844d31a64f';
+    const CELINA = '419fa143-1d97-40cd-b47b-812cb364acfd';
+    // 00:30 on 2026-03-11 in Asia/Manila (the demo organization's timezone); still 2026-03-10 in UTC.
+    const AT = new Date('2026-03-10T16:30:00Z');
+    const BEFORE_MIDNIGHT = new Date('2026-03-10T15:30:00Z');
+
+    // Only Date is replaced: the adapters' own delays keep running on real timers.
+    const at = (instant: Date) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(instant);
+    };
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('shows the seeded overdue task of another user and the blocked, high-risk property', async () => {
+      at(new Date('2026-10-07T04:00:00Z'));
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      expect(await operationsApi.getAttention(DEMO_ORGANIZATION_ID)).toEqual({
+        today: '2026-10-07',
+        my_tasks: { total: 0, items: [] },
+        overdue_tasks: {
+          total: 1,
+          items: [
+            {
+              id: 'a1000000-0000-4000-8000-000000000001',
+              property_id: NCP_102,
+              property_reference: 'NCP-00102',
+              title: 'Follow up on survey plan',
+              status: 'open',
+              priority: 'high',
+              assigned_user_id: LUIS,
+              assigned_user_name: 'Luis Reyes',
+              due_on: '2026-09-26',
+              overdue: true,
+            },
+          ],
+        },
+        properties: {
+          total: 1,
+          items: [
+            {
+              id: '70000000-0000-4000-8000-000000000003',
+              property_reference: 'NCP-00131',
+              acquisition_stage: 'documentation',
+              acquisition_status: 'active',
+              risk: 'high',
+              legal_status: 'blocked',
+            },
+          ],
+        },
+      });
+    });
+
+    it('applies the task rules of the API: mine, open or in progress, not archived, overdue only before today', async () => {
+      at(AT);
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      const create = (title: string, input: { assignedUserId?: string | null; dueOn?: string | null; priority?: 'low' | 'normal' | 'high' | 'urgent' }) =>
+        operationsApi.createTask(NCP_102, { title, ...input });
+      await create('Mine, due yesterday', { assignedUserId: ALEX, dueOn: '2026-03-10' });
+      const today = await create('Mine, due today', { assignedUserId: ALEX, dueOn: '2026-03-11', priority: 'high' });
+      await operationsApi.updateTask(today.id, { status: 'in_progress' });
+      await create('Mine, no due date', { assignedUserId: ALEX, priority: 'urgent' });
+      await operationsApi.updateTask((await create('Mine, done', { assignedUserId: ALEX, dueOn: '2026-03-01' })).id, { status: 'done' });
+      await operationsApi.updateTask((await create('Mine, cancelled', { assignedUserId: ALEX, dueOn: '2026-03-01' })).id, { status: 'cancelled' });
+      await operationsApi.updateTask((await create('Mine, archived', { assignedUserId: ALEX, dueOn: '2026-03-01' })).id, { archived: true });
+      await create('Unassigned, late', { dueOn: '2026-03-05', priority: 'low' });
+      await create('Legal, late', { assignedUserId: CELINA, dueOn: '2026-03-05', priority: 'urgent' });
+      await create('Luis, due today', { assignedUserId: LUIS, dueOn: '2026-03-11' });
+
+      const after = await operationsApi.getAttention(DEMO_ORGANIZATION_ID);
+      expect(after.today).toBe('2026-03-11');
+      expect(after.my_tasks.total).toBe(3);
+      expect(after.my_tasks.items.map((task) => [task.title, task.status, task.due_on, task.overdue])).toEqual([
+        ['Mine, due yesterday', 'open', '2026-03-10', true],
+        ['Mine, due today', 'in_progress', '2026-03-11', false],
+        ['Mine, no due date', 'open', null, false],
+      ]);
+      expect(after.my_tasks.items.every((task) => task.assigned_user_id === ALEX && task.property_reference === 'NCP-00102')).toBe(true);
+      // Others' and unassigned overdue tasks only; the most urgent first on the same day.
+      expect(after.overdue_tasks.total).toBe(2);
+      expect(after.overdue_tasks.items.map((task) => [task.title, task.assigned_user_id, task.assigned_user_name, task.overdue])).toEqual([
+        ['Legal, late', CELINA, 'Celina Cruz', true],
+        ['Unassigned, late', null, null, true],
+      ]);
+
+      // One hour earlier it is still the 10th in Manila: a task due on the 10th is not overdue yet.
+      vi.setSystemTime(BEFORE_MIDNIGHT);
+      const before = await operationsApi.getAttention(DEMO_ORGANIZATION_ID);
+      expect(before.today).toBe('2026-03-10');
+      expect(before.my_tasks.items.map((task) => task.overdue)).toEqual([false, false, false]);
+      expect(before.overdue_tasks.items.map((task) => task.title)).toEqual(['Legal, late', 'Unassigned, late']);
+    });
+
+    it('lists blocked or high-risk properties still being acquired, in byte order of the reference', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      const projectId = '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001';
+      const create = (propertyReference: string, risk: string) =>
+        operationsApi.createProperty({ organizationId: DEMO_ORGANIZATION_ID, projectId, propertyReference, risk } as never);
+      const references = async () => (await operationsApi.getAttention(DEMO_ORGANIZATION_ID)).properties.items.map((property) => property.property_reference);
+
+      const high = await create('ATT-D1', 'high');
+      const blocked = await create('ATT-D2', 'low');
+      await create('ATT-D3', 'medium');
+      await create('att-d0', 'high');
+      expect(await references()).toEqual(['ATT-D1', 'NCP-00131', 'att-d0']);
+
+      await operationsApi.updateProperty(blocked.id, { legalStatus: 'blocked' });
+      expect(await references()).toEqual(['ATT-D1', 'ATT-D2', 'NCP-00131', 'att-d0']);
+
+      // On hold is still being acquired; withdrawn is not.
+      await operationsApi.transitionPropertyStatus(high.id, { targetStatus: 'on_hold', expectedStatus: 'active' });
+      const onHold = await operationsApi.getAttention(DEMO_ORGANIZATION_ID);
+      expect(onHold.properties.items[0]).toMatchObject({ property_reference: 'ATT-D1', acquisition_status: 'on_hold', risk: 'high', legal_status: 'unknown' });
+      await operationsApi.transitionPropertyStatus(high.id, { targetStatus: 'withdrawn', expectedStatus: 'on_hold', reason: 'Owner declined' });
+      expect(await references()).toEqual(['ATT-D2', 'NCP-00131', 'att-d0']);
+      expect((await operationsApi.getAttention(DEMO_ORGANIZATION_ID)).properties.total).toBe(3);
+
+      await operationsApi.updateProperty(blocked.id, { legalStatus: 'clear' });
+      expect(await references()).toEqual(['NCP-00131', 'att-d0']);
+    });
+
+    it('uses the organization timezone for today, and UTC when it is not recognized', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      const { organizationApi } = await import('./organizationApi');
+      await organizationApi.updateOrganization(DEMO_ORGANIZATION_ID, { timezone: 'America/New_York' });
+      at(new Date('2026-03-10T03:00:00Z'));
+      expect((await operationsApi.getAttention(DEMO_ORGANIZATION_ID)).today).toBe('2026-03-09');
+
+      await organizationApi.updateOrganization(DEMO_ORGANIZATION_ID, { timezone: 'Not/AZone' });
+      vi.setSystemTime(AT);
+      const fallback = await operationsApi.getAttention(DEMO_ORGANIZATION_ID);
+      expect(fallback.today).toBe('2026-03-10');
+      expect(fallback.properties.total).toBe(1);
+    });
+
+    it('returns at most the list limit and the full count', async () => {
+      at(AT);
+      const { operationsApi, DEMO_ORGANIZATION_ID, ATTENTION_LIST_LIMIT } = await import('./operationsApi');
+      expect(ATTENTION_LIST_LIMIT).toBe(50);
+      for (let index = 1; index <= 52; index += 1) {
+        await operationsApi.createTask(NCP_102, { title: `Mine ${index}`, assignedUserId: ALEX });
+        await operationsApi.createTask(NCP_102, { title: `Late ${String(index).padStart(2, '0')}`, dueOn: `2026-01-${String((index % 28) + 1).padStart(2, '0')}` });
+      }
+      const result = await operationsApi.getAttention(DEMO_ORGANIZATION_ID);
+      expect([result.my_tasks.total, result.my_tasks.items.length]).toEqual([52, 50]);
+      expect([result.overdue_tasks.total, result.overdue_tasks.items.length]).toEqual([52, 50]);
+      // Same due date and priority: ordered by id.
+      const ids = result.my_tasks.items.map((task) => task.id);
+      expect(ids).toEqual([...ids].sort());
+      const dues = result.overdue_tasks.items.map((task) => task.due_on);
+      expect(dues).toEqual([...dues].sort());
+    });
+
+    it('changes nothing and is refused for an organization the demo user does not belong to', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      const before = JSON.stringify([await operationsApi.listProperties(DEMO_ORGANIZATION_ID), await operationsApi.listTasks(NCP_102, { includeArchived: true })]);
+      await operationsApi.getAttention(DEMO_ORGANIZATION_ID);
+      expect(JSON.stringify([await operationsApi.listProperties(DEMO_ORGANIZATION_ID), await operationsApi.listTasks(NCP_102, { includeArchived: true })])).toBe(before);
+      await expect(operationsApi.getAttention('99999999-9999-4999-8999-999999999999')).rejects.toThrow('You do not have permission for this operation');
+    });
+  });
+});
+
+describe('operationsApi live attention request', () => {
+  it('reads GET /ops/attention for the organization and returns the unwrapped lists', async () => {
+    const data = {
+      today: '2026-10-07',
+      my_tasks: { total: 0, items: [] },
+      overdue_tasks: { total: 0, items: [] },
+      properties: { total: 0, items: [] },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.resetModules();
+    vi.stubEnv('VITE_API_BASE_URL', 'https://api.example.com/api/v1/');
+    window.__BIZCAIAOS_AUTH__ = { getAccessToken: vi.fn().mockResolvedValue('verified-jwt-token') };
+    try {
+      const { operationsApi, operationsApiMode, DEMO_ORGANIZATION_ID } = await import('./operationsApi');
+      expect(operationsApiMode).toBe('live');
+      expect(await operationsApi.getAttention(DEMO_ORGANIZATION_ID)).toEqual(data);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(`https://api.example.com/api/v1/ops/attention?organizationId=${DEMO_ORGANIZATION_ID}`);
+      expect(init?.method ?? 'GET').toBe('GET');
+      expect(init?.body).toBeUndefined();
+    } finally {
+      delete window.__BIZCAIAOS_AUTH__;
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
   });
 });

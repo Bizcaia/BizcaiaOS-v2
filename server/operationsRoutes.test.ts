@@ -3288,4 +3288,155 @@ describe('property workflow API', () => {
       }
     });
   });
+
+  describe('attention view', () => {
+    const TASK_ROW = {
+      id: 'c0000000-0000-4000-8000-000000000001',
+      property_id: PROPERTY_A,
+      property_reference: 'NCP-00001',
+      title: 'Call the owner',
+      status: 'open',
+      priority: 'high',
+      assigned_user_id: USER_ID,
+      assigned_user_name: 'Test User',
+      due_on: '2026-09-20',
+      overdue: true,
+    };
+    const PROPERTY_ROW = {
+      id: PROPERTY_A,
+      property_reference: 'NCP-00001',
+      acquisition_stage: 'negotiation',
+      acquisition_status: 'on_hold',
+      risk: 'high',
+      legal_status: 'blocked',
+    };
+    let attentionRows: { mine: unknown[]; overdue: unknown[]; properties: unknown[] };
+    let todayError: Error | null;
+
+    const normalize = (sql: string) => sql.replace(/\s+/g, ' ').trim().toLowerCase();
+    const attentionCalls = () =>
+      actorQuery.mock.calls
+        .map(([sql, params]) => [normalize(String(sql)), params] as [string, unknown[] | undefined])
+        .filter(([sql]) => sql.includes('attention_today') || sql.includes('as today') || sql.includes('as overdue') || sql.includes("p.risk = 'high'"));
+    const get = (baseUrl: string, query = `?organizationId=${ORG_A}`, headers: Record<string, string> = AUTH) =>
+      fetch(`${baseUrl}/api/v1/ops/attention${query}`, { headers });
+
+    beforeEach(() => {
+      attentionRows = { mine: [], overdue: [], properties: [] };
+      todayError = null;
+      actorQuery.mockImplementation(async (sql: string, params: unknown[] = []) => {
+        const normalized = normalize(sql);
+        if (normalized.includes('savepoint attention_today')) return { rows: [], rowCount: 0 };
+        if (normalized.includes('as today')) {
+          if (params[2] === null && todayError) throw todayError;
+          return { rows: [{ today: params[2] === 'UTC' ? '2026-09-22' : '2026-09-23' }], rowCount: 1 };
+        }
+        if (normalized.includes('as overdue')) {
+          const rows = normalized.includes('is distinct from') ? attentionRows.overdue : attentionRows.mine;
+          return { rows, rowCount: rows.length };
+        }
+        if (normalized.includes("p.risk = 'high'")) return { rows: attentionRows.properties, rowCount: attentionRows.properties.length };
+        return handleActorQuery(sql, params);
+      });
+    });
+
+    it('returns the three lists with numeric totals and without the count column', async () => {
+      attentionRows = {
+        mine: [{ ...TASK_ROW, total: '7' }],
+        overdue: [{ ...TASK_ROW, id: 'c0000000-0000-4000-8000-000000000002', assigned_user_id: null, assigned_user_name: null, total: '61' }],
+        properties: [{ ...PROPERTY_ROW, total: '3' }],
+      };
+      await withApi(async (baseUrl) => {
+        const response = await get(baseUrl);
+        expect(response.status).toBe(200);
+        expect((await response.json()).data).toEqual({
+          today: '2026-09-23',
+          my_tasks: { total: 7, items: [TASK_ROW] },
+          overdue_tasks: {
+            total: 61,
+            items: [{ ...TASK_ROW, id: 'c0000000-0000-4000-8000-000000000002', assigned_user_id: null, assigned_user_name: null }],
+          },
+          properties: { total: 3, items: [PROPERTY_ROW] },
+        });
+      });
+    });
+
+    it('reports empty lists as a total of zero', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await (await get(baseUrl)).json()).data).toEqual({
+          today: '2026-09-23',
+          my_tasks: { total: 0, items: [] },
+          overdue_tasks: { total: 0, items: [] },
+          properties: { total: 0, items: [] },
+        });
+      });
+    });
+
+    it('reads only: one day lookup and three selects scoped to the organization, the day and the caller', async () => {
+      await withApi(async (baseUrl) => {
+        expect((await get(baseUrl)).status).toBe(200);
+      });
+      const calls = attentionCalls();
+      expect(calls.map(([sql]) => sql.split(' ')[0])).toEqual(['savepoint', 'select', 'release', 'select', 'select', 'select']);
+      const [, day, , mine, overdue, properties] = calls;
+      expect(day[1]).toEqual([ORG_A, null, null]);
+      expect(day[0]).toContain('at time zone coalesce($3::text, o.timezone)');
+
+      for (const [sql, params] of [mine, overdue]) {
+        expect(params).toEqual([ORG_A, '2026-09-23', USER_ID]);
+        expect(sql).toContain('join public.properties p on p.id = t.property_id');
+        expect(sql).toContain('where t.organization_id = $1 and t.archived_at is null and t.status in (\'open\', \'in_progress\')');
+        expect(sql).toContain('(t.due_on is not null and t.due_on < $2::date) as overdue');
+        expect(sql).toContain('order by t.due_on asc nulls last, t.priority desc, t.id limit 50');
+      }
+      expect(mine[0]).toContain('and t.assigned_user_id = $3::uuid');
+      expect(mine[0]).not.toContain('is distinct from');
+      expect(overdue[0]).toContain('and t.due_on < $2::date and t.assigned_user_id is distinct from $3::uuid');
+
+      expect(properties[1]).toEqual([ORG_A]);
+      expect(properties[0]).toContain(
+        "where p.organization_id = $1 and p.status = 'active' and p.acquisition_status in ('active', 'on_hold') and (p.legal_status = 'blocked' or p.risk = 'high')",
+      );
+      expect(properties[0]).toContain('order by p.property_reference collate "c", p.id limit 50');
+      // Nothing but selects and the savepoint reaches the database.
+      expect(calls.some(([sql]) => /\b(insert|update|delete)\b/.test(sql))).toBe(false);
+    });
+
+    it('falls back to UTC for today when PostgreSQL does not recognize the organization timezone', async () => {
+      todayError = sqlError('22023', 'time zone "Mars/Olympus" not recognized');
+      await withApi(async (baseUrl) => {
+        const response = await get(baseUrl);
+        expect(response.status).toBe(200);
+        expect((await response.json()).data.today).toBe('2026-09-22');
+      });
+      const calls = attentionCalls();
+      expect(calls.map(([sql]) => sql.split(' ')[0])).toEqual(['savepoint', 'select', 'rollback', 'select', 'select', 'select', 'select']);
+      expect(calls[2][0]).toBe('rollback to savepoint attention_today');
+      expect(calls[3][1]).toEqual([ORG_A, null, 'UTC']);
+      // The lists use the fallback day.
+      expect(calls[4][1]).toEqual([ORG_A, '2026-09-22', USER_ID]);
+    });
+
+    it('does not hide any other failure behind the fallback', async () => {
+      todayError = sqlError('57014', 'canceling statement due to statement timeout');
+      await withApi(async (baseUrl) => {
+        const response = await get(baseUrl);
+        expect(response.status).toBe(500);
+        expect((await response.json()).error.code).toBe('internal_server_error');
+      });
+      expect(attentionCalls().map(([sql]) => sql.split(' ')[0])).toEqual(['savepoint', 'select']);
+    });
+
+    it('is refused for a non-member, without an organization, and without a token, before anything is read', async () => {
+      await withApi(async (baseUrl) => {
+        const outside = await get(baseUrl, `?organizationId=${ORG_B}`);
+        expect(outside.status).toBe(403);
+        expect((await outside.json()).error.message).toBe('You do not have permission for this operation');
+        expect((await get(baseUrl, '')).status).toBe(400);
+        expect((await get(baseUrl, '?organizationId=nope')).status).toBe(400);
+        expect((await get(baseUrl, `?organizationId=${ORG_A}`, {})).status).toBe(401);
+      });
+      expect(attentionCalls()).toEqual([]);
+    });
+  });
 });
