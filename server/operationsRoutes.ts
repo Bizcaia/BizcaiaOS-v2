@@ -414,7 +414,7 @@ operationsRouter.get('/properties', async (request, response) => {
     }
     values.push(query.limit, query.offset);
     const result = await client.query(
-      `${propertySelect} where ${where.join(' and ')} order by p.updated_at desc limit $${values.length - 1} offset $${values.length}`,
+      `${propertySelect} where ${where.join(' and ')} order by p.updated_at desc, p.id limit $${values.length - 1} offset $${values.length}`,
       values,
     );
     return result.rows;

@@ -1604,3 +1604,278 @@ describe('operationsApi live attention request', () => {
     }
   });
 });
+
+describe('operationsApi live-mode correctness (L1)', () => {
+  const PROJECT = '6c8e5a14-2b89-4d1d-a2f0-8f9b0a2f0001';
+  const STAGES = [
+    'identified', 'initial_contact', 'owner_validation', 'property_validation', 'documentation', 'negotiation', 'commercial_review',
+    'legal_review', 'agreement_preparation', 'signing', 'payment_closing', 'acquisition_complete', 'on_hold', 'withdrawn',
+  ];
+
+  async function loadDemo() {
+    vi.resetModules();
+    vi.stubEnv('VITE_API_BASE_URL', '');
+    return import('./operationsApi');
+  }
+
+  /** Small seeded generator, so the same demo data is built on every run. */
+  function mulberry32(seed: number) {
+    let a = seed;
+    return () => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    delete window.__BIZCAIAOS_AUTH__;
+  });
+
+  describe('property list pages', () => {
+    it('reaches 120 properties exactly once in pages of 50, most recently changed first and then by id', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID, PROPERTY_PAGE_SIZE } = await loadDemo();
+      expect(PROPERTY_PAGE_SIZE).toBe(50);
+      // One clock reading for all of them: only the id can order them, as for rows written in one transaction.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-10-01T00:00:00.000Z'));
+      const created: string[] = [];
+      for (let index = 0; index < 116; index += 1) {
+        created.push((await operationsApi.createProperty({ organizationId: DEMO_ORGANIZATION_ID, projectId: PROJECT, propertyReference: `PG-${String(index).padStart(3, '0')}` })).id);
+      }
+      const page = (offset: number, limit?: number) => operationsApi.listProperties(DEMO_ORGANIZATION_ID, { offset, ...(limit ? { limit } : {}) });
+      const pages = [await page(0), await page(50), await page(100)];
+      expect(pages.map((entries) => entries.length)).toEqual([50, 50, 20]);
+      const ids = pages.flat().map((property) => property.id);
+      expect(new Set(ids).size).toBe(120);
+      // The 116 created now lead, ordered by id; the four seeded properties, never changed, come last.
+      expect(ids.slice(0, 116)).toEqual([...created].sort());
+      expect(ids.slice(116)).toEqual(['70000000-0000-4000-8000-000000000001', '70000000-0000-4000-8000-000000000002', '70000000-0000-4000-8000-000000000003', '70000000-0000-4000-8000-000000000004']);
+      expect((await page(0)).map((property) => property.id)).toEqual(ids.slice(0, 50));
+      expect((await page(57, 1)).map((property) => property.id)).toEqual([ids[57]]);
+      expect((await page(0, 200)).map((property) => property.id)).toEqual(ids);
+
+      // A later change of any kind moves that property to the front and keeps every other in place.
+      vi.setSystemTime(new Date('2026-10-01T00:00:01.000Z'));
+      await operationsApi.updateProperty(ids[90], { readinessPercent: 55 });
+      vi.setSystemTime(new Date('2026-10-01T00:00:02.000Z'));
+      await operationsApi.transitionPropertyStatus(ids[30], { targetStatus: 'on_hold', expectedStatus: 'active' });
+      vi.setSystemTime(new Date('2026-10-01T00:00:03.000Z'));
+      await operationsApi.transitionPropertyStage('70000000-0000-4000-8000-000000000002', { targetStage: 'legal_review', expectedStage: 'commercial_review' });
+      const after = (await page(0, 200)).map((property) => property.id);
+      const moved = ['70000000-0000-4000-8000-000000000002', ids[30], ids[90]];
+      expect(after.slice(0, 3)).toEqual(moved);
+      expect(after.slice(3)).toEqual(ids.filter((id) => !moved.includes(id)));
+    });
+
+    it('pages each filter from its own first row and refuses a page size or offset the API refuses', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo();
+      for (let index = 0; index < 60; index += 1) {
+        await operationsApi.createProperty({ organizationId: DEMO_ORGANIZATION_ID, projectId: PROJECT, propertyReference: `FL-${index}`, municipality: index % 2 ? 'Calamba' : 'Biñan' });
+      }
+      const all = await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { limit: 200 });
+      const calamba = all.filter((property) => (property.municipality ?? '').toLowerCase().includes('calamba') || property.barangay?.toLowerCase().includes('calamba'));
+      expect(calamba.length).toBeGreaterThan(30);
+      const read = async (filters: { search?: string; stage?: 'identified' }) => [
+        ...(await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { ...filters, limit: 25, offset: 0 })),
+        ...(await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { ...filters, limit: 25, offset: 25 })),
+        ...(await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { ...filters, limit: 25, offset: 50 })),
+      ];
+      expect((await read({ search: '  CALAMBA ' })).map((property) => property.id)).toEqual(calamba.map((property) => property.id));
+      expect((await read({ stage: 'identified' })).map((property) => property.id)).toEqual(all.filter((property) => property.acquisition_stage === 'identified').map((property) => property.id));
+      // An empty search is no filter.
+      expect((await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { search: '   ', limit: 200 })).length).toBe(all.length);
+
+      for (const page of [{ limit: 0 }, { limit: 201 }, { limit: 1.5 }, { offset: -1 }, { offset: 0.5 }]) {
+        await expect(operationsApi.listProperties(DEMO_ORGANIZATION_ID, page)).rejects.toThrow('Request validation failed');
+      }
+    });
+  });
+
+  describe('portfolio counts', () => {
+    it('counts the seeded portfolio by the server definitions', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo();
+      expect(await operationsApi.dashboard(DEMO_ORGANIZATION_ID)).toEqual({
+        total: 4,
+        active: 4,
+        negotiation: 1,
+        blocked: 1,
+        ready: 1,
+        stages: [
+          { acquisition_stage: 'documentation', count: 1 },
+          { acquisition_stage: 'negotiation', count: 1 },
+          { acquisition_stage: 'commercial_review', count: 1 },
+          { acquisition_stage: 'withdrawn', count: 1 },
+        ],
+      });
+    });
+
+    it('counts ready and the stages among active properties only, and negotiation by stage whatever the status', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo();
+      const NEGOTIATION = '70000000-0000-4000-8000-000000000001';
+      const REVIEW = '70000000-0000-4000-8000-000000000002';
+      await operationsApi.updateProperty(NEGOTIATION, { readinessPercent: 80 });
+      await operationsApi.updateProperty(REVIEW, { readinessPercent: 79 });
+      expect(await operationsApi.dashboard(DEMO_ORGANIZATION_ID)).toMatchObject({ total: 4, active: 4, negotiation: 1, ready: 1 });
+
+      await operationsApi.transitionPropertyStatus(NEGOTIATION, { targetStatus: 'on_hold', expectedStatus: 'active' });
+      const paused = await operationsApi.dashboard(DEMO_ORGANIZATION_ID);
+      expect(paused).toMatchObject({ total: 4, active: 3, negotiation: 1, ready: 0 });
+      expect(paused.stages).toEqual([
+        { acquisition_stage: 'documentation', count: 1 },
+        { acquisition_stage: 'commercial_review', count: 1 },
+        { acquisition_stage: 'withdrawn', count: 1 },
+      ]);
+      await expect(operationsApi.dashboard('99999999-9999-4999-8999-999999999999')).rejects.toThrow('You do not have permission for this operation');
+    });
+
+    it.each([3, 17, 91])('matches counts and pages computed independently from randomized data (seed %i)', async (seed) => {
+      const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo();
+      const random = mulberry32(seed);
+      const pick = <T,>(values: T[]) => values[Math.floor(random() * values.length)];
+      vi.useFakeTimers({ toFake: ['Date'] });
+      let clock = Date.parse('2026-10-01T00:00:00.000Z');
+      const tick = () => {
+        // Often the same instant as the previous write, so ties are common.
+        if (random() < 0.5) clock += 1000;
+        vi.setSystemTime(new Date(clock));
+      };
+      for (let index = 0; index < 130; index += 1) {
+        tick();
+        const property = await operationsApi.createProperty({
+          organizationId: DEMO_ORGANIZATION_ID,
+          projectId: PROJECT,
+          propertyReference: `RN-${seed}-${index}`,
+          risk: pick(['low', 'medium', 'high']),
+        } as never);
+        if (random() < 0.6) {
+          tick();
+          await operationsApi.updateProperty(property.id, { readinessPercent: pick([0, 35, 79, 80, 81, 100]), legalStatus: pick(['unknown', 'clear', 'blocked']) });
+        }
+        const target = pick(['identified', 'identified', 'initial_contact', 'owner_validation']);
+        if (target !== 'identified') {
+          tick();
+          await operationsApi.transitionPropertyStage(property.id, { targetStage: 'initial_contact', expectedStage: 'identified' });
+          if (target === 'owner_validation') await operationsApi.transitionPropertyStage(property.id, { targetStage: 'owner_validation', expectedStage: 'initial_contact' });
+        }
+        const status = pick(['active', 'active', 'on_hold', 'withdrawn']);
+        if (status !== 'active') {
+          tick();
+          await operationsApi.transitionPropertyStatus(property.id, { targetStatus: status as 'on_hold' | 'withdrawn', expectedStatus: 'active', reason: 'randomized' });
+        }
+      }
+
+      const all = await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { limit: 200 });
+      expect(all).toHaveLength(134);
+      // The order, computed here from each row's own change time and id.
+      const expectedOrder = [...all].sort((a, b) => {
+        const left = a.updated_at ?? '';
+        const right = b.updated_at ?? '';
+        return left !== right ? (left < right ? 1 : -1) : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+      expect(all.map((property) => property.id)).toEqual(expectedOrder.map((property) => property.id));
+      expect(new Set(all.map((property) => property.updated_at)).size).toBeLessThan(134);
+      for (const limit of [50, 7, 33]) {
+        const paged: string[] = [];
+        for (let offset = 0; offset < 134; offset += limit) {
+          paged.push(...(await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { limit, offset })).map((property) => property.id));
+        }
+        expect(paged).toEqual(all.map((property) => property.id));
+      }
+
+      const active = all.filter((property) => property.acquisition_status === 'active');
+      expect(await operationsApi.dashboard(DEMO_ORGANIZATION_ID)).toEqual({
+        total: all.length,
+        active: active.length,
+        negotiation: all.filter((property) => property.acquisition_stage === 'negotiation').length,
+        blocked: all.filter((property) => property.legal_status === 'blocked' || property.risk === 'high').length,
+        ready: active.filter((property) => property.readiness_percent >= 80).length,
+        stages: STAGES.map((stage) => ({ acquisition_stage: stage, count: active.filter((property) => property.acquisition_stage === stage).length })).filter((entry) => entry.count > 0),
+      });
+    });
+  });
+
+  describe('live requests', () => {
+    async function loadLive(payload: unknown) {
+      const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ data: payload }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      vi.stubGlobal('fetch', fetchMock);
+      vi.resetModules();
+      vi.stubEnv('VITE_API_BASE_URL', 'https://api.example.com/api/v1/');
+      window.__BIZCAIAOS_AUTH__ = { getAccessToken: vi.fn().mockResolvedValue('verified-jwt-token') };
+      const module = await import('./operationsApi');
+      expect(module.operationsApiMode).toBe('live');
+      const urls = () => fetchMock.mock.calls.map(([url]) => new URL(String(url)));
+      return { ...module, urls };
+    }
+
+    it('asks for one page and sends only the filters that are set, never the text "undefined"', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID, urls } = await loadLive([]);
+      await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { search: '', stage: undefined, projectId: undefined });
+      await operationsApi.listProperties(DEMO_ORGANIZATION_ID);
+      await operationsApi.listProperties(DEMO_ORGANIZATION_ID, { search: '  Calamba ', stage: 'negotiation', projectId: PROJECT, limit: 50, offset: 100 });
+      const [unset, bare, filtered] = urls();
+      for (const url of [unset, bare]) {
+        expect(url.pathname).toBe('/api/v1/ops/properties');
+        expect(Object.fromEntries(url.searchParams)).toEqual({ organizationId: DEMO_ORGANIZATION_ID, limit: '50', offset: '0' });
+      }
+      expect(Object.fromEntries(filtered.searchParams)).toEqual({
+        organizationId: DEMO_ORGANIZATION_ID,
+        limit: '50',
+        offset: '100',
+        projectId: PROJECT,
+        stage: 'negotiation',
+        search: 'Calamba',
+      });
+      expect(urls().some((url) => url.search.includes('undefined'))).toBe(false);
+    });
+
+    it('reads the portfolio counts from GET /ops/dashboard and returns them as numbers', async () => {
+      const { operationsApi, DEMO_ORGANIZATION_ID, urls } = await loadLive({
+        total: '118',
+        active: '75',
+        negotiation: '9',
+        blocked: '61',
+        ready: '21',
+        stages: [
+          { acquisition_stage: 'identified', count: '12' },
+          { acquisition_stage: 'withdrawn', count: '3' },
+        ],
+      });
+      expect(await operationsApi.dashboard(DEMO_ORGANIZATION_ID)).toEqual({
+        total: 118,
+        active: 75,
+        negotiation: 9,
+        blocked: 61,
+        ready: 21,
+        stages: [
+          { acquisition_stage: 'identified', count: 12 },
+          { acquisition_stage: 'withdrawn', count: 3 },
+        ],
+      });
+      expect(urls()[0].pathname + urls()[0].search).toBe(`/api/v1/ops/dashboard?organizationId=${DEMO_ORGANIZATION_ID}`);
+    });
+  });
+
+  it('keeps every date-only field as the day that was entered', async () => {
+    const { operationsApi, DEMO_ORGANIZATION_ID } = await loadDemo();
+    const day = /^\d{4}-\d{2}-\d{2}$/;
+    const property = '70000000-0000-4000-8000-000000000001';
+    const task = await operationsApi.createTask(property, { title: 'Dated', dueOn: '2026-09-26' });
+    expect(task.due_on).toBe('2026-09-26');
+    expect((await operationsApi.updateTask(task.id, { dueOn: '2028-02-29' })).due_on).toBe('2028-02-29');
+    for (const entry of await operationsApi.listTasks(property, { includeArchived: true })) expect(entry.due_on === null || day.test(entry.due_on)).toBe(true);
+    for (const payment of await operationsApi.listPayments(property)) {
+      expect(payment.scheduled_on === null || day.test(payment.scheduled_on)).toBe(true);
+      expect(payment.paid_on === null || day.test(payment.paid_on)).toBe(true);
+    }
+    for (const signature of await operationsApi.listAgreementSignatures(property, { includeArchived: true })) expect(signature.signed_on).toMatch(day);
+    for (const project of await operationsApi.listProjects(DEMO_ORGANIZATION_ID)) {
+      expect(project.starts_on == null || day.test(project.starts_on)).toBe(true);
+      expect(project.target_completion_on == null || day.test(project.target_completion_on)).toBe(true);
+    }
+  });
+});

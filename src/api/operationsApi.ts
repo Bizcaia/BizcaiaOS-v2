@@ -49,6 +49,8 @@ export type Property = {
   payment_status: string;
   readiness_percent: number;
   risk: 'low' | 'medium' | 'high';
+  created_at?: string;
+  updated_at?: string;
   project_code?: string;
   project_name?: string;
   negotiator_name?: string | null;
@@ -270,6 +272,24 @@ export type TimelineEntry = {
   actor: { id: string; display_name: string | null } | null;
   summary: string;
   archived: boolean;
+};
+
+/** Rows the Properties tab reads per request. */
+export const PROPERTY_PAGE_SIZE = 50;
+
+/**
+ * Portfolio counts as the server defines them, over the properties the caller
+ * can see: `total` properties (not archived), `active` and `ready` (readiness
+ * of 80% or more) among those being acquired, `negotiation` by stage, and the
+ * active properties of each stage that has any.
+ */
+export type DashboardSummary = {
+  total: number;
+  active: number;
+  negotiation: number;
+  blocked: number;
+  ready: number;
+  stages: Array<{ acquisition_stage: AcquisitionStage; count: number }>;
 };
 
 /** One row of an attention task list; `overdue` is decided against the organization's calendar day. */
@@ -657,6 +677,9 @@ export const stageOrder: AcquisitionStage[] = [
   'signing',
   'payment_closing',
 ];
+
+/** Every stage value in the order the database lists them, the legacy values last. */
+const acquisitionStageOrder: AcquisitionStage[] = [...stageOrder, 'acquisition_complete', 'on_hold', 'withdrawn'];
 
 export const forwardStageRoles = new Set(['negotiator', 'supervisor', 'land_acquisition_manager', 'system_admin']);
 export const backwardStageRoles = new Set(['supervisor', 'land_acquisition_manager', 'system_admin']);
@@ -1712,22 +1735,46 @@ export const operationsApi = {
     return owner;
   },
 
-  async listProperties(orgId: string, filters?: { projectId?: string; stage?: AcquisitionStage; search?: string }) {
+  /**
+   * One page of properties, most recently changed first (then by id, so pages
+   * never repeat or skip a row). `limit` defaults to PROPERTY_PAGE_SIZE.
+   */
+  async listProperties(
+    orgId: string,
+    filters?: { projectId?: string; stage?: AcquisitionStage; search?: string; limit?: number; offset?: number },
+  ) {
+    const limit = filters?.limit ?? PROPERTY_PAGE_SIZE;
+    const offset = filters?.offset ?? 0;
     if (operationsApiMode === 'live') {
-      const query = new URLSearchParams({ organizationId: orgId, ...filters });
+      // Only filters that are set are sent: an unset one would otherwise travel as the text "undefined" and be refused.
+      const query = new URLSearchParams({ organizationId: orgId, limit: String(limit), offset: String(offset) });
+      if (filters?.projectId) query.set('projectId', filters.projectId);
+      if (filters?.stage) query.set('stage', filters.stage);
+      if (filters?.search?.trim()) query.set('search', filters.search.trim());
       return request<Property[]>(`/ops/properties?${query}`);
     }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200 || !Number.isInteger(offset) || offset < 0) {
+      throw new Error('Request validation failed');
+    }
+    const search = filters?.search?.trim().toLowerCase();
     return demoProperties
       .filter((property) => property.organization_id === orgId)
       .filter((property) => !filters?.projectId || property.project_id === filters.projectId)
       .filter((property) => !filters?.stage || property.acquisition_stage === filters.stage)
       .filter(
         (property) =>
-          !filters?.search ||
+          !search ||
           `${property.property_reference} ${property.lot_number ?? ''} ${property.municipality ?? ''} ${property.barangay ?? ''}`
             .toLowerCase()
-            .includes(filters.search.toLowerCase()),
+            .includes(search),
       )
+      .sort((a, b) => {
+        const left = a.updated_at ?? '';
+        const right = b.updated_at ?? '';
+        if (left !== right) return left < right ? 1 : -1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      })
+      .slice(offset, offset + limit)
       .map(decorateProperty);
   },
 
@@ -1771,6 +1818,8 @@ export const operationsApi = {
       payment_status: 'not_started',
       readiness_percent: 0,
       risk: (input.risk ?? 'medium') as 'low' | 'medium' | 'high',
+      created_at: now(),
+      updated_at: now(),
     });
     demoProperties = [property, ...demoProperties];
     recordDemoLifecycleHistory(null, property);
@@ -1793,7 +1842,7 @@ export const operationsApi = {
     const mapped = Object.fromEntries(
       Object.entries(input).map(([key, value]) => [propertyPatchColumns[key] ?? key, value]),
     );
-    const next = { ...demoProperties[index], ...mapped } as Property;
+    const next = { ...demoProperties[index], ...mapped, updated_at: now() } as Property;
     assertAssignmentRoles(next.organization_id, next.assigned_negotiator_id, next.assigned_manager_id);
     const previous = demoProperties[index];
     demoProperties[index] = decorateProperty(next);
@@ -1851,7 +1900,7 @@ export const operationsApi = {
     } else if (input.override) {
       throw new Error(`No override applies to moving this property from ${previous.acquisition_stage} to ${input.targetStage}`);
     }
-    demoProperties[index] = decorateProperty({ ...previous, acquisition_stage: input.targetStage });
+    demoProperties[index] = decorateProperty({ ...previous, acquisition_stage: input.targetStage, updated_at: now() });
     recordDemoLifecycleHistory(previous, demoProperties[index], reason, rules.length > 0 ? rules : null);
     return demoProperties[index];
   },
@@ -1999,7 +2048,7 @@ export const operationsApi = {
     demoRemediationEvent(remediation, 'resolved', 'UNDER_REVIEW', 'RESOLVED', reason);
     if (property.acquisition_stage !== input.resultingStage) {
       const index = demoProperties.findIndex((entry) => entry.id === propertyId);
-      demoProperties[index] = decorateProperty({ ...property, acquisition_stage: input.resultingStage });
+      demoProperties[index] = decorateProperty({ ...property, acquisition_stage: input.resultingStage, updated_at: now() });
       recordDemoLifecycleHistory(property, demoProperties[index], reason, null, remediation.id);
     }
     return { ...remediation };
@@ -2060,7 +2109,7 @@ export const operationsApi = {
       throw new Error(`Changing this property from ${from} to ${to} requires an override (${operation.rules.join(', ')})`);
     }
     if (operation.rules.length === 0 && input.override) throw new Error(`No override applies to changing this property from ${from} to ${to}`);
-    demoProperties[index] = decorateProperty({ ...previous, acquisition_status: to });
+    demoProperties[index] = decorateProperty({ ...previous, acquisition_status: to, updated_at: now() });
     recordDemoLifecycleHistory(previous, demoProperties[index], reason, operation.rules.length > 0 ? operation.rules : null);
     return demoProperties[index];
   },
@@ -2878,18 +2927,40 @@ export const operationsApi = {
     return demoAttention(organizationId, organization.timezone);
   },
 
-  async dashboard(orgId: string) {
-    if (operationsApiMode === 'live') return request<Record<string, unknown>>(`/ops/dashboard?organizationId=${orgId}`);
-    const properties = demoProperties.filter((property) => property.organization_id === orgId);
+  /** Read-only portfolio counts. The API sends them as text; both modes return numbers. */
+  async dashboard(orgId: string): Promise<DashboardSummary> {
+    if (operationsApiMode === 'live') {
+      const data = await request<{
+        total: string;
+        active: string;
+        negotiation: string;
+        blocked: string;
+        ready: string;
+        stages: Array<{ acquisition_stage: AcquisitionStage; count: string }>;
+      }>(`/ops/dashboard?${new URLSearchParams({ organizationId: orgId })}`);
+      return {
+        total: Number(data.total),
+        active: Number(data.active),
+        negotiation: Number(data.negotiation),
+        blocked: Number(data.blocked),
+        ready: Number(data.ready),
+        stages: data.stages.map((entry) => ({ acquisition_stage: entry.acquisition_stage, count: Number(entry.count) })),
+      };
+    }
+    const member = demoActorMembership();
+    if (!member || member.organization_id !== orgId) throw new Error('You do not have permission for this operation');
+    // Mirrors GET /ops/dashboard over the properties the actor can see. Demo properties are never archived.
+    const properties = demoProperties.filter((property) => property.organization_id === orgId && demoCanReadProperty(property));
+    const active = properties.filter((property) => property.acquisition_status === 'active');
     return {
-      total: String(properties.length),
-      active: String(properties.filter((property) => property.acquisition_status === 'active').length),
-      negotiation: String(properties.filter((property) => property.acquisition_stage === 'negotiation').length),
-      blocked: String(properties.filter((property) => property.legal_status === 'blocked' || property.risk === 'high').length),
-      ready: String(
-        properties.filter((property) => property.readiness_percent >= 80 && property.acquisition_status === 'active').length,
-      ),
-      stages: [],
+      total: properties.length,
+      active: active.length,
+      negotiation: properties.filter((property) => property.acquisition_stage === 'negotiation').length,
+      blocked: properties.filter((property) => property.legal_status === 'blocked' || property.risk === 'high').length,
+      ready: active.filter((property) => property.readiness_percent >= 80).length,
+      stages: acquisitionStageOrder
+        .map((stage) => ({ acquisition_stage: stage, count: active.filter((property) => property.acquisition_stage === stage).length }))
+        .filter((entry) => entry.count > 0),
     };
   },
 };

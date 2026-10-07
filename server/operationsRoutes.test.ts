@@ -3439,4 +3439,17 @@ describe('property workflow API', () => {
       expect(attentionCalls()).toEqual([]);
     });
   });
+
+  describe('property list order', () => {
+    it('orders by change time and then by id, so pages never repeat or skip a row', async () => {
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/properties?organizationId=${ORG_A}&limit=50&offset=100`, { headers: AUTH });
+        expect(response.status).toBe(200);
+      });
+      const listed = actorQuery.mock.calls.filter(([sql]) => /from public\.properties p/.test(String(sql)) && /limit \$/.test(String(sql)));
+      expect(listed).toHaveLength(1);
+      expect(String(listed[0][0]).replace(/\s+/g, ' ')).toContain('order by p.updated_at desc, p.id limit $2 offset $3');
+      expect(listed[0][1]).toEqual([ORG_A, 50, 100]);
+    });
+  });
 });
