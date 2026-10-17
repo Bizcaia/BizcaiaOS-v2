@@ -1,5 +1,12 @@
 # Staging verification checklist
 
+> **Current-state overlay (prefer this):** see
+> [CURRENT_STATE.md](CURRENT_STATE.md) and [AGENTS.md](../../AGENTS.md).
+> G3 for the reviewed pin/staging identity is **CLOSED / ACCEPTED WITH
+> DOCUMENTED RESIDUALS** (do not reopen). This repository checklist remains a
+> **template**; filled evidence is kept outside Git. The status block below is
+> historical preparation-time wording, not the live G3 disposition.
+
 > **Status: nothing verified. Staging is NOT PROVISIONED.** Every row below is
 > `NOT_VERIFIED` in the repository, and stays so until the evidence comes from
 > the real staging environment itself. Acceptable evidence: a command output,

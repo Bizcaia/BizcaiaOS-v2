@@ -2,6 +2,10 @@
 
 Reconstructed from the Manus.ai export and prepared as the working application baseline.
 
+For agents and operators: live gate/residual disposition is in
+[`docs/deployment/CURRENT_STATE.md`](docs/deployment/CURRENT_STATE.md)
+([`AGENTS.md`](AGENTS.md)).
+
 ## Current state
 - Public marketing site retained.
 - Preview operations workspace added under `#app`.

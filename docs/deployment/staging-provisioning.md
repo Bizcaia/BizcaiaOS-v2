@@ -1,5 +1,14 @@
 # Staging provisioning runbook
 
+> **Current-state overlay (prefer this):** see
+> [CURRENT_STATE.md](CURRENT_STATE.md) and [AGENTS.md](../../AGENTS.md).
+> For the reviewed pin and staging identity recorded there, **G3 is CLOSED /
+> ACCEPTED WITH DOCUMENTED RESIDUALS** and must not be reopened. **G4 / G5 /
+> G6 / production / hosting / DNS** still require separate explicit owner
+> authorization. The status block and gate table below are **historical
+> preparation-time wording** preserved with this procedure; they are not the
+> live disposition.
+
 > **Status: NOT PROVISIONED.** No staging Supabase project, Render service,
 > disk, or DNS record exists. This runbook prepares the work; it authorizes
 > none of it. The prototype stays on the Supabase Free plan until the owner
@@ -10,6 +19,9 @@
 
 Companion documents:
 
+- [CURRENT_STATE.md](CURRENT_STATE.md): **live** gate / residual disposition
+  (prefer over historical status language in this file).
+- [AGENTS.md](../../AGENTS.md): multi-agent operating contract.
 - [production-readiness.md](production-readiness.md): accepted architecture
   (D-PROD decisions) and the **environment variable matrix**, the single
   source for variable names and values.

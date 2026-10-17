@@ -1,5 +1,12 @@
 # Staging owner input sheet
 
+> **Current-state overlay (prefer this):** see
+> [CURRENT_STATE.md](CURRENT_STATE.md) and [AGENTS.md](../../AGENTS.md).
+> G3 is **CLOSED / ACCEPTED WITH DOCUMENTED RESIDUALS** for the reviewed
+> pin/staging identity. Later gates (G4+) and production still need separate
+> explicit owner authorization. Sections below retain historical
+> preparation-time wording.
+
 Only information the owner must supply. Engineering work, verification, and
 anything derivable from the repository are not listed. Never put secrets in
 this file, in Git, or in chat: secrets go straight into the secret store or
