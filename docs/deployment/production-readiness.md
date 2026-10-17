@@ -1,5 +1,13 @@
 # BizcaiaOS deployment readiness: local, staging, production
 
+> **Current-state overlay (prefer this):** see
+> [CURRENT_STATE.md](CURRENT_STATE.md) and [AGENTS.md](../../AGENTS.md).
+> Supabase staging for the reviewed pin exists and **G3 is CLOSED / ACCEPTED
+> WITH DOCUMENTED RESIDUALS**. This guide remains the architecture and
+> configuration contract. The opening paragraph below is historical
+> preparation-time wording; it does **not** authorize G4, G5, hosting, DNS,
+> or production.
+
 BizcaiaOS is in the prototype phase. **No staging or production environment
 exists yet**, and nothing below claims one does. This guide records the
 accepted architecture and the configuration contract, so that moving to
