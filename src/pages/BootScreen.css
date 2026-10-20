@@ -1,0 +1,152 @@
+/* BizcaiaOS entry boot — self-contained so production Vite always includes it. */
+
+.boot-screen {
+  --boot-bg: #0a0a0a;
+  --boot-ink: #f2ebe4;
+  --boot-muted: #8a837c;
+  --boot-accent: #9a0002;
+  --boot-line: rgba(242, 235, 228, 0.12);
+  --boot-ease: cubic-bezier(0.23, 1, 0.32, 1);
+
+  min-height: 100vh;
+  min-height: 100dvh;
+  width: 100%;
+  display: grid;
+  place-items: center;
+  padding: 32px 24px;
+  background: var(--boot-bg);
+  color: var(--boot-ink);
+  position: relative;
+  overflow: hidden;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+.boot-ambient {
+  position: absolute;
+  inset: -20% auto auto 50%;
+  width: min(720px, 120vw);
+  height: min(720px, 120vw);
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(154, 0, 2, 0.16) 0%, rgba(154, 0, 2, 0.04) 42%, transparent 70%);
+  pointer-events: none;
+}
+
+.boot-frame {
+  position: relative;
+  z-index: 1;
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 56px;
+  text-align: center;
+}
+
+.boot-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+.boot-mark {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 28px;
+  transform: skewX(-14deg);
+}
+
+.boot-mark i {
+  width: 6px;
+  display: block;
+  border-radius: 2px 2px 0 0;
+  background: var(--boot-accent);
+}
+
+.boot-mark i:nth-child(1) {
+  height: 12px;
+  opacity: 0.55;
+}
+
+.boot-mark i:nth-child(2) {
+  height: 20px;
+  opacity: 0.8;
+}
+
+.boot-mark i:nth-child(3) {
+  height: 28px;
+}
+
+.boot-wordmark {
+  margin: 0;
+  font-family: 'Baloo 2', Inter, sans-serif;
+  font-size: clamp(34px, 8vw, 44px);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+.boot-wordmark span {
+  color: #d34a4b;
+}
+
+.boot-tagline {
+  margin: 0;
+  max-width: 280px;
+  color: var(--boot-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  line-height: 1.45;
+}
+
+.boot-status-block {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.boot-status {
+  margin: 0;
+  min-height: 1.2em;
+  color: rgba(242, 235, 228, 0.78);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+}
+
+.boot-progress {
+  width: 100%;
+  height: 2px;
+  background: var(--boot-line);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.boot-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--boot-accent);
+  border-radius: 2px;
+  transition: width 0.35s var(--boot-ease);
+}
+
+@media (max-width: 480px) {
+  .boot-frame {
+    gap: 44px;
+  }
+
+  .boot-tagline {
+    letter-spacing: 0.12em;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-progress-fill {
+    transition: none;
+  }
+}
