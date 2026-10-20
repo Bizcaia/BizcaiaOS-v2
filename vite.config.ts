@@ -19,7 +19,12 @@ export default defineConfig(({ mode }) => {
         },
       },
     ],
-    resolve: { alias: { '@': resolve(__dirname, 'src') } },
+    resolve: {
+      alias: {
+        '@': resolve(__dirname, 'src'),
+        '@shared': resolve(__dirname, 'shared'),
+      },
+    },
     server: { host: '0.0.0.0', allowedHosts: true },
   };
 });

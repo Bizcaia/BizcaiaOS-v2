@@ -14,6 +14,8 @@ import {
   ownerListQuerySchema,
   projectListQuerySchema,
   propertyListQuerySchema,
+  propertyExportQuerySchema,
+  propertyImportOrganizationQuerySchema,
   propertyOwnerParamsSchema,
   createNegotiationEventSchema,
   createNegotiationSchema,
@@ -43,6 +45,15 @@ import {
   createInteractionSchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
+import {
+  buildPropertyImportPreview,
+  insertImportedProperties,
+  publicPreviewPayload,
+  readPropertyImportCsvFile,
+  streamPropertiesExport,
+  writePropertyImportTemplate,
+} from './imports/propertyImportHandlers.js';
+import { PROPERTY_IMPORT_ERROR_MESSAGES } from '../shared/propertyCsvContract.js';
 
 export const operationsRouter = Router();
 
@@ -457,6 +468,94 @@ operationsRouter.post('/properties', async (request, response) => {
     return firstRow(result.rows, 'Property creation failed');
   });
   response.status(201).json({ data: property });
+});
+
+operationsRouter.get('/imports/properties/template.csv', async (request, response) => {
+  const user = requireUser(request);
+  const { organizationId } = propertyImportOrganizationQuerySchema.parse(request.query);
+  await withActorTransaction(user.id, async (client) => {
+    await requireMembership(client, organizationId, user.id);
+  });
+  writePropertyImportTemplate(response);
+});
+
+operationsRouter.post('/imports/properties/preview', async (request, response) => {
+  const user = requireUser(request);
+  const buffer = await readPropertyImportCsvFile(request, response);
+  const organizationId = propertyImportOrganizationQuerySchema.parse({
+    organizationId: typeof request.body?.organizationId === 'string' ? request.body.organizationId : request.query.organizationId,
+  }).organizationId;
+
+  const preview = await withActorTransaction(user.id, async (client) => {
+    await requireRole(client, organizationId, user.id, PROPERTY_CREATE_ROLES);
+    return buildPropertyImportPreview(client, organizationId, buffer);
+  });
+
+  if ('fileError' in preview) {
+    response.status(400).json({ error: preview.fileError });
+    return;
+  }
+  response.json({ data: publicPreviewPayload(preview) });
+});
+
+operationsRouter.post('/imports/properties/commit', async (request, response) => {
+  const user = requireUser(request);
+  const buffer = await readPropertyImportCsvFile(request, response);
+  const organizationId = propertyImportOrganizationQuerySchema.parse({
+    organizationId: typeof request.body?.organizationId === 'string' ? request.body.organizationId : request.query.organizationId,
+  }).organizationId;
+
+  try {
+    const created = await withActorTransaction(user.id, async (client) => {
+      await requireRole(client, organizationId, user.id, PROPERTY_CREATE_ROLES);
+      const preview = await buildPropertyImportPreview(client, organizationId, buffer);
+      if ('fileError' in preview) {
+        throw Object.assign(new Error(preview.fileError.message), {
+          status: 400,
+          code: preview.fileError.code,
+        });
+      }
+      if (!preview.canCommit || !preview.accepted) {
+        throw Object.assign(new Error(PROPERTY_IMPORT_ERROR_MESSAGES.COMMIT_HAS_REJECTED_ROWS), {
+          status: 422,
+          code: 'COMMIT_HAS_REJECTED_ROWS',
+          details: publicPreviewPayload(preview),
+        });
+      }
+      return insertImportedProperties(client, organizationId, preview.accepted);
+    });
+    response.status(201).json({ data: { createdCount: created.length, properties: created } });
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === '23505') {
+      const preview = await withActorTransaction(user.id, async (client) => {
+        await requireRole(client, organizationId, user.id, PROPERTY_CREATE_ROLES);
+        return buildPropertyImportPreview(client, organizationId, buffer);
+      });
+      if ('fileError' in preview) {
+        response.status(400).json({ error: preview.fileError });
+        return;
+      }
+      response.status(422).json({
+        error: {
+          code: 'COMMIT_HAS_REJECTED_ROWS',
+          message: PROPERTY_IMPORT_ERROR_MESSAGES.COMMIT_HAS_REJECTED_ROWS,
+          details: publicPreviewPayload(preview),
+        },
+      });
+      return;
+    }
+    throw error;
+  }
+});
+
+operationsRouter.get('/exports/properties.csv', async (request, response) => {
+  const user = requireUser(request);
+  const query = propertyExportQuerySchema.parse(request.query);
+  await withActorTransaction(user.id, async (client) => {
+    await requireMembership(client, query.organizationId, user.id);
+    await streamPropertiesExport(client, query, response);
+  });
 });
 
 operationsRouter.patch('/properties/:id', async (request, response) => {

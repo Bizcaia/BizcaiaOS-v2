@@ -370,20 +370,56 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
     return { rows: [row], rowCount: 1 };
   }
   if (normalized.startsWith('insert into public.properties')) {
+    // CSV import binds risk as $11 with literal identified/null assignees; create API binds stage/assignees/risk as $11–$14.
+    const csvImport = normalized.includes("'identified'") && normalized.includes('null,null,$11');
     const row = {
       id: crypto.randomUUID(),
       organization_id: params[0],
       project_id: params[1],
       property_reference: params[2],
+      title_number: params[3] ?? null,
+      tax_declaration: params[4] ?? null,
+      lot_number: params[5] ?? null,
+      area_hectares: params[6] ?? null,
       municipality: params[7],
       province: params[8],
       barangay: params[9],
-      acquisition_stage: params[10],
-      assigned_negotiator_id: params[11],
-      assigned_manager_id: params[12],
+      acquisition_stage: csvImport ? 'identified' : params[10],
+      acquisition_status: 'active',
+      assigned_negotiator_id: csvImport ? null : params[11],
+      assigned_manager_id: csvImport ? null : params[12],
+      risk: csvImport ? params[10] : params[13],
+      legal_status: 'unknown',
+      documentation_status: 'not_started',
+      payment_status: 'not_started',
+      readiness_percent: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     };
+    if (store.properties.some((entry) => entry.organization_id === row.organization_id && entry.property_reference === row.property_reference)) {
+      throw sqlError('23505', 'duplicate key value violates unique constraint');
+    }
     store.properties.push(row);
     return { rows: [row], rowCount: 1 };
+  }
+  if (normalized.includes('from public.projects where organization_id = $1 and code = any')) {
+    const codes = new Set(params[1] as string[]);
+    const rows = store.projects.filter((project) => project.organization_id === params[0] && codes.has(project.code));
+    return { rows: rows.map((project) => ({ id: project.id, code: project.code })), rowCount: rows.length };
+  }
+  if (normalized.includes('select property_reference from public.properties where organization_id = $1 and property_reference = any')) {
+    const refs = new Set(params[1] as string[]);
+    const rows = store.properties
+      .filter((property) => property.organization_id === params[0] && refs.has(String(property.property_reference)))
+      .map((property) => ({ property_reference: property.property_reference }));
+    return { rows, rowCount: rows.length };
+  }
+  if (normalized.includes('select count(*)::text as count from public.properties p where')) {
+    let rows = store.properties.filter((property) => property.organization_id === params[0]);
+    if (normalized.includes('p.project_id=')) {
+      rows = rows.filter((property) => property.project_id === params[1]);
+    }
+    return { rows: [{ count: String(rows.length) }], rowCount: 1 };
   }
   if (normalized.startsWith('insert into public.property_owners')) {
     const row = {
@@ -3450,6 +3486,107 @@ describe('property workflow API', () => {
       expect(listed).toHaveLength(1);
       expect(String(listed[0][0]).replace(/\s+/g, ' ')).toContain('order by p.updated_at desc, p.id limit $2 offset $3');
       expect(listed[0][1]).toEqual([ORG_A, 50, 100]);
+    });
+  });
+
+  describe('property CSV import/export', () => {
+    const header =
+      'projectCode,propertyReference,titleNumber,taxDeclaration,lotNumber,areaHectares,municipality,province,barangay,risk';
+
+    async function postCsv(baseUrl: string, path: string, csv: string, organizationId = ORG_A) {
+      const form = new FormData();
+      form.set('organizationId', organizationId);
+      form.set('file', new File([csv], 'properties.csv', { type: 'text/csv' }));
+      return fetch(`${baseUrl}/api/v1/ops${path}`, { method: 'POST', headers: AUTH_NO_CONTENT_TYPE, body: form });
+    }
+
+    it('downloads the exact template headers for a member', async () => {
+      store.role = 'viewer';
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/imports/properties/template.csv?organizationId=${ORG_A}`, {
+          headers: AUTH_NO_CONTENT_TYPE,
+        });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(`${header}\r\n`);
+      });
+    });
+
+    it('previews without inserting and commits atomically for create roles', async () => {
+      store.role = 'land_acquisition_manager';
+      const before = store.properties.length;
+      const csv = `${header}\nNCP-01,CSV-NEW-1,, , ,1.25,Calamba,Laguna,Canlubang,low\n`;
+      await withApi(async (baseUrl) => {
+        const preview = await postCsv(baseUrl, '/imports/properties/preview', csv);
+        expect(preview.status).toBe(200);
+        const body = await preview.json();
+        expect(body.data.canCommit).toBe(true);
+        expect(body.data.validCount).toBe(1);
+        expect(store.properties.length).toBe(before);
+
+        const commit = await postCsv(baseUrl, '/imports/properties/commit', csv);
+        expect(commit.status).toBe(201);
+        const committed = await commit.json();
+        expect(committed.data.createdCount).toBe(1);
+        expect(store.properties.some((property) => property.property_reference === 'CSV-NEW-1')).toBe(true);
+      });
+    });
+
+    it('rejects existing propertyReference and unauthorized roles', async () => {
+      store.role = 'land_acquisition_manager';
+      store.properties.push({
+        id: crypto.randomUUID(),
+        organization_id: ORG_A,
+        project_id: PROJECT_A,
+        property_reference: 'EXISTING-1',
+        acquisition_stage: 'identified',
+        acquisition_status: 'active',
+      });
+      await withApi(async (baseUrl) => {
+        const preview = await postCsv(baseUrl, '/imports/properties/preview', `${header}\nNCP-01,EXISTING-1,,,,,,,,\n`);
+        expect(preview.status).toBe(200);
+        expect((await preview.json()).data.rows[0].errors[0].code).toBe('PROPERTY_REFERENCE_EXISTS');
+
+        store.role = 'viewer';
+        const forbidden = await postCsv(baseUrl, '/imports/properties/preview', `${header}\nNCP-01,CSV-NEW-2,,,,,,,,\n`);
+        expect(forbidden.status).toBe(403);
+      });
+    });
+
+    it('exports filtered properties as CSV with formula sanitization', async () => {
+      store.role = 'viewer';
+      store.properties.push({
+        id: crypto.randomUUID(),
+        organization_id: ORG_A,
+        project_id: PROJECT_A,
+        property_reference: '=HACK',
+        title_number: null,
+        tax_declaration: null,
+        lot_number: null,
+        area_hectares: null,
+        municipality: null,
+        province: null,
+        barangay: null,
+        acquisition_stage: 'identified',
+        acquisition_status: 'active',
+        risk: 'medium',
+        legal_status: 'unknown',
+        documentation_status: 'not_started',
+        payment_status: 'not_started',
+        readiness_percent: 0,
+        assigned_negotiator_id: null,
+        assigned_manager_id: null,
+        created_at: '2026-01-01T00:00:00.000Z',
+        updated_at: '2026-01-02T00:00:00.000Z',
+      });
+      await withApi(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/v1/ops/exports/properties.csv?organizationId=${ORG_A}`, {
+          headers: AUTH_NO_CONTENT_TYPE,
+        });
+        expect(response.status).toBe(200);
+        const text = await response.text();
+        expect(text).toContain("'=HACK");
+        expect(text.split('\n')[0]).toContain('propertyReference,projectCode,projectName');
+      });
     });
   });
 });

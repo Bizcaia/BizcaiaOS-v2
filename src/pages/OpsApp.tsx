@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, FolderKanban, LayoutDashboard, LogOut, Map, Plus, Search, ShieldCheck } from 'lucide-react';
+import { ArrowLeft, Download, FolderKanban, LayoutDashboard, LogOut, Map, Plus, Search, ShieldCheck, Upload } from 'lucide-react';
 import { organizationApi, organizationApiMode, type Member, type OrganizationRole } from '../api/organizationApi';
 import {
   DEMO_ORGANIZATION_ID,
   PROPERTY_PAGE_SIZE,
+  OperationsApiError,
+  buildPropertyImportErrorCsv,
   operationsApi,
+  propertyImportErrorFilename,
   type AcquisitionStage,
   type AgreementSignature,
   type Attention,
@@ -35,6 +38,7 @@ import {
   type RemediationEvent,
   type AcquisitionStatus,
   type LifecycleConflictDetails,
+  type PropertyImportPreviewResult,
   backwardStageRoles,
   demoStatusOperation,
   forwardStageRoles,
@@ -227,6 +231,8 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [loading, setLoading] = useState(true);
   const [showCreateProperty, setShowCreateProperty] = useState(false);
+  const [showImportProperties, setShowImportProperties] = useState(false);
+  const [exportingProperties, setExportingProperties] = useState(false);
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [organizationId, setOrganizationId] = useState<string | null>(null);
@@ -468,9 +474,14 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
               </button>
             )}
             {tab === 'properties' && canManageProperties && (
-              <button className="primary-button" onClick={() => setShowCreateProperty(true)}>
-                <Plus size={16} /> Add property
-              </button>
+              <>
+                <button className="secondary-button" type="button" onClick={() => setShowImportProperties(true)}>
+                  <Upload size={16} /> Import CSV
+                </button>
+                <button className="primary-button" onClick={() => setShowCreateProperty(true)}>
+                  <Plus size={16} /> Add property
+                </button>
+              </>
             )}
           </div>
         </header>
@@ -558,6 +569,33 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
                   <option key={key} value={key}>{label}</option>
                 ))}
               </select>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={!organizationId || exportingProperties}
+                aria-label="Export filtered properties as CSV"
+                onClick={() => {
+                  if (!organizationId) return;
+                  setExportingProperties(true);
+                  void operationsApi
+                    .exportPropertiesCsv(organizationId, {
+                      projectId: selectedProjectId || undefined,
+                      stage: stage || undefined,
+                      search: search.trim() || undefined,
+                    })
+                    .then(({ blob, filename }) => {
+                      const url = URL.createObjectURL(blob);
+                      const link = document.createElement('a');
+                      link.href = url;
+                      link.download = filename;
+                      link.click();
+                      URL.revokeObjectURL(url);
+                    })
+                    .finally(() => setExportingProperties(false));
+                }}
+              >
+                <Download size={16} /> {exportingProperties ? 'Exporting…' : 'Export CSV'}
+              </button>
             </div>
             {loading ? (
               <p>Loading properties…</p>
@@ -616,6 +654,34 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
             onClose={() => setShowCreateProject(false)}
             onCreated={async () => {
               setShowCreateProject(false);
+              await load();
+            }}
+          />
+        )}
+        {showImportProperties && organizationId && (
+          <ImportProperties
+            organizationId={organizationId}
+            onClose={() => setShowImportProperties(false)}
+            onImported={async () => {
+              setShowImportProperties(false);
+              const listed = await operationsApi.listProperties(organizationId, {
+                search,
+                stage: stage || undefined,
+                projectId: selectedProjectId || undefined,
+                limit: PROPERTY_PAGE_SIZE,
+                offset: 0,
+              });
+              setProperties(listed);
+              setHasMoreProperties(listed.length === PROPERTY_PAGE_SIZE);
+            }}
+          />
+        )}
+        {showImportProperties && organizationId && (
+          <ImportProperties
+            organizationId={organizationId}
+            onClose={() => setShowImportProperties(false)}
+            onImported={async () => {
+              setShowImportProperties(false);
               await load();
             }}
           />
@@ -2622,6 +2688,157 @@ function CreateProperty({
         >
           Create property
         </button>
+      </aside>
+    </div>
+  );
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function ImportProperties({
+  organizationId,
+  onClose,
+  onImported,
+}: {
+  organizationId: string;
+  onClose: () => void;
+  onImported: () => Promise<void>;
+}) {
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<PropertyImportPreviewResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [successCount, setSuccessCount] = useState<number | null>(null);
+
+  const runPreview = async (nextFile: File) => {
+    setBusy(true);
+    setError('');
+    setPreview(null);
+    setSuccessCount(null);
+    try {
+      setPreview(await operationsApi.previewPropertyImport(organizationId, nextFile));
+    } catch (cause) {
+      if (cause instanceof OperationsApiError) {
+        setError(cause.message);
+        if (cause.details && typeof cause.details === 'object' && cause.details !== null && 'rows' in cause.details) {
+          setPreview(cause.details as PropertyImportPreviewResult);
+        }
+      } else {
+        setError(cause instanceof Error ? cause.message : 'Preview failed');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="drawer-backdrop">
+      <aside className="property-drawer" aria-label="Import properties from CSV">
+        <button className="drawer-close" type="button" onClick={onClose}>
+          ×
+        </button>
+        <span className="panel-kicker">IMPORT</span>
+        <h2>Import properties CSV</h2>
+        <p>Create-only. Preview validates the file without saving. Confirm imports the full valid batch atomically.</p>
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            void operationsApi.downloadPropertyImportTemplate(organizationId).then(({ blob, filename }) => downloadBlob(blob, filename));
+          }}
+        >
+          <Download size={16} /> Download template
+        </button>
+        <label>
+          CSV file
+          <input
+            type="file"
+            accept=".csv,text/csv"
+            disabled={busy}
+            onChange={(event) => {
+              const next = event.target.files?.[0] ?? null;
+              setFile(next);
+              setPreview(null);
+              setSuccessCount(null);
+              setError('');
+              if (next) void runPreview(next);
+            }}
+          />
+        </label>
+        {busy && <p>Validating…</p>}
+        {error && <p className="form-error">{error}</p>}
+        {preview && (
+          <div>
+            <p>
+              Rows {preview.totalRows} · Would create {preview.validCount} · Rejected {preview.rejectedCount}
+            </p>
+            {preview.rejectedCount > 0 && (
+              <>
+                <ul>
+                  {preview.rows
+                    .filter((row) => row.rejected)
+                    .slice(0, 20)
+                    .map((row) => (
+                      <li key={row.rowNumber}>
+                        Row {row.rowNumber}: {row.errors.map((entry) => entry.message).join('; ')}
+                      </li>
+                    ))}
+                </ul>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    const csv = buildPropertyImportErrorCsv(preview);
+                    downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), propertyImportErrorFilename());
+                  }}
+                >
+                  Download error CSV
+                </button>
+              </>
+            )}
+            {successCount !== null ? (
+              <p>Imported {successCount} properties.</p>
+            ) : (
+              <button
+                className="primary-button"
+                type="button"
+                disabled={!file || busy || !preview.canCommit}
+                onClick={() => {
+                  if (!file) return;
+                  setBusy(true);
+                  setError('');
+                  void operationsApi
+                    .commitPropertyImport(organizationId, file)
+                    .then(async (result) => {
+                      setSuccessCount(result.createdCount);
+                      await onImported();
+                    })
+                    .catch((cause) => {
+                      if (cause instanceof OperationsApiError) {
+                        setError(cause.message);
+                        if (cause.details && typeof cause.details === 'object' && cause.details !== null && 'rows' in cause.details) {
+                          setPreview(cause.details as PropertyImportPreviewResult);
+                        }
+                      } else {
+                        setError(cause instanceof Error ? cause.message : 'Import failed');
+                      }
+                    })
+                    .finally(() => setBusy(false));
+                }}
+              >
+                Import {preview.validCount} properties
+              </button>
+            )}
+          </div>
+        )}
       </aside>
     </div>
   );

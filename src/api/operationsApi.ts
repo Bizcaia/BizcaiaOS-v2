@@ -1,5 +1,25 @@
 import { organizationApi } from './organizationApi';
 import { unknownBigIntKeys, unknownRequestKeys, type RequestBodyOperation } from './requestKeys';
+import {
+  PROPERTY_IMPORT_CSV_MAX_BYTES_DEFAULT,
+  PROPERTY_IMPORT_ERROR_MESSAGES,
+  buildPropertyImportErrorCsv,
+  propertyExportDataLine,
+  propertyExportFilename,
+  propertyExportHeaderLine,
+  propertyImportErrorFilename,
+  propertyImportTemplateCsv,
+  type PropertyImportPreviewResult,
+} from '../../shared/propertyCsvContract';
+import { evaluatePropertyImport } from '../../shared/evaluatePropertyImport';
+import { parsePropertyImportCsv } from '../../shared/parsePropertyImportCsv';
+
+export {
+  buildPropertyImportErrorCsv,
+  propertyImportErrorFilename,
+  propertyImportTemplateCsv,
+  type PropertyImportPreviewResult,
+} from '../../shared/propertyCsvContract';
 
 export type AcquisitionStage =
   | 'identified'
@@ -394,13 +414,13 @@ export type LifecycleConflictDetails = {
   expected: string;
 };
 
-/** An API refusal with its HTTP status and error code (and details for a lifecycle conflict). */
+/** An API refusal with its HTTP status and error code (and optional structured details). */
 export class OperationsApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
     readonly code: string,
-    readonly details?: LifecycleConflictDetails,
+    readonly details?: LifecycleConflictDetails | unknown,
   ) {
     super(message);
     this.name = 'OperationsApiError';
@@ -482,7 +502,14 @@ async function uploadRequest<T>(path: string, formData: FormData): Promise<T> {
     body: formData,
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error?.message ?? 'Request failed');
+  if (!response.ok) {
+    throw new OperationsApiError(
+      payload.error?.message ?? 'Request failed',
+      response.status,
+      payload.error?.code ?? 'request_failed',
+      payload.error?.details,
+    );
+  }
   return payload.data as T;
 }
 
@@ -2963,4 +2990,210 @@ export const operationsApi = {
         .filter((entry) => entry.count > 0),
     };
   },
+
+  async downloadPropertyImportTemplate(organizationId: string) {
+    if (operationsApiMode === 'live') {
+      return downloadRequest(`/ops/imports/properties/template.csv?${new URLSearchParams({ organizationId })}`);
+    }
+    const member = demoActorMembership();
+    if (!member || member.organization_id !== organizationId) {
+      throw new OperationsApiError(PROPERTY_IMPORT_ERROR_MESSAGES.FORBIDDEN, 403, 'FORBIDDEN');
+    }
+    const csv = propertyImportTemplateCsv();
+    return { blob: new Blob([csv], { type: 'text/csv;charset=utf-8' }), filename: 'property-import-template.csv' };
+  },
+
+  async previewPropertyImport(organizationId: string, file: File): Promise<PropertyImportPreviewResult> {
+    if (file.size > PROPERTY_IMPORT_CSV_MAX_BYTES_DEFAULT) {
+      throw new OperationsApiError(PROPERTY_IMPORT_ERROR_MESSAGES.FILE_TOO_LARGE, 400, 'FILE_TOO_LARGE');
+    }
+    if (operationsApiMode === 'live') {
+      const form = new FormData();
+      form.set('organizationId', organizationId);
+      form.set('file', file);
+      return uploadRequest<PropertyImportPreviewResult>('/ops/imports/properties/preview', form);
+    }
+    return demoPreviewPropertyImport(organizationId, file);
+  },
+
+  async commitPropertyImport(organizationId: string, file: File) {
+    if (file.size > PROPERTY_IMPORT_CSV_MAX_BYTES_DEFAULT) {
+      throw new OperationsApiError(PROPERTY_IMPORT_ERROR_MESSAGES.FILE_TOO_LARGE, 400, 'FILE_TOO_LARGE');
+    }
+    if (operationsApiMode === 'live') {
+      const form = new FormData();
+      form.set('organizationId', organizationId);
+      form.set('file', file);
+      return uploadRequest<{ createdCount: number; properties: Property[] }>('/ops/imports/properties/commit', form);
+    }
+    return demoCommitPropertyImport(organizationId, file);
+  },
+
+  async exportPropertiesCsv(
+    organizationId: string,
+    filters?: { projectId?: string; stage?: AcquisitionStage; search?: string },
+  ) {
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams({ organizationId });
+      if (filters?.projectId) query.set('projectId', filters.projectId);
+      if (filters?.stage) query.set('stage', filters.stage);
+      if (filters?.search?.trim()) query.set('search', filters.search.trim());
+      return downloadRequest(`/ops/exports/properties.csv?${query}`);
+    }
+    return demoExportPropertiesCsv(organizationId, filters);
+  },
 };
+
+function demoAssertPropertyCreateRole(organizationId: string) {
+  const member = demoActorMembership();
+  if (!member || member.organization_id !== organizationId || !['system_admin', 'land_acquisition_manager'].includes(member.role)) {
+    throw new OperationsApiError(PROPERTY_IMPORT_ERROR_MESSAGES.FORBIDDEN, 403, 'FORBIDDEN');
+  }
+}
+
+async function demoReadFileText(file: File): Promise<string> {
+  return file.text();
+}
+
+async function demoPreviewPropertyImport(organizationId: string, file: File): Promise<PropertyImportPreviewResult> {
+  demoAssertPropertyCreateRole(organizationId);
+  const parsed = parsePropertyImportCsv(await demoReadFileText(file));
+  if (!parsed.ok) {
+    throw new OperationsApiError(parsed.error.message, 400, parsed.error.code);
+  }
+  const projectIdsByCode = new Map(
+    demoProjects.filter((project) => project.organization_id === organizationId).map((project) => [project.code, project.id]),
+  );
+  const existingReferences = new Set(
+    demoProperties.filter((property) => property.organization_id === organizationId).map((property) => property.property_reference),
+  );
+  const preview = evaluatePropertyImport({
+    rows: parsed.rows,
+    fieldErrors: parsed.fieldErrors,
+    projectIdsByCode,
+    existingReferences,
+  });
+  const { accepted: _accepted, ...publicPreview } = preview;
+  return publicPreview;
+}
+
+async function demoCommitPropertyImport(organizationId: string, file: File) {
+  demoAssertPropertyCreateRole(organizationId);
+  const parsed = parsePropertyImportCsv(await demoReadFileText(file));
+  if (!parsed.ok) {
+    throw new OperationsApiError(parsed.error.message, 400, parsed.error.code);
+  }
+  const projectIdsByCode = new Map(
+    demoProjects.filter((project) => project.organization_id === organizationId).map((project) => [project.code, project.id]),
+  );
+  const existingReferences = new Set(
+    demoProperties.filter((property) => property.organization_id === organizationId).map((property) => property.property_reference),
+  );
+  const preview = evaluatePropertyImport({
+    rows: parsed.rows,
+    fieldErrors: parsed.fieldErrors,
+    projectIdsByCode,
+    existingReferences,
+  });
+  if (!preview.canCommit || !preview.accepted) {
+    throw new OperationsApiError(PROPERTY_IMPORT_ERROR_MESSAGES.COMMIT_HAS_REJECTED_ROWS, 422, 'COMMIT_HAS_REJECTED_ROWS', {
+      totalRows: preview.totalRows,
+      validCount: preview.validCount,
+      rejectedCount: preview.rejectedCount,
+      canCommit: preview.canCommit,
+      rows: preview.rows,
+    });
+  }
+  const created: Property[] = [];
+  for (const row of preview.accepted) {
+    const property = decorateProperty({
+      id: crypto.randomUUID(),
+      organization_id: organizationId,
+      project_id: row.projectId,
+      property_reference: row.propertyReference,
+      title_number: row.titleNumber,
+      tax_declaration: row.taxDeclaration,
+      lot_number: row.lotNumber,
+      area_hectares: row.areaHectares,
+      municipality: row.municipality,
+      province: row.province,
+      barangay: row.barangay,
+      acquisition_stage: 'identified',
+      acquisition_status: 'active',
+      assigned_negotiator_id: null,
+      assigned_manager_id: null,
+      legal_status: 'unknown',
+      documentation_status: 'not_started',
+      payment_status: 'not_started',
+      readiness_percent: 0,
+      risk: row.risk,
+      created_at: now(),
+      updated_at: now(),
+    });
+    demoProperties = [property, ...demoProperties];
+    recordDemoLifecycleHistory(null, property);
+    created.push(property);
+  }
+  return { createdCount: created.length, properties: created };
+}
+
+function demoExportPropertiesCsv(
+  organizationId: string,
+  filters?: { projectId?: string; stage?: AcquisitionStage; search?: string },
+) {
+  const member = demoActorMembership();
+  if (!member || member.organization_id !== organizationId) {
+    throw new OperationsApiError(PROPERTY_IMPORT_ERROR_MESSAGES.FORBIDDEN, 403, 'FORBIDDEN');
+  }
+  const search = filters?.search?.trim().toLowerCase();
+  const rows = demoProperties
+    .filter((property) => property.organization_id === organizationId)
+    .filter((property) => demoCanReadProperty(property))
+    .filter((property) => !filters?.projectId || property.project_id === filters.projectId)
+    .filter((property) => !filters?.stage || property.acquisition_stage === filters.stage)
+    .filter(
+      (property) =>
+        !search ||
+        `${property.property_reference} ${property.lot_number ?? ''} ${property.municipality ?? ''} ${property.barangay ?? ''}`
+          .toLowerCase()
+          .includes(search),
+    )
+    .sort((a, b) => {
+      const aUpdated = a.updated_at ?? '';
+      const bUpdated = b.updated_at ?? '';
+      return aUpdated < bUpdated ? 1 : aUpdated > bUpdated ? -1 : a.id < b.id ? 1 : -1;
+    });
+
+  let csv = propertyExportHeaderLine();
+  for (const property of rows) {
+    const project = demoProjects.find((entry) => entry.id === property.project_id);
+    csv += propertyExportDataLine({
+      id: property.id,
+      property_reference: property.property_reference,
+      project_code: project?.code ?? '',
+      project_name: project?.name ?? '',
+      title_number: property.title_number,
+      tax_declaration: property.tax_declaration,
+      lot_number: property.lot_number,
+      area_hectares: property.area_hectares,
+      municipality: property.municipality,
+      province: property.province,
+      barangay: property.barangay,
+      acquisition_stage: property.acquisition_stage,
+      acquisition_status: property.acquisition_status,
+      risk: property.risk,
+      legal_status: property.legal_status,
+      documentation_status: property.documentation_status,
+      payment_status: property.payment_status,
+      readiness_percent: property.readiness_percent,
+      negotiator_name: property.negotiator_name ?? null,
+      manager_name: property.manager_name ?? null,
+      updated_at: property.updated_at ?? '',
+      created_at: property.created_at ?? '',
+    });
+  }
+  return {
+    blob: new Blob([csv], { type: 'text/csv;charset=utf-8' }),
+    filename: propertyExportFilename(organizationId),
+  };
+}

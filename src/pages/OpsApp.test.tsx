@@ -1139,4 +1139,34 @@ describe('OpsApp property workflow', () => {
       expect(Array.from(item.querySelectorAll('input[type="date"]')).map((input) => (input as HTMLInputElement).value)).toEqual(['2026-09-26']);
     });
   });
+
+  it('imports properties from CSV via preview and commit in demo mode', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    await user.click(await screen.findByRole('button', { name: /import csv/i }));
+    const drawers = await screen.findAllByLabelText('Import properties from CSV');
+    const drawer = drawers[drawers.length - 1]!;
+    expect(within(drawer).getByRole('heading', { name: 'Import properties CSV' })).toBeVisible();
+
+    const csv = [
+      'projectCode,propertyReference,titleNumber,taxDeclaration,lotNumber,areaHectares,municipality,province,barangay,risk',
+      'NCP-01,CSV-UI-001,,,,,,,Calamba,low',
+    ].join('\n');
+    const file = new File([csv], 'import.csv', { type: 'text/csv' });
+    await user.upload(within(drawer).getByLabelText('CSV file'), file);
+
+    expect(await within(drawer).findByText(/Would create 1/)).toBeVisible();
+    await user.click(within(drawer).getByRole('button', { name: /import 1 properties/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /CSV-UI-001/i })).toBeVisible();
+    });
+  });
+
+  it('exposes export CSV on the properties toolbar', async () => {
+    const user = userEvent.setup();
+    render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: 'Properties' }));
+    expect(await screen.findByRole('button', { name: /export filtered properties as csv/i })).toBeVisible();
+  });
 });

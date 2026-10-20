@@ -7,6 +7,14 @@ export const propertyRiskSchema = z.enum(['low','medium','high']);
 
 export const projectListQuerySchema = z.object({ organizationId: z.uuid() });
 export const propertyListQuerySchema = z.object({ organizationId: z.uuid(), projectId: z.uuid().optional(), stage: acquisitionStageSchema.optional(), search: z.string().trim().max(120).optional(), limit: z.coerce.number().int().min(1).max(200).default(50), offset: z.coerce.number().int().min(0).default(0) });
+/** Filtered properties CSV export: same filters as the list, without pagination. */
+export const propertyExportQuerySchema = z.object({
+  organizationId: z.uuid(),
+  projectId: z.uuid().optional(),
+  stage: acquisitionStageSchema.optional(),
+  search: z.string().trim().max(120).optional(),
+});
+export const propertyImportOrganizationQuerySchema = z.object({ organizationId: z.uuid() });
 export const idParamsSchema = z.object({ id: z.uuid() });
 export const organizationAndIdParamsSchema = z.object({ organizationId: z.uuid(), id: z.uuid() });
 

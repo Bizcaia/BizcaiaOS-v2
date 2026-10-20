@@ -11,7 +11,7 @@
     "typecheck": "tsc -p tsconfig.client.json --noEmit",
     "start:api": "tsx server/index.ts",
     "typecheck:api": "tsc -p tsconfig.server.json --noEmit",
-    "test:api": "vitest run server --environment node --exclude server/integration/**",
+    "test:api": "vitest run server shared --environment node --exclude server/integration/**",
     "test:frontend": "vitest run src",
     "test:frontend:watch": "vitest src",
     "test:frontend:coverage": "vitest run src --coverage",
@@ -29,6 +29,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.117.2",
     "@vitejs/plugin-react": "4.7.0",
+    "csv-parse": "^6.2.1",
     "express": "^5.1.0",
     "jose": "^6.1.0",
     "lucide-react": "0.544.0",

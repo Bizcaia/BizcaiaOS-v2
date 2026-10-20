@@ -57,7 +57,13 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => 
     return;
   }
 
-  const errorRecord = error as { code?: unknown; status?: unknown; message?: unknown; detail?: unknown };
+  const errorRecord = error as {
+    code?: unknown;
+    status?: unknown;
+    message?: unknown;
+    detail?: unknown;
+    details?: unknown;
+  };
   const databaseCode = typeof errorRecord.code === 'string' ? errorRecord.code : undefined;
 
   // D-X1 (L-07): a stale lifecycle field is a conflict, distinct from
@@ -113,6 +119,7 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => 
     error: {
       code: publicCode,
       message: safeMessage,
+      ...(status < 500 && errorRecord.details !== undefined ? { details: errorRecord.details } : {}),
     },
   });
 };
