@@ -29,7 +29,7 @@ function App() {
 
   return (
     <ErrorBoundary>
-      <ThemeProvider defaultTheme="light">
+      <ThemeProvider>
         <TooltipProvider>
           <Toaster />
           {phase === 'boot' ? <BootScreen onComplete={enterApp} /> : <OpsApp onExit={exitApp} />}

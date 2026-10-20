@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Download, FolderKanban, LayoutDashboard, LogOut, Map, Plus, Search, ShieldCheck, Upload } from 'lucide-react';
+import { ArrowLeft, Download, FolderKanban, LayoutDashboard, LogOut, Map, Moon, Plus, Search, ShieldCheck, Sun, Upload } from 'lucide-react';
 import { organizationApi, organizationApiMode, type Member, type OrganizationRole } from '../api/organizationApi';
+import { useTheme } from '../contexts/ThemeContext';
 import {
   DEMO_ORGANIZATION_ID,
   PROPERTY_PAGE_SIZE,
@@ -223,6 +224,34 @@ export default function OpsApp({ onExit }: { onExit: () => void }) {
     <AuthGate auth={getSupabaseAuth()} onCancel={onExit}>
       {({ signOut }) => <OpsWorkspace onExit={onExit} onSignOut={signOut} />}
     </AuthGate>
+  );
+}
+
+function ThemeAppearanceControl() {
+  const { theme, setTheme } = useTheme();
+  return (
+    <div className="theme-toggle" role="group" aria-label="Appearance">
+      <button
+        type="button"
+        className={theme === 'light' ? 'theme-toggle-option active' : 'theme-toggle-option'}
+        aria-pressed={theme === 'light'}
+        aria-label="Light mode"
+        onClick={() => setTheme('light')}
+      >
+        <Sun size={15} aria-hidden="true" />
+        <span>Light</span>
+      </button>
+      <button
+        type="button"
+        className={theme === 'dark' ? 'theme-toggle-option active' : 'theme-toggle-option'}
+        aria-pressed={theme === 'dark'}
+        aria-label="Night mode"
+        onClick={() => setTheme('dark')}
+      >
+        <Moon size={15} aria-hidden="true" />
+        <span>Night</span>
+      </button>
+    </div>
   );
 }
 
@@ -472,6 +501,7 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
             <h1>{titles[tab]}</h1>
           </div>
           <div className="ops-header-actions">
+            <ThemeAppearanceControl />
             <span className={isDemo ? 'api-mode demo' : 'api-mode'}>
               <i /> {isDemo ? 'Preview workspace' : 'Live API'}
             </span>

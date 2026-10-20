@@ -6,6 +6,17 @@
     <meta name="theme-color" content="#0d0d0d" />
     <meta name="description" content="BizcaiaOS is the operating system for land acquisition teams. Move every property closer to close." />
     <title>BizcaiaOS — Land acquisition, made visible.</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('bizcaiaos-theme');
+          var theme = stored === 'light' || stored === 'dark'
+            ? stored
+            : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (e) {}
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />

@@ -45,10 +45,35 @@ vi.mock('../api/organizationApi', async () => {
 });
 
 import OpsApp from './OpsApp';
+import { ThemeProvider } from '../contexts/ThemeContext';
+
+function renderOpsApp(onExit: () => void = vi.fn()) {
+  return render(
+    <ThemeProvider>
+      <OpsApp onExit={onExit} />
+    </ThemeProvider>,
+  );
+}
 
 describe('OpsApp property workflow', () => {
   beforeEach(() => {
     resetOperationsDemoState();
+    localStorage.clear();
+    document.documentElement.removeAttribute('data-theme');
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      configurable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+        onchange: null,
+      })),
+    });
     apiMocks.getMe.mockResolvedValue({
       id: members[0].user_id,
       email: members[0].email,
@@ -60,7 +85,7 @@ describe('OpsApp property workflow', () => {
 
   it('creates a project in demo mode and a property with assignments and owners', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
 
     expect(await screen.findByRole('heading', { name: 'Portfolio overview' })).toBeVisible();
 
@@ -101,7 +126,7 @@ describe('OpsApp property workflow', () => {
 
   it('shows seeded owners and assignments on property detail', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
     expect((await screen.findAllByText('Rosa Mendoza')).length).toBeGreaterThan(0);
@@ -112,7 +137,7 @@ describe('OpsApp property workflow', () => {
 
   it('limits assignment selectors to the SQL assignment roles', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /add property/i }));
 
@@ -129,7 +154,7 @@ describe('OpsApp property workflow', () => {
 
   it('shows negotiation state and history on a negotiation-stage property', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -151,7 +176,7 @@ describe('OpsApp property workflow', () => {
 
   it('shows the seeded document and lets an allowed role upload a new one', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -172,7 +197,7 @@ describe('OpsApp property workflow', () => {
 
   it('archives a document and hides it from the default list', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -196,7 +221,7 @@ describe('OpsApp property workflow', () => {
       organizations: [{ ...organization, role: 'negotiator' }],
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -208,7 +233,7 @@ describe('OpsApp property workflow', () => {
 
   it('shows seeded tasks and lets an elevated role create a task with an assignee picker', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -233,7 +258,7 @@ describe('OpsApp property workflow', () => {
       organizations: [{ ...organization, role: 'negotiator' }],
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -257,7 +282,7 @@ describe('OpsApp property workflow', () => {
       organizations: [{ ...organization, role: 'viewer' }],
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -276,7 +301,7 @@ describe('OpsApp property workflow', () => {
 
   it('shows seeded payments and lets an elevated role record a payment', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -301,7 +326,7 @@ describe('OpsApp property workflow', () => {
       organizations: [{ ...organization, role: 'negotiator' }],
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -325,7 +350,7 @@ describe('OpsApp property workflow', () => {
     await seedExecutedAgreement('Deed of Sale');
     await seedExecutedAgreement('Deed Supplement');
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -368,7 +393,7 @@ describe('OpsApp property workflow', () => {
       signedOn: '2026-09-20',
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -394,7 +419,7 @@ describe('OpsApp property workflow', () => {
       signedOn: '2026-09-20',
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -418,7 +443,7 @@ describe('OpsApp property workflow', () => {
       organizations: [{ ...organization, role: 'finance' }],
     });
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
 
@@ -431,7 +456,7 @@ describe('OpsApp property workflow', () => {
 
   async function openProperty(reference: RegExp) {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: reference }));
     const heading = await screen.findByRole('heading', { name: 'Timeline' });
@@ -539,7 +564,7 @@ describe('OpsApp property workflow', () => {
 
   async function openInteractions() {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
     const heading = await screen.findByRole('heading', { name: 'Interactions' });
@@ -596,7 +621,7 @@ describe('OpsApp property workflow', () => {
   it.each(['legal_documentation', 'finance', 'viewer'])('hides the interaction block from %s', async (role) => {
     actAs(role);
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
     expect(await screen.findByRole('heading', { name: 'Timeline' })).toBeVisible();
@@ -610,7 +635,7 @@ describe('OpsApp property workflow', () => {
     const transitionSpy = vi.spyOn(operationsApi, 'transitionPropertyStage');
     const updateSpy = vi.spyOn(operationsApi, 'updateProperty');
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
     const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
@@ -640,7 +665,7 @@ describe('OpsApp property workflow', () => {
     // NCP-00102 is in negotiation with an open negotiation (L-04).
     const propertyId = '70000000-0000-4000-8000-000000000001';
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
     const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
@@ -659,7 +684,7 @@ describe('OpsApp property workflow', () => {
   // Concurrency and UI integration (L-07).
   async function openProperty118() {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
     const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
@@ -740,7 +765,7 @@ describe('OpsApp property workflow', () => {
   it.each(['legal_documentation', 'finance', 'viewer'])('shows %s the lifecycle state without lifecycle controls', async (role) => {
     actAs(role);
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00118/ }));
     expect(await screen.findByLabelText('Current lifecycle')).toHaveTextContent('Stage Commercial review · Status Active');
@@ -749,7 +774,7 @@ describe('OpsApp property workflow', () => {
 
   it('offers no stage control on a legacy stage, only the status control and remediation', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /NCP-00077/ }));
     const lifecycle = await screen.findByRole('region', { name: 'Lifecycle' });
@@ -761,7 +786,7 @@ describe('OpsApp property workflow', () => {
   // Legacy stage remediation (L-06): the seeded NCP-00077 is on the legacy stage withdrawn.
   async function openLegacyProperty() {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     expect(await screen.findByText(/Withdrawn · Needs review/)).toBeVisible();
     await user.click(await screen.findByRole('button', { name: /NCP-00077/ }));
@@ -831,7 +856,7 @@ describe('OpsApp property workflow', () => {
     const tile = () => screen.getByText('Blocked / high risk').closest('.ops-metric') as HTMLElement;
 
     it('shows what needs attention on the Dashboard and makes the blocked / high risk tile agree with the list', async () => {
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       const section = await attentionSection();
       const mine = await within(section).findByLabelText('My tasks');
       const overdue = within(section).getByLabelText('Overdue, not mine');
@@ -860,7 +885,7 @@ describe('OpsApp property workflow', () => {
 
     it('opens the property of a task row and of a property row', async () => {
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await user.click(await within(await attentionSection()).findByRole('button', { name: /Follow up on survey plan/ }));
       expect(await screen.findByRole('heading', { name: 'NCP-00102', level: 2 })).toBeVisible();
       expect(screen.getByRole('heading', { name: 'Properties' })).toBeVisible();
@@ -878,7 +903,7 @@ describe('OpsApp property workflow', () => {
         priority: 'urgent',
       });
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       const mine = await within(await attentionSection()).findByLabelText('My tasks');
       const row = await within(mine).findByRole('button', { name: /Confirm survey date/ });
       expect(row).toHaveTextContent('Overdue');
@@ -916,7 +941,7 @@ describe('OpsApp property workflow', () => {
         properties: { total: 61, items },
       });
       try {
-        render(<OpsApp onExit={vi.fn()} />);
+        renderOpsApp();
         const blocked = await within(await attentionSection()).findByLabelText('Blocked or high risk');
         expect(await within(blocked).findByText('Showing 50 of 61')).toBeVisible();
         expect(within(blocked).getAllByRole('button')).toHaveLength(50);
@@ -930,7 +955,7 @@ describe('OpsApp property workflow', () => {
     it('shows the failure instead of the lists, and no number on the tile, when the view cannot be read', async () => {
       const spy = vi.spyOn(operationsApi, 'getAttention').mockRejectedValue(new Error('You do not have permission for this operation'));
       try {
-        render(<OpsApp onExit={vi.fn()} />);
+        renderOpsApp();
         const section = await attentionSection();
         expect(await within(section).findByText('You do not have permission for this operation')).toBeVisible();
         expect(within(section).queryByLabelText('My tasks')).not.toBeInTheDocument();
@@ -965,7 +990,7 @@ describe('OpsApp property workflow', () => {
       // Ready and the stage grid count properties being acquired: the paused one leaves both.
       await operationsApi.transitionPropertyStatus('70000000-0000-4000-8000-000000000002', { targetStatus: 'on_hold', expectedStatus: 'active' });
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
 
       const counts = async () => {
         await waitFor(() => expect(tileValue('Properties')).toBe('120'));
@@ -993,7 +1018,7 @@ describe('OpsApp property workflow', () => {
 
     it('opens the Properties tab on a stage from the grid, as before', async () => {
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await waitFor(() => expect(stageCount('Negotiation')).toBe('1'));
       const card = screen.getAllByRole('button').find((button) => button.classList.contains('stage-card') && within(button).queryByText('Negotiation', { selector: 'span' }))!;
       await user.click(card);
@@ -1007,7 +1032,7 @@ describe('OpsApp property workflow', () => {
       expect(expected).toHaveLength(120);
       const shown = () => rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await user.click(await screen.findByRole('button', { name: 'Properties' }));
 
       await waitFor(() => expect(rows()).toHaveLength(50));
@@ -1038,7 +1063,7 @@ describe('OpsApp property workflow', () => {
     it('shows a property once when it changed between two pages', async () => {
       await seedProperties(116);
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await user.click(await screen.findByRole('button', { name: 'Properties' }));
       await waitFor(() => expect(rows()).toHaveLength(50));
       // Another user changes the first row: it moves to the front and pushes every row one place down.
@@ -1057,7 +1082,7 @@ describe('OpsApp property workflow', () => {
       await seedProperties(116);
       const shown = () => rows().map((row) => within(row as HTMLElement).getByRole('strong').textContent);
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await user.click(await screen.findByRole('button', { name: 'Properties' }));
       await waitFor(() => expect(rows()).toHaveLength(50));
 
@@ -1107,7 +1132,7 @@ describe('OpsApp property workflow', () => {
 
     it('offers no Load more when everything fits on one page', async () => {
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await user.click(await screen.findByRole('button', { name: 'Properties' }));
       await waitFor(() => expect(rows()).toHaveLength(4));
       expect(screen.queryByRole('button', { name: 'Load more properties' })).not.toBeInTheDocument();
@@ -1116,7 +1141,7 @@ describe('OpsApp property workflow', () => {
     it('shows the failure and no numbers when the counts cannot be read', async () => {
       const spy = vi.spyOn(operationsApi, 'dashboard').mockRejectedValue(new Error('You do not have permission for this operation'));
       try {
-        render(<OpsApp onExit={vi.fn()} />);
+        renderOpsApp();
         expect(await screen.findByText('You do not have permission for this operation')).toBeVisible();
         expect([tileValue('Properties'), tileValue('Acquisition-ready'), tileValue('Active negotiations'), stageCount('Identified')]).toEqual(['—', '—', '—', '—']);
         // The attention section and its tile are read separately and still load.
@@ -1130,7 +1155,7 @@ describe('OpsApp property workflow', () => {
       const property = '70000000-0000-4000-8000-000000000001';
       await operationsApi.createTask(property, { title: 'Dated follow-up', dueOn: '2026-09-26', assignedUserId: members[0].user_id });
       const user = userEvent.setup();
-      render(<OpsApp onExit={vi.fn()} />);
+      renderOpsApp();
       await user.click(await screen.findByRole('button', { name: 'Properties' }));
       await user.click(await screen.findByRole('button', { name: /NCP-00102/ }));
       const tasks = (await screen.findByRole('heading', { name: 'Tasks' })).closest('section')!;
@@ -1142,7 +1167,7 @@ describe('OpsApp property workflow', () => {
 
   it('imports properties from CSV via preview and commit in demo mode', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     await user.click(await screen.findByRole('button', { name: /import csv/i }));
     const drawers = await screen.findAllByLabelText('Import properties from CSV');
@@ -1165,9 +1190,23 @@ describe('OpsApp property workflow', () => {
 
   it('exposes export CSV on the properties toolbar', async () => {
     const user = userEvent.setup();
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     expect(await screen.findByRole('button', { name: /export filtered properties as csv/i })).toBeVisible();
+  });
+
+  it('exposes a Light/Night appearance control that persists the selection', async () => {
+    const user = userEvent.setup();
+    renderOpsApp();
+    expect(await screen.findByRole('group', { name: 'Appearance' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Light mode' })).toHaveAttribute('aria-pressed', 'true');
+    expect(document.documentElement.dataset.theme).toBe('light');
+
+    await user.click(screen.getByRole('button', { name: 'Night mode' }));
+    expect(screen.getByRole('button', { name: 'Night mode' })).toHaveAttribute('aria-pressed', 'true');
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(localStorage.getItem('bizcaiaos-theme')).toBe('dark');
+    expect(screen.getByRole('img', { name: 'BizcaiaOS' })).toBeVisible();
   });
 
   it('renders negotiator activity KPI with period switching and drill-down', async () => {
@@ -1204,7 +1243,7 @@ describe('OpsApp property workflow', () => {
       ],
     });
 
-    render(<OpsApp onExit={vi.fn()} />);
+    renderOpsApp();
     await user.click(await screen.findByRole('button', { name: /Team & access/i }));
     const section = await screen.findByRole('region', { name: 'Negotiator activity' });
     expect(within(section).getByRole('heading', { name: 'Unique landowners updated' })).toBeVisible();
