@@ -1169,4 +1169,62 @@ describe('OpsApp property workflow', () => {
     await user.click(await screen.findByRole('button', { name: 'Properties' }));
     expect(await screen.findByRole('button', { name: /export filtered properties as csv/i })).toBeVisible();
   });
+
+  it('renders negotiator activity KPI with period switching and drill-down', async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(operationsApi, 'getNegotiatorActivity').mockResolvedValue({
+      period: 'today',
+      timezone: 'Asia/Manila',
+      periodStart: '2026-03-10T16:00:00.000Z',
+      periodEnd: '2026-03-11T16:00:00.000Z',
+      summary: {
+        negotiatorId: members[0].user_id,
+        negotiatorName: members[0].display_name,
+        uniqueLandowners: 2,
+        totalActivities: 4,
+      },
+      leaderboard: [
+        {
+          negotiatorId: members[0].user_id,
+          negotiatorName: members[0].display_name,
+          uniqueLandowners: 2,
+          totalActivities: 4,
+        },
+      ],
+    });
+    const drillSpy = vi.spyOn(operationsApi, 'getNegotiatorActivityLandowners').mockResolvedValue({
+      period: 'today',
+      timezone: 'Asia/Manila',
+      periodStart: '2026-03-10T16:00:00.000Z',
+      periodEnd: '2026-03-11T16:00:00.000Z',
+      negotiatorId: members[0].user_id,
+      landowners: [
+        { ownerId: 'owner-1', displayName: 'Juan', interactionCount: 3 },
+        { ownerId: 'owner-2', displayName: 'Maria', interactionCount: 1 },
+      ],
+    });
+
+    render(<OpsApp onExit={vi.fn()} />);
+    const section = await screen.findByRole('region', { name: 'Negotiator activity' });
+    expect(within(section).getByRole('heading', { name: 'Unique landowners updated' })).toBeVisible();
+    expect(await within(section).findByText(/Unique landowners ·/)).toBeVisible();
+    expect(within(section).getByText('Total activities')).toBeVisible();
+    await waitFor(() => {
+      expect(within(section).getAllByText('2').length).toBeGreaterThanOrEqual(1);
+      expect(within(section).getAllByText('4').length).toBeGreaterThanOrEqual(1);
+    });
+    expect(within(section).getByRole('table', { name: 'Negotiator activity leaderboard' })).toBeVisible();
+
+    await user.click(within(section).getByRole('button', { name: 'This Week' }));
+    await waitFor(() => {
+      expect(spy).toHaveBeenCalledWith(DEMO_ORGANIZATION_ID, expect.objectContaining({ period: 'this_week' }));
+    });
+
+    await user.click(within(section).getByRole('button', { name: 'View contributing landowners' }));
+    expect(await within(section).findByText('Juan')).toBeVisible();
+    expect(within(section).getByText('Maria')).toBeVisible();
+    expect(drillSpy).toHaveBeenCalled();
+    spy.mockRestore();
+    drillSpy.mockRestore();
+  });
 });

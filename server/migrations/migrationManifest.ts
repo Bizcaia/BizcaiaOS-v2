@@ -27,4 +27,5 @@ export const MIGRATION_FILES = [
   '018_lifecycle_optimistic_concurrency.sql',
   '019_revoke_public_function_execute.sql',
   '020_property_risk_history.sql',
+  '021_negotiator_activity_index.sql',
 ];

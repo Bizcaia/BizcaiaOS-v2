@@ -78,6 +78,20 @@ export const remediationResolveSchema = z.strictObject({
 export const remediationQueueQuerySchema = z.object({ organizationId: z.uuid() });
 export const attentionQuerySchema = z.object({ organizationId: z.uuid() });
 
+export const negotiatorActivityPeriodSchema = z.enum(['today', 'this_week', 'this_month', 'this_year']);
+
+export const negotiatorActivityQuerySchema = z.object({
+  organizationId: z.uuid(),
+  period: negotiatorActivityPeriodSchema.default('today'),
+  negotiatorId: z.uuid().optional(),
+});
+
+export const negotiatorActivityLandownersQuerySchema = z.object({
+  organizationId: z.uuid(),
+  period: negotiatorActivityPeriodSchema.default('today'),
+  negotiatorId: z.uuid(),
+});
+
 export const ownerTypeSchema = z.enum(['individual', 'corporate', 'estate', 'government', 'other']);
 export const ownerListQuerySchema = z.object({ organizationId: z.uuid() });
 export const createOwnerSchema = z.strictObject({

@@ -311,6 +311,81 @@ function handleActorQuery(sql: string, params: unknown[] = []) {
     store.interactions.push(row);
     return { rows: [{ id: row.id }], rowCount: 1 };
   }
+  if (normalized.includes('savepoint negotiator_activity_period') || normalized.includes('release savepoint negotiator_activity_period')) {
+    return { rows: [], rowCount: 0 };
+  }
+  if (normalized.includes('as period_start') && normalized.includes('date_trunc')) {
+    if (!store.timezone.includes('/') && store.timezone !== 'UTC') {
+      throw sqlError('22023', `time zone "${store.timezone}" not recognized`);
+    }
+    return {
+      rows: [
+        {
+          timezone: store.timezone,
+          period_start: new Date('2026-03-10T16:00:00.000Z'),
+          period_end: new Date('2026-03-11T16:00:00.000Z'),
+        },
+      ],
+      rowCount: 1,
+    };
+  }
+  if (
+    normalized.includes('from public.interactions i') &&
+    (normalized.includes('count(distinct i.owner_id)') || normalized.includes('group by i.owner_id'))
+  ) {
+    const organizationId = String(params[0]);
+    const periodStart = new Date(String(params[1])).getTime();
+    const periodEnd = new Date(String(params[2])).getTime();
+    const qualifying = store.interactions.filter((interaction) => {
+      if (interaction.organization_id !== organizationId) return false;
+      if (!interaction.owner_id || interaction.archived_at) return false;
+      const occurred = new Date(String(interaction.occurred_at)).getTime();
+      return occurred >= periodStart && occurred < periodEnd;
+    });
+    if (normalized.includes('group by i.recorded_by_user_id')) {
+      const groups = new Map<string, { owners: Set<string>; total: number }>();
+      for (const interaction of qualifying) {
+        const recorder = String(interaction.recorded_by_user_id);
+        const group = groups.get(recorder) ?? { owners: new Set<string>(), total: 0 };
+        group.owners.add(String(interaction.owner_id));
+        group.total += 1;
+        groups.set(recorder, group);
+      }
+      const rows = [...groups.entries()].map(([negotiatorId, group]) => ({
+        negotiator_id: negotiatorId,
+        negotiator_name: TASK_USER_NAMES[negotiatorId] ?? 'Unknown',
+        unique_landowners: String(group.owners.size),
+        total_activities: String(group.total),
+      }));
+      return { rows, rowCount: rows.length };
+    }
+    if (normalized.includes('group by i.owner_id')) {
+      const negotiatorId = String(params[3]);
+      const counts = new Map<string, number>();
+      for (const interaction of qualifying.filter((row) => row.recorded_by_user_id === negotiatorId)) {
+        counts.set(String(interaction.owner_id), (counts.get(String(interaction.owner_id)) ?? 0) + 1);
+      }
+      const rows = [...counts.entries()].map(([ownerId, interactionCount]) => ({
+        owner_id: ownerId,
+        display_name: store.owners.find((owner) => owner.id === ownerId)?.display_name ?? 'Unknown',
+        interaction_count: String(interactionCount),
+      }));
+      return { rows, rowCount: rows.length };
+    }
+    const negotiatorId = String(params[3]);
+    const mine = qualifying.filter((row) => row.recorded_by_user_id === negotiatorId);
+    return {
+      rows: [
+        {
+          negotiator_id: negotiatorId,
+          negotiator_name: TASK_USER_NAMES[negotiatorId] ?? 'Unknown',
+          unique_landowners: String(new Set(mine.map((row) => row.owner_id)).size),
+          total_activities: String(mine.length),
+        },
+      ],
+      rowCount: 1,
+    };
+  }
   if (normalized.includes('from public.interactions i')) {
     let rows: Array<Record<string, unknown>> = store.interactions.map((interaction) => ({
       ...interaction,
@@ -3586,6 +3661,162 @@ describe('property workflow API', () => {
         const text = await response.text();
         expect(text).toContain("'=HACK");
         expect(text.split('\n')[0]).toContain('propertyReference,projectCode,projectName');
+      });
+    });
+  });
+
+  describe('negotiator activity KPI', () => {
+    function seedQualifyingInteractions() {
+      store.interactions = [
+        {
+          id: crypto.randomUUID(),
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: OWNER_A,
+          interaction_type: 'call',
+          notes: 'First call',
+          occurred_at: '2026-03-10T20:00:00.000Z',
+          recorded_by_user_id: NEGOTIATOR_ID,
+          created_at: '2026-03-10T20:00:00.000Z',
+          updated_at: '2026-03-10T20:00:00.000Z',
+          archived_at: null,
+        },
+        {
+          id: crypto.randomUUID(),
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: OWNER_A,
+          interaction_type: 'message',
+          notes: 'Follow-up',
+          occurred_at: '2026-03-11T02:00:00.000Z',
+          recorded_by_user_id: NEGOTIATOR_ID,
+          created_at: '2026-03-11T02:00:00.000Z',
+          updated_at: '2026-03-11T02:00:00.000Z',
+          archived_at: null,
+        },
+        {
+          id: crypto.randomUUID(),
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: OWNER_A2,
+          interaction_type: 'meeting',
+          notes: 'Meeting',
+          occurred_at: '2026-03-11T03:00:00.000Z',
+          recorded_by_user_id: NEGOTIATOR_ID,
+          created_at: '2026-03-11T03:00:00.000Z',
+          updated_at: '2026-03-11T03:00:00.000Z',
+          archived_at: null,
+        },
+        {
+          id: crypto.randomUUID(),
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: null,
+          interaction_type: 'call',
+          notes: 'No owner',
+          occurred_at: '2026-03-11T04:00:00.000Z',
+          recorded_by_user_id: NEGOTIATOR_ID,
+          created_at: '2026-03-11T04:00:00.000Z',
+          updated_at: '2026-03-11T04:00:00.000Z',
+          archived_at: null,
+        },
+        {
+          id: crypto.randomUUID(),
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: OWNER_A,
+          interaction_type: 'call',
+          notes: 'Archived',
+          occurred_at: '2026-03-11T05:00:00.000Z',
+          recorded_by_user_id: NEGOTIATOR_ID,
+          created_at: '2026-03-11T05:00:00.000Z',
+          updated_at: '2026-03-11T05:00:00.000Z',
+          archived_at: '2026-03-11T06:00:00.000Z',
+        },
+        {
+          id: crypto.randomUUID(),
+          organization_id: ORG_A,
+          property_id: PROPERTY_A,
+          owner_id: OWNER_A,
+          interaction_type: 'call',
+          notes: 'Manager recorded',
+          occurred_at: '2026-03-11T07:00:00.000Z',
+          recorded_by_user_id: USER_ID,
+          created_at: '2026-03-11T07:00:00.000Z',
+          updated_at: '2026-03-11T07:00:00.000Z',
+          archived_at: null,
+        },
+      ];
+    }
+
+    it('returns unique landowners and total activities for a manager, excluding null owner and archived', async () => {
+      store.role = 'land_acquisition_manager';
+      seedQualifyingInteractions();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(
+          `${baseUrl}/api/v1/ops/negotiator-activity?organizationId=${ORG_A}&period=today&negotiatorId=${NEGOTIATOR_ID}`,
+          { headers: AUTH },
+        );
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        expect(body.data.summary).toMatchObject({
+          negotiatorId: NEGOTIATOR_ID,
+          uniqueLandowners: 2,
+          totalActivities: 3,
+        });
+        expect(body.data.leaderboard.length).toBeGreaterThanOrEqual(1);
+      });
+    });
+
+    it('rejects a negotiator requesting another negotiator KPI', async () => {
+      store.role = 'negotiator';
+      seedQualifyingInteractions();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(
+          `${baseUrl}/api/v1/ops/negotiator-activity?organizationId=${ORG_A}&period=today&negotiatorId=${NEGOTIATOR_ID}`,
+          { headers: AUTH },
+        );
+        expect(response.status).toBe(403);
+      });
+    });
+
+    it('rejects unauthorized roles', async () => {
+      store.role = 'viewer';
+      await withApi(async (baseUrl) => {
+        const response = await fetch(
+          `${baseUrl}/api/v1/ops/negotiator-activity?organizationId=${ORG_A}&period=today`,
+          { headers: AUTH },
+        );
+        expect(response.status).toBe(403);
+      });
+    });
+
+    it('returns drill-down landowners for the same qualifying set', async () => {
+      store.role = 'system_admin';
+      seedQualifyingInteractions();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(
+          `${baseUrl}/api/v1/ops/negotiator-activity/landowners?organizationId=${ORG_A}&period=today&negotiatorId=${NEGOTIATOR_ID}`,
+          { headers: AUTH },
+        );
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        expect(body.data.landowners).toHaveLength(2);
+        expect(body.data.landowners.map((row: { ownerId: string }) => row.ownerId).sort()).toEqual(
+          [OWNER_A, OWNER_A2].sort(),
+        );
+      });
+    });
+
+    it('isolates organizations', async () => {
+      store.role = 'land_acquisition_manager';
+      seedQualifyingInteractions();
+      await withApi(async (baseUrl) => {
+        const response = await fetch(
+          `${baseUrl}/api/v1/ops/negotiator-activity?organizationId=${ORG_B}&period=today`,
+          { headers: AUTH },
+        );
+        expect(response.status).toBe(403);
       });
     });
   });

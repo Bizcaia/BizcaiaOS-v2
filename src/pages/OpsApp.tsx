@@ -39,6 +39,9 @@ import {
   type AcquisitionStatus,
   type LifecycleConflictDetails,
   type PropertyImportPreviewResult,
+  type NegotiatorActivityPeriod,
+  type NegotiatorActivityReport,
+  type NegotiatorActivityLandownersReport,
   backwardStageRoles,
   demoStatusOperation,
   forwardStageRoles,
@@ -46,6 +49,7 @@ import {
   legacyStages,
   stageOrder,
 } from '../api/operationsApi';
+import { NEGOTIATOR_ACTIVITY_PERIOD_LABELS, NEGOTIATOR_ACTIVITY_PERIODS } from '../../shared/negotiatorActivityPeriod';
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
 import AuthGate from '../auth/AuthGate';
@@ -497,6 +501,7 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
             </div>
             {dashboardError && <p className="form-error">{dashboardError}</p>}
             <AttentionSection attention={attention} error={attentionError} onOpenProperty={openProperty} />
+            <NegotiatorActivitySection organizationId={organizationId} role={role} />
             <section className="ops-panel">
               <div className="panel-head">
                 <div>
@@ -801,6 +806,183 @@ function Metric({ label, value }: { label: string; value: number | string }) {
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+const interactionKpiRoles = new Set<OrganizationRole>([
+  'system_admin',
+  'land_acquisition_manager',
+  'supervisor',
+  'negotiator',
+]);
+
+function NegotiatorActivitySection({
+  organizationId,
+  role,
+}: {
+  organizationId: string;
+  role: OrganizationRole;
+}) {
+  const canView = interactionKpiRoles.has(role);
+  const showLeaderboard =
+    role === 'system_admin' || role === 'land_acquisition_manager' || role === 'supervisor';
+  const [period, setPeriod] = useState<NegotiatorActivityPeriod>('today');
+  const [selectedNegotiatorId, setSelectedNegotiatorId] = useState<string | null>(null);
+  const [report, setReport] = useState<NegotiatorActivityReport | null>(null);
+  const [landowners, setLandowners] = useState<NegotiatorActivityLandownersReport | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [drillOpen, setDrillOpen] = useState(false);
+
+  useEffect(() => {
+    if (!canView) return;
+    let cancelled = false;
+    setLoading(true);
+    void operationsApi
+      .getNegotiatorActivity(organizationId, {
+        period,
+        negotiatorId: showLeaderboard ? selectedNegotiatorId ?? undefined : undefined,
+      })
+      .then((result) => {
+        if (cancelled) return;
+        setReport(result);
+        setError('');
+        if (!selectedNegotiatorId) setSelectedNegotiatorId(result.summary.negotiatorId);
+      })
+      .catch((cause) => {
+        if (cancelled) return;
+        setReport(null);
+        setError(cause instanceof Error ? cause.message : 'Unable to load negotiator activity');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId, period, selectedNegotiatorId, canView, showLeaderboard]);
+
+  useEffect(() => {
+    setDrillOpen(false);
+    setLandowners(null);
+  }, [period, selectedNegotiatorId]);
+
+  if (!canView) return null;
+
+  const openDrillDown = async () => {
+    if (!report) return;
+    setError('');
+    try {
+      const detail = await operationsApi.getNegotiatorActivityLandowners(organizationId, {
+        period,
+        negotiatorId: report.summary.negotiatorId,
+      });
+      setLandowners(detail);
+      setDrillOpen(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to load landowners');
+    }
+  };
+
+  return (
+    <section className="ops-panel" aria-label="Negotiator activity">
+      <div className="panel-head">
+        <div>
+          <span className="panel-kicker">NEGOTIATOR ACTIVITY</span>
+          <h2>Unique landowners updated</h2>
+          <p className="drawer-meta">
+            Distinct landowners contacted through recorded interactions. Repeated contacts with the same landowner count once.
+          </p>
+        </div>
+      </div>
+      <div className="property-toolbar" role="group" aria-label="Reporting period">
+        {NEGOTIATOR_ACTIVITY_PERIODS.map((key) => (
+          <button
+            key={key}
+            type="button"
+            className={period === key ? 'primary-button' : 'secondary-button'}
+            aria-pressed={period === key}
+            onClick={() => setPeriod(key)}
+          >
+            {NEGOTIATOR_ACTIVITY_PERIOD_LABELS[key]}
+          </button>
+        ))}
+      </div>
+      {error && <p className="form-error">{error}</p>}
+      {loading && !report ? (
+        <p>Loading negotiator activity…</p>
+      ) : report ? (
+        <>
+          <div className="ops-metrics">
+            <div className="ops-metric">
+              <span>Unique landowners · {report.summary.negotiatorName}</span>
+              <strong>{report.summary.uniqueLandowners}</strong>
+            </div>
+            <div className="ops-metric">
+              <span>Total activities</span>
+              <strong>{report.summary.totalActivities}</strong>
+            </div>
+          </div>
+          <p className="drawer-meta">
+            Period in {report.timezone}. Unique landowners = distinct landowners; activities = qualifying interactions recorded.
+          </p>
+          <button type="button" className="secondary-button" onClick={() => void openDrillDown()}>
+            View contributing landowners
+          </button>
+          {drillOpen && landowners && (
+            <div className="owner-block" aria-label="Contributing landowners">
+              <h3>
+                {landowners.landowners.length} landowner{landowners.landowners.length === 1 ? '' : 's'}
+              </h3>
+              {landowners.landowners.length === 0 ? (
+                <p>No qualifying landowners in this period.</p>
+              ) : (
+                <ul className="owner-list">
+                  {landowners.landowners.map((owner) => (
+                    <li key={owner.ownerId}>
+                      <strong>{owner.displayName}</strong>
+                      <small>
+                        {owner.interactionCount} activit{owner.interactionCount === 1 ? 'y' : 'ies'}
+                      </small>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {showLeaderboard && (
+            <div className="owner-block" aria-label="Negotiator leaderboard">
+              <h3>Team breakdown</h3>
+              {report.leaderboard.length === 0 ? (
+                <p>No qualifying activity in this period.</p>
+              ) : (
+                <div className="property-list" role="table" aria-label="Negotiator activity leaderboard">
+                  <div className="property-row table-head" role="row">
+                    <span role="columnheader">Negotiator</span>
+                    <span role="columnheader">Unique landowners</span>
+                    <span role="columnheader">Activities</span>
+                  </div>
+                  {report.leaderboard.map((row) => (
+                    <button
+                      key={row.negotiatorId}
+                      type="button"
+                      className="property-row"
+                      role="row"
+                      aria-pressed={selectedNegotiatorId === row.negotiatorId}
+                      onClick={() => setSelectedNegotiatorId(row.negotiatorId)}
+                    >
+                      <strong>{row.negotiatorName}</strong>
+                      <span>{row.uniqueLandowners}</span>
+                      <b>{row.totalActivities}</b>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      ) : null}
+    </section>
   );
 }
 

@@ -14,6 +14,11 @@ import {
 import { evaluatePropertyImport } from '../../shared/evaluatePropertyImport';
 // Demo/browser only: Buffer-free RFC4180 parser (live parsing stays on the server).
 import { parsePropertyImportCsv } from '../../shared/parsePropertyImportCsv';
+import {
+  NEGOTIATOR_ACTIVITY_PERIODS,
+  computeNegotiatorActivityPeriodBounds,
+  type NegotiatorActivityPeriod,
+} from '../../shared/negotiatorActivityPeriod';
 
 export {
   buildPropertyImportErrorCsv,
@@ -311,6 +316,39 @@ export type DashboardSummary = {
   blocked: number;
   ready: number;
   stages: Array<{ acquisition_stage: AcquisitionStage; count: number }>;
+};
+
+export type { NegotiatorActivityPeriod };
+
+export type NegotiatorActivitySummary = {
+  negotiatorId: string;
+  negotiatorName: string;
+  uniqueLandowners: number;
+  totalActivities: number;
+};
+
+export type NegotiatorActivityReport = {
+  period: NegotiatorActivityPeriod;
+  timezone: string;
+  periodStart: string;
+  periodEnd: string;
+  summary: NegotiatorActivitySummary;
+  leaderboard: NegotiatorActivitySummary[];
+};
+
+export type NegotiatorActivityLandowner = {
+  ownerId: string;
+  displayName: string;
+  interactionCount: number;
+};
+
+export type NegotiatorActivityLandownersReport = {
+  period: NegotiatorActivityPeriod;
+  timezone: string;
+  periodStart: string;
+  periodEnd: string;
+  negotiatorId: string;
+  landowners: NegotiatorActivityLandowner[];
 };
 
 /** One row of an attention task list; `overdue` is decided against the organization's calendar day. */
@@ -924,6 +962,131 @@ const interactionTypes = new Set<InteractionType>(['call', 'meeting', 'site_visi
 function demoCanUseInteractions(): boolean {
   const member = demoActorMembership();
   return !!member && interactionRoles.has(member.role);
+}
+
+function demoQualifyingInteractions(
+  organizationId: string,
+  period: NegotiatorActivityPeriod,
+  timeZone: string,
+  negotiatorId?: string,
+) {
+  const bounds = computeNegotiatorActivityPeriodBounds(period, timeZone);
+  const rows = demoInteractions.filter((interaction) => {
+    if (interaction.organization_id !== organizationId) return false;
+    if (!interaction.owner_id || interaction.archived_at) return false;
+    const property = demoProperties.find((entry) => entry.id === interaction.property_id);
+    if (!property || !demoCanReadProperty(property)) return false;
+    if (negotiatorId && interaction.recorded_by_user_id !== negotiatorId) return false;
+    const occurred = new Date(interaction.occurred_at);
+    return occurred.getTime() >= bounds.start.getTime() && occurred.getTime() < bounds.end.getTime();
+  });
+  return { bounds, rows, timeZone };
+}
+
+function demoNegotiatorActivitySummaryFromRows(
+  negotiatorId: string,
+  rows: Interaction[],
+): NegotiatorActivitySummary {
+  const owners = new Set(rows.map((row) => row.owner_id).filter((id): id is string => !!id));
+  return {
+    negotiatorId,
+    negotiatorName: demoUsers[negotiatorId] ?? 'Unknown',
+    uniqueLandowners: owners.size,
+    totalActivities: rows.length,
+  };
+}
+
+async function demoNegotiatorActivity(
+  organizationId: string,
+  period: NegotiatorActivityPeriod,
+  requestedNegotiatorId?: string,
+): Promise<NegotiatorActivityReport> {
+  const member = demoActorMembership();
+  if (!member || member.organization_id !== organizationId || !demoCanUseInteractions()) {
+    throw new Error('You do not have permission for this operation');
+  }
+  let targetId = requestedNegotiatorId ?? DEMO_ACTOR_ID;
+  if (member.role === 'negotiator') {
+    if (requestedNegotiatorId && requestedNegotiatorId !== DEMO_ACTOR_ID) {
+      throw new Error('You do not have permission for this operation');
+    }
+    targetId = DEMO_ACTOR_ID;
+  }
+  const organization = await organizationApi.getOrganization(organizationId);
+  const { bounds, rows, timeZone } = demoQualifyingInteractions(organizationId, period, organization.timezone);
+  const summary = demoNegotiatorActivitySummaryFromRows(
+    targetId,
+    rows.filter((row) => row.recorded_by_user_id === targetId),
+  );
+  const canLead =
+    member.role === 'system_admin' || member.role === 'land_acquisition_manager' || member.role === 'supervisor';
+  const byRecorder = new Map<string, Interaction[]>();
+  for (const row of rows) {
+    const list = byRecorder.get(row.recorded_by_user_id) ?? [];
+    list.push(row);
+    byRecorder.set(row.recorded_by_user_id, list);
+  }
+  const leaderboard = canLead
+    ? [...byRecorder.entries()]
+        .map(([id, list]) => demoNegotiatorActivitySummaryFromRows(id, list))
+        .sort(
+          (a, b) =>
+            b.uniqueLandowners - a.uniqueLandowners ||
+            b.totalActivities - a.totalActivities ||
+            a.negotiatorName.localeCompare(b.negotiatorName),
+        )
+    : [summary];
+  return {
+    period,
+    timezone: timeZone,
+    periodStart: bounds.start.toISOString(),
+    periodEnd: bounds.end.toISOString(),
+    summary,
+    leaderboard,
+  };
+}
+
+async function demoNegotiatorActivityLandowners(
+  organizationId: string,
+  period: NegotiatorActivityPeriod,
+  negotiatorId: string,
+): Promise<NegotiatorActivityLandownersReport> {
+  const member = demoActorMembership();
+  if (!member || member.organization_id !== organizationId || !demoCanUseInteractions()) {
+    throw new Error('You do not have permission for this operation');
+  }
+  if (member.role === 'negotiator' && negotiatorId !== DEMO_ACTOR_ID) {
+    throw new Error('You do not have permission for this operation');
+  }
+  const organization = await organizationApi.getOrganization(organizationId);
+  const { bounds, rows, timeZone } = demoQualifyingInteractions(
+    organizationId,
+    period,
+    organization.timezone,
+    negotiatorId,
+  );
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (!row.owner_id) continue;
+    counts.set(row.owner_id, (counts.get(row.owner_id) ?? 0) + 1);
+  }
+  const landowners = [...counts.entries()]
+    .map(([ownerId, interactionCount]) => ({
+      ownerId,
+      displayName: demoOwners.find((owner) => owner.id === ownerId)?.display_name ?? 'Unknown',
+      interactionCount,
+    }))
+    .sort(
+      (a, b) => b.interactionCount - a.interactionCount || a.displayName.localeCompare(b.displayName),
+    );
+  return {
+    period,
+    timezone: timeZone,
+    periodStart: bounds.start.toISOString(),
+    periodEnd: bounds.end.toISOString(),
+    negotiatorId,
+    landowners,
+  };
 }
 
 function decorateInteraction(interaction: Interaction): Interaction {
@@ -2990,6 +3153,41 @@ export const operationsApi = {
         .map((stage) => ({ acquisition_stage: stage, count: active.filter((property) => property.acquisition_stage === stage).length }))
         .filter((entry) => entry.count > 0),
     };
+  },
+
+  async getNegotiatorActivity(
+    organizationId: string,
+    input: { period?: NegotiatorActivityPeriod; negotiatorId?: string } = {},
+  ): Promise<NegotiatorActivityReport> {
+    const period = input.period ?? 'today';
+    if (!(NEGOTIATOR_ACTIVITY_PERIODS as readonly string[]).includes(period)) {
+      throw new Error('Request validation failed');
+    }
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams({ organizationId, period });
+      if (input.negotiatorId) query.set('negotiatorId', input.negotiatorId);
+      return request<NegotiatorActivityReport>(`/ops/negotiator-activity?${query}`);
+    }
+    return demoNegotiatorActivity(organizationId, period, input.negotiatorId);
+  },
+
+  async getNegotiatorActivityLandowners(
+    organizationId: string,
+    input: { period?: NegotiatorActivityPeriod; negotiatorId: string },
+  ): Promise<NegotiatorActivityLandownersReport> {
+    const period = input.period ?? 'today';
+    if (!(NEGOTIATOR_ACTIVITY_PERIODS as readonly string[]).includes(period)) {
+      throw new Error('Request validation failed');
+    }
+    if (operationsApiMode === 'live') {
+      const query = new URLSearchParams({
+        organizationId,
+        period,
+        negotiatorId: input.negotiatorId,
+      });
+      return request<NegotiatorActivityLandownersReport>(`/ops/negotiator-activity/landowners?${query}`);
+    }
+    return demoNegotiatorActivityLandowners(organizationId, period, input.negotiatorId);
   },
 
   async downloadPropertyImportTemplate(organizationId: string) {

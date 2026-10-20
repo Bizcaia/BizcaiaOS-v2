@@ -43,6 +43,8 @@ import {
   propertyTimelineQuerySchema,
   archiveInteractionSchema,
   createInteractionSchema,
+  negotiatorActivityLandownersQuerySchema,
+  negotiatorActivityQuerySchema,
 } from './operationsSchemas.js';
 import { assertAcceptedFile, getDocumentStorage, loadDocumentUploadConfig } from './storage/documentStorage.js';
 import {
@@ -54,6 +56,14 @@ import {
   writePropertyImportTemplate,
 } from './imports/propertyImportHandlers.js';
 import { PROPERTY_IMPORT_ERROR_MESSAGES } from '../shared/propertyCsvContract.js';
+import {
+  canViewNegotiatorActivityLeaderboard,
+  loadNegotiatorActivityLandowners,
+  loadNegotiatorActivityLeaderboard,
+  loadNegotiatorActivitySummary,
+  resolveNegotiatorActivityPeriodBounds,
+  resolveNegotiatorActivityTarget,
+} from './negotiatorActivity.js';
 
 export const operationsRouter = Router();
 
@@ -348,6 +358,83 @@ operationsRouter.get('/attention', async (request, response) => {
   const data = await withActorTransaction(user.id, async (client) => {
     await requireMembership(client, organizationId, user.id);
     return loadAttention(client, user.id, organizationId);
+  });
+  response.json({ data });
+});
+
+operationsRouter.get('/negotiator-activity', async (request, response) => {
+  const user = requireUser(request);
+  const query = negotiatorActivityQuerySchema.parse(request.query);
+  const data = await withActorTransaction(user.id, async (client) => {
+    const role = await requireRole(client, query.organizationId, user.id, INTERACTION_ROLES);
+    const bounds = await resolveNegotiatorActivityPeriodBounds(client, query.organizationId, query.period);
+    const targetNegotiatorId = resolveNegotiatorActivityTarget({
+      role,
+      actorUserId: user.id,
+      requestedNegotiatorId: query.negotiatorId,
+    });
+    const summary = await loadNegotiatorActivitySummary(
+      client,
+      query.organizationId,
+      targetNegotiatorId,
+      bounds.period_start,
+      bounds.period_end,
+    );
+    const leaderboard = canViewNegotiatorActivityLeaderboard(role)
+      ? await loadNegotiatorActivityLeaderboard(client, query.organizationId, bounds.period_start, bounds.period_end)
+      : [summary];
+    return {
+      period: query.period,
+      timezone: bounds.timezone,
+      periodStart: new Date(bounds.period_start).toISOString(),
+      periodEnd: new Date(bounds.period_end).toISOString(),
+      summary: {
+        negotiatorId: summary.negotiator_id,
+        negotiatorName: summary.negotiator_name,
+        uniqueLandowners: summary.unique_landowners,
+        totalActivities: summary.total_activities,
+      },
+      leaderboard: leaderboard.map((row) => ({
+        negotiatorId: row.negotiator_id,
+        negotiatorName: row.negotiator_name,
+        uniqueLandowners: row.unique_landowners,
+        totalActivities: row.total_activities,
+      })),
+    };
+  });
+  response.json({ data });
+});
+
+operationsRouter.get('/negotiator-activity/landowners', async (request, response) => {
+  const user = requireUser(request);
+  const query = negotiatorActivityLandownersQuerySchema.parse(request.query);
+  const data = await withActorTransaction(user.id, async (client) => {
+    const role = await requireRole(client, query.organizationId, user.id, INTERACTION_ROLES);
+    const targetNegotiatorId = resolveNegotiatorActivityTarget({
+      role,
+      actorUserId: user.id,
+      requestedNegotiatorId: query.negotiatorId,
+    });
+    const bounds = await resolveNegotiatorActivityPeriodBounds(client, query.organizationId, query.period);
+    const landowners = await loadNegotiatorActivityLandowners(
+      client,
+      query.organizationId,
+      targetNegotiatorId,
+      bounds.period_start,
+      bounds.period_end,
+    );
+    return {
+      period: query.period,
+      timezone: bounds.timezone,
+      periodStart: new Date(bounds.period_start).toISOString(),
+      periodEnd: new Date(bounds.period_end).toISOString(),
+      negotiatorId: targetNegotiatorId,
+      landowners: landowners.map((row) => ({
+        ownerId: row.owner_id,
+        displayName: row.display_name,
+        interactionCount: row.interaction_count,
+      })),
+    };
   });
   response.json({ data });
 });
