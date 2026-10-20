@@ -53,6 +53,9 @@ import { NEGOTIATOR_ACTIVITY_PERIOD_LABELS, NEGOTIATOR_ACTIVITY_PERIODS } from '
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
 import AuthGate from '../auth/AuthGate';
+
+/** Static public asset — served from /brand/ in production (Vite public/). */
+const OPS_SIDEBAR_LOGO_SRC = '/brand/bizcaiaos-logo-hd.jpg';
 import { getSupabaseAuth } from '../auth/supabaseAuth';
 
 const stageLabels: Record<AcquisitionStage, string> = {
@@ -430,14 +433,14 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
     <div className="ops-shell">
       <aside className="ops-sidebar">
         <div className="ops-brand">
-          <span className="logo-mark">
-            <i />
-            <i />
-            <i />
-          </span>
-          <strong>
-            bizcaia<span>os</span>
-          </strong>
+          <img
+            className="ops-brand-logo"
+            src={OPS_SIDEBAR_LOGO_SRC}
+            alt="BizcaiaOS"
+            width={1024}
+            height={342}
+            decoding="async"
+          />
         </div>
         <nav>
           <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => { setTab('dashboard'); setSelected(null); }}>
