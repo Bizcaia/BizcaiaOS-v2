@@ -1,6 +1,11 @@
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import BootScreen, { BOOT_REDUCED_MS, BOOT_STATUSES, BOOT_TOTAL_MS } from './BootScreen';
+import BootScreen, {
+  BOOT_ARTWORK_SRC,
+  BOOT_REDUCED_MS,
+  BOOT_STATUSES,
+  BOOT_TOTAL_MS,
+} from './BootScreen';
 
 describe('BootScreen', () => {
   beforeEach(() => {
@@ -27,11 +32,13 @@ describe('BootScreen', () => {
     vi.restoreAllMocks();
   });
 
-  it('renders brand and the first boot status', () => {
+  it('renders the brand artwork and the first boot status', () => {
     render(<BootScreen onComplete={() => undefined} />);
     expect(screen.getByLabelText('BizcaiaOS starting')).toBeInTheDocument();
-    expect(document.querySelector('.boot-wordmark')).toHaveTextContent('BIZCAIAOS');
-    expect(screen.getByText('OPERATING SYSTEM FOR LAND ACQUISITION')).toBeInTheDocument();
+    const artwork = screen.getByRole('img', {
+      name: 'BizcaiaOS — Land Acquisition Operating System',
+    });
+    expect(artwork).toHaveAttribute('src', BOOT_ARTWORK_SRC);
     expect(screen.getByText(BOOT_STATUSES[0])).toBeInTheDocument();
     expect(screen.getByRole('progressbar')).toBeInTheDocument();
   });

@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import './BootScreen.css';
 
+/** Static public asset — served from /brand/ in production (Vite public/). */
+export const BOOT_ARTWORK_SRC = '/brand/bizcaiaos-boot.jpg';
+
 const BOOT_STATUSES = [
   'INITIALIZING BIZCAIAOS',
   'LOADING PROPERTY INTELLIGENCE',
@@ -23,18 +26,9 @@ function prefersReducedMotion(): boolean {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-function BootMark() {
-  return (
-    <span className="boot-mark" aria-hidden="true">
-      <i />
-      <i />
-      <i />
-    </span>
-  );
-}
-
 /**
  * Full-viewport BizcaiaOS boot sequence shown at the application entry.
+ * Uses the supplied brand artwork as the primary visual; does not recreate the logo in CSS.
  * Does not touch auth, API, or tenancy — presentation only.
  */
 export default function BootScreen({ onComplete }: Props) {
@@ -84,15 +78,15 @@ export default function BootScreen({ onComplete }: Props) {
 
   return (
     <div className="boot-screen" role="main" aria-label="BizcaiaOS starting">
-      <div className="boot-ambient" aria-hidden="true" />
       <div className="boot-frame">
-        <div className="boot-brand">
-          <BootMark />
-          <p className="boot-wordmark">
-            BIZCAIA<span>OS</span>
-          </p>
-          <p className="boot-tagline">OPERATING SYSTEM FOR LAND ACQUISITION</p>
-        </div>
+        <img
+          className="boot-artwork"
+          src={BOOT_ARTWORK_SRC}
+          alt="BizcaiaOS — Land Acquisition Operating System"
+          width={1024}
+          height={1024}
+          decoding="async"
+        />
 
         <div className="boot-status-block">
           <p className="boot-status" aria-live="polite" aria-atomic="true">
