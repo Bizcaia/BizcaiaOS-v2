@@ -1205,6 +1205,7 @@ describe('OpsApp property workflow', () => {
     });
 
     render(<OpsApp onExit={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: /Team & access/i }));
     const section = await screen.findByRole('region', { name: 'Negotiator activity' });
     expect(within(section).getByRole('heading', { name: 'Unique landowners updated' })).toBeVisible();
     expect(await within(section).findByText(/Unique landowners ·/)).toBeVisible();

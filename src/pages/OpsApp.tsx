@@ -490,7 +490,10 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
           </div>
         </header>
         {tab === 'team' ? (
-          <TeamManagement organizationId={organizationId} onPreviewOnboarding={() => setShowOnboarding(true)} notify={() => {}} />
+          <>
+            <TeamManagement organizationId={organizationId} onPreviewOnboarding={() => setShowOnboarding(true)} notify={() => {}} />
+            <NegotiatorActivitySection organizationId={organizationId} role={role} />
+          </>
         ) : tab === 'dashboard' ? (
           <>
             <div className="ops-metrics">
@@ -501,7 +504,6 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
             </div>
             {dashboardError && <p className="form-error">{dashboardError}</p>}
             <AttentionSection attention={attention} error={attentionError} onOpenProperty={openProperty} />
-            <NegotiatorActivitySection organizationId={organizationId} role={role} />
             <section className="ops-panel">
               <div className="panel-head">
                 <div>
