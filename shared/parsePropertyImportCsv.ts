@@ -1,49 +1,24 @@
-import { parse } from 'csv-parse/sync';
+import { PROPERTY_IMPORT_ERROR_MESSAGES } from './propertyCsvContract.js';
 import {
-  PROPERTY_IMPORT_CSV_HEADERS,
-  PROPERTY_IMPORT_ERROR_MESSAGES,
-  PROPERTY_IMPORT_MAX_DATA_ROWS,
-  type PropertyImportCsvHeader,
-  type PropertyImportFieldError,
-  type PropertyImportFileError,
-  type PropertyImportNormalizedRow,
-  validateHeaders,
-  validateImportDataRow,
-} from './propertyCsvContract.js';
+  decodePropertyImportCsvText,
+  finalizePropertyImportRecords,
+  type ParsedPropertyCsv,
+} from './finalizePropertyImportRecords.js';
 
-export type ParsedPropertyCsv =
-  | {
-      ok: true;
-      rows: PropertyImportNormalizedRow[];
-      fieldErrors: Map<number, PropertyImportFieldError[]>;
-    }
-  | { ok: false; error: PropertyImportFileError };
+export type { ParsedPropertyCsv } from './finalizePropertyImportRecords.js';
 
 /**
- * Parse UTF-8 CSV text/bytes into normalized property import rows.
- * Uses csv-parse (not a hand-rolled parser). Header = row 1; first data = row 2.
+ * Browser-safe RFC4180 CSV parser for demo/client use.
+ * Must not import Node CSV libraries or Node globals (process/fs/stream).
+ * Live/server import remains authoritative via server/imports/parsePropertyCsv.ts.
  */
 export function parsePropertyImportCsv(input: string | Uint8Array): ParsedPropertyCsv {
-  let text: string;
-  try {
-    text = typeof input === 'string' ? input : new TextDecoder('utf-8', { fatal: false }).decode(input);
-  } catch {
-    return {
-      ok: false,
-      error: { code: 'FILE_ENCODING', message: PROPERTY_IMPORT_ERROR_MESSAGES.FILE_ENCODING },
-    };
-  }
+  const decoded = decodePropertyImportCsvText(input);
+  if (!decoded.ok) return decoded;
 
   let records: string[][];
   try {
-    records = parse(text, {
-      bom: true,
-      columns: false,
-      relax_column_count: false,
-      skip_empty_lines: true,
-      trim: false,
-      relax_quotes: false,
-    }) as string[][];
+    records = parseRfc4180Records(decoded.text);
   } catch {
     return {
       ok: false,
@@ -51,54 +26,96 @@ export function parsePropertyImportCsv(input: string | Uint8Array): ParsedProper
     };
   }
 
-  if (records.length === 0) {
-    return {
-      ok: false,
-      error: { code: 'FILE_NO_DATA_ROWS', message: PROPERTY_IMPORT_ERROR_MESSAGES.FILE_NO_DATA_ROWS },
-    };
-  }
+  return finalizePropertyImportRecords(records);
+}
 
-  const headerRow = records[0] ?? [];
-  const headerError = validateHeaders(headerRow.map((cell) => String(cell)));
-  if (headerError) {
-    return { ok: false, error: headerError };
-  }
+/**
+ * Minimal RFC4180 record splitter matching the csv-parse options used on the server:
+ * bom stripped, comma delimiter, CRLF/LF, quoted commas, escaped quotes,
+ * skip empty lines, trim:false, relax_quotes:false, relax_column_count:false (enforced later).
+ */
+function parseRfc4180Records(input: string): string[][] {
+  const text = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
+  const records: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let inQuotes = false;
+  let i = 0;
+  let sawContentInRow = false;
 
-  const dataRecords = records.slice(1);
-  if (dataRecords.length === 0) {
-    return {
-      ok: false,
-      error: { code: 'FILE_NO_DATA_ROWS', message: PROPERTY_IMPORT_ERROR_MESSAGES.FILE_NO_DATA_ROWS },
-    };
-  }
-  if (dataRecords.length > PROPERTY_IMPORT_MAX_DATA_ROWS) {
-    return {
-      ok: false,
-      error: { code: 'FILE_TOO_MANY_ROWS', message: PROPERTY_IMPORT_ERROR_MESSAGES.FILE_TOO_MANY_ROWS },
-    };
-  }
+  const endField = () => {
+    row.push(field);
+    field = '';
+  };
 
-  const rows: PropertyImportNormalizedRow[] = [];
-  const fieldErrors = new Map<number, PropertyImportFieldError[]>();
-
-  for (let index = 0; index < dataRecords.length; index += 1) {
-    const record = dataRecords[index] ?? [];
-    if (record.length !== PROPERTY_IMPORT_CSV_HEADERS.length) {
-      return {
-        ok: false,
-        error: { code: 'FILE_MALFORMED', message: PROPERTY_IMPORT_ERROR_MESSAGES.FILE_MALFORMED },
-      };
+  const endRow = () => {
+    endField();
+    const isEmptyLine = !sawContentInRow && row.length === 1 && row[0] === '';
+    if (!isEmptyLine) {
+      records.push(row);
     }
-    const rowNumber = index + 2;
-    const cells = Object.fromEntries(
-      PROPERTY_IMPORT_CSV_HEADERS.map((header, columnIndex) => [header, String(record[columnIndex] ?? '')]),
-    ) as Record<PropertyImportCsvHeader, string>;
-    const validated = validateImportDataRow(rowNumber, cells);
-    rows.push(validated.row);
-    if (validated.errors.length > 0) {
-      fieldErrors.set(rowNumber, validated.errors);
+    row = [];
+    sawContentInRow = false;
+  };
+
+  while (i < text.length) {
+    const ch = text[i]!;
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i += 1;
+        continue;
+      }
+      field += ch;
+      sawContentInRow = true;
+      i += 1;
+      continue;
     }
+
+    if (ch === '"') {
+      inQuotes = true;
+      sawContentInRow = true;
+      i += 1;
+      continue;
+    }
+
+    if (ch === ',') {
+      endField();
+      sawContentInRow = true;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '\n') {
+      endRow();
+      i += 1;
+      continue;
+    }
+
+    if (ch === '\r') {
+      endRow();
+      i += text[i + 1] === '\n' ? 2 : 1;
+      continue;
+    }
+
+    field += ch;
+    sawContentInRow = true;
+    i += 1;
   }
 
-  return { ok: true, rows, fieldErrors };
+  if (inQuotes) {
+    throw new Error('unclosed_quote');
+  }
+
+  if (sawContentInRow || field.length > 0 || row.length > 0) {
+    endRow();
+  }
+
+  return records;
 }

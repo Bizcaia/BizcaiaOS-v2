@@ -12,6 +12,7 @@ import {
   type PropertyImportPreviewResult,
 } from '../../shared/propertyCsvContract';
 import { evaluatePropertyImport } from '../../shared/evaluatePropertyImport';
+// Demo/browser only: Buffer-free RFC4180 parser (live parsing stays on the server).
 import { parsePropertyImportCsv } from '../../shared/parsePropertyImportCsv';
 
 export {

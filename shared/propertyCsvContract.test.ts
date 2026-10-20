@@ -7,10 +7,16 @@ import {
   validateHeaders,
   validateImportDataRow,
 } from './propertyCsvContract.js';
-import { parsePropertyImportCsv } from './parsePropertyImportCsv.js';
+import { parsePropertyImportCsv as parseBrowser } from './parsePropertyImportCsv.js';
+import { parsePropertyImportCsv as parseServer } from '../server/imports/parsePropertyCsv.js';
 import { evaluatePropertyImport } from './evaluatePropertyImport.js';
 
 const header = PROPERTY_IMPORT_CSV_HEADERS.join(',');
+
+const parsers = [
+  ['browser', parseBrowser],
+  ['server-csv-parse', parseServer],
+] as const;
 
 describe('property CSV contract', () => {
   it('accepts exact headers only', () => {
@@ -19,41 +25,60 @@ describe('property CSV contract', () => {
     expect(validateHeaders([...PROPERTY_IMPORT_CSV_HEADERS].reverse())?.code).toBe('HEADERS_INVALID');
   });
 
-  it('parses BOM, CRLF, quoted commas, and escaped quotes', () => {
-    const csv =
-      '\uFEFF' +
-      `${header}\r\n` +
-      `NCP,"REF-1","T,1",,,"1.5","City","Prov","Brgy",low\r\n` +
-      `NCP,REF-2,"say ""hi""",,,,,,,\n`;
-    const parsed = parsePropertyImportCsv(csv);
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) return;
-    expect(parsed.rows).toHaveLength(2);
-    expect(parsed.rows[0]?.titleNumber).toBe('T,1');
-    expect(parsed.rows[1]?.titleNumber).toBe('say "hi"');
-    expect(parsed.rows[0]?.risk).toBe('low');
-    expect(parsed.rows[1]?.risk).toBe('medium');
-  });
+  for (const [name, parsePropertyImportCsv] of parsers) {
+    describe(`parse parity (${name})`, () => {
+      it('parses BOM, CRLF, quoted commas, and escaped quotes', () => {
+        const csv =
+          '\uFEFF' +
+          `${header}\r\n` +
+          `NCP,"REF-1","T,1",,,"1.5","City","Prov","Brgy",low\r\n` +
+          `NCP,REF-2,"say ""hi""",,,,,,,\n`;
+        const parsed = parsePropertyImportCsv(csv);
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        expect(parsed.rows).toHaveLength(2);
+        expect(parsed.rows[0]?.titleNumber).toBe('T,1');
+        expect(parsed.rows[1]?.titleNumber).toBe('say "hi"');
+        expect(parsed.rows[0]?.risk).toBe('low');
+        expect(parsed.rows[1]?.risk).toBe('medium');
+      });
 
-  it('rejects unclosed quotes and inconsistent columns', () => {
-    expect(parsePropertyImportCsv(`${header}\nNCP,REF-1,"open,,,,,,,\n`).ok).toBe(false);
-    expect(parsePropertyImportCsv(`${header}\nNCP,REF-1\n`).ok).toBe(false);
-  });
+      it('rejects unclosed quotes and inconsistent columns', () => {
+        expect(parsePropertyImportCsv(`${header}\nNCP,REF-1,"open,,,,,,,\n`).ok).toBe(false);
+        expect(parsePropertyImportCsv(`${header}\nNCP,REF-1\n`).ok).toBe(false);
+      });
 
-  it('rejects zero and too many data rows', () => {
-    expect(parsePropertyImportCsv(`${header}\n`).ok).toBe(false);
-    const many = [header, ...Array.from({ length: 5001 }, (_, i) => `NCP,REF-${i},,,,,,,,`)].join('\n');
-    const parsed = parsePropertyImportCsv(many);
-    expect(parsed.ok).toBe(false);
-    if (!parsed.ok) expect(parsed.error.code).toBe('FILE_TOO_MANY_ROWS');
-  });
+      it('rejects zero and too many data rows', () => {
+        expect(parsePropertyImportCsv(`${header}\n`).ok).toBe(false);
+        const many = [header, ...Array.from({ length: 5001 }, (_, i) => `NCP,REF-${i},,,,,,,,`)].join('\n');
+        const parsed = parsePropertyImportCsv(many);
+        expect(parsed.ok).toBe(false);
+        if (!parsed.ok) expect(parsed.error.code).toBe('FILE_TOO_MANY_ROWS');
+      });
 
-  it('accepts 5000 data rows structurally', () => {
-    const many = [header, ...Array.from({ length: 5000 }, (_, i) => `NCP,REF-${i},,,,,,,,`)].join('\n');
-    const parsed = parsePropertyImportCsv(many);
-    expect(parsed.ok).toBe(true);
-    if (parsed.ok) expect(parsed.rows).toHaveLength(5000);
-  });
+      it('accepts 5000 data rows structurally', () => {
+        const many = [header, ...Array.from({ length: 5000 }, (_, i) => `NCP,REF-${i},,,,,,,,`)].join('\n');
+        const parsed = parsePropertyImportCsv(many);
+        expect(parsed.ok).toBe(true);
+        if (parsed.ok) expect(parsed.rows).toHaveLength(5000);
+      });
+
+      it('evaluates project and existing reference conflicts without disclosing cross-org', () => {
+        const parsed = parsePropertyImportCsv(`${header}\nKNOWN,NEW-1,,,,,,,,\nOTHER,NEW-2,,,,,,,,\n`);
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        const preview = evaluatePropertyImport({
+          rows: parsed.rows,
+          fieldErrors: parsed.fieldErrors,
+          projectIdsByCode: new Map([['KNOWN', 'project-1']]),
+          existingReferences: new Set(['NEW-2']),
+        });
+        expect(preview.rows[0]?.wouldCreate).toBe(true);
+        expect(preview.rows[1]?.errors.some((error) => error.code === 'PROJECT_NOT_FOUND')).toBe(true);
+        expect(preview.canCommit).toBe(false);
+      });
+    });
+  }
 
   it('validates fields, trimming, and defaults', () => {
     const { row, errors } = validateImportDataRow(2, {
@@ -81,21 +106,6 @@ describe('property CSV contract', () => {
       { rowNumber: 4, propertyReference: 'B' },
     ]);
     expect([...dupes].sort()).toEqual([2, 3]);
-  });
-
-  it('evaluates project and existing reference conflicts without disclosing cross-org', () => {
-    const parsed = parsePropertyImportCsv(`${header}\nKNOWN,NEW-1,,,,,,,,\nOTHER,NEW-2,,,,,,,,\n`);
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) return;
-    const preview = evaluatePropertyImport({
-      rows: parsed.rows,
-      fieldErrors: parsed.fieldErrors,
-      projectIdsByCode: new Map([['KNOWN', 'project-1']]),
-      existingReferences: new Set(['NEW-2']),
-    });
-    expect(preview.rows[0]?.wouldCreate).toBe(true);
-    expect(preview.rows[1]?.errors.some((error) => error.code === 'PROJECT_NOT_FOUND')).toBe(true);
-    expect(preview.canCommit).toBe(false);
   });
 
   it('builds error CSV with exact columns and sanitizes formulas', () => {

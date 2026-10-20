@@ -1,6 +1,7 @@
 /**
- * Browser-safe CSV Property Import/Export contract.
- * Server-only parsing (csv-parse) lives under server/imports/.
+ * Browser-safe CSV Property Import/Export contract and helpers.
+ * Authoritative live parsing lives in server/imports/parsePropertyCsv.ts.
+ * Demo/browser parsing uses shared/parsePropertyImportCsv.ts (no Node globals).
  */
 
 export const PROPERTY_IMPORT_CSV_HEADERS = [
