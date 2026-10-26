@@ -7,8 +7,7 @@ import BootScreen from './pages/BootScreen';
 import OpsApp from './pages/OpsApp';
 
 function initialPhase(): 'boot' | 'app' {
-  // Public entry is `/` (Holdings “Explore BizcaiaOS”). Organization setup is first paint.
-  return 'app';
+  return typeof window !== 'undefined' && window.location.hash === '#app' ? 'app' : 'boot';
 }
 
 function App() {
