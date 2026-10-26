@@ -1209,6 +1209,29 @@ describe('OpsApp property workflow', () => {
     expect(screen.getByRole('img', { name: 'BizcaiaOS' })).toBeVisible();
   });
 
+  it('opens workspace navigation as an overlay without changing dashboard copy', async () => {
+    const user = userEvent.setup();
+    renderOpsApp();
+    expect(await screen.findByRole('heading', { name: 'Portfolio overview' })).toBeVisible();
+    expect(screen.getByText('NORTH CORRIDOR PROGRAM')).toBeVisible();
+    expect(screen.getByText('Preview workspace')).toBeVisible();
+
+    const toggle = screen.getByRole('button', { name: 'Open navigation' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: 'Close navigation' })).not.toBeInTheDocument();
+
+    await user.click(toggle);
+    expect(screen.getByRole('button', { name: 'Close navigation' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: 'Dismiss navigation' })).toBeVisible();
+    expect(document.querySelector('.ops-sidebar')?.classList.contains('open')).toBe(true);
+    expect(screen.getByRole('heading', { name: 'Portfolio overview' })).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Projects' }));
+    expect(await screen.findByRole('heading', { name: 'Projects' })).toBeVisible();
+    expect(document.querySelector('.ops-sidebar')?.classList.contains('open')).toBe(false);
+    expect(screen.getByRole('button', { name: 'Open navigation' })).toHaveAttribute('aria-expanded', 'false');
+  });
+
   it('renders negotiator activity KPI with period switching and drill-down', async () => {
     const user = userEvent.setup();
     const spy = vi.spyOn(operationsApi, 'getNegotiatorActivity').mockResolvedValue({

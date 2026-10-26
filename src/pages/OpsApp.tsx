@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Download, FolderKanban, LayoutDashboard, LogOut, Map, Moon, Plus, Search, ShieldCheck, Sun, Upload } from 'lucide-react';
+import { ArrowLeft, Download, FolderKanban, LayoutDashboard, LogOut, Map, Menu, Moon, Plus, Search, ShieldCheck, Sun, Upload } from 'lucide-react';
 import { organizationApi, organizationApiMode, type Member, type OrganizationRole } from '../api/organizationApi';
 import { useTheme } from '../contexts/ThemeContext';
 import {
@@ -281,6 +281,7 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   const [dashboardError, setDashboardError] = useState('');
   const [attention, setAttention] = useState<Attention | null>(null);
   const [attentionError, setAttentionError] = useState('');
+  const [navOpen, setNavOpen] = useState(false);
   const isDemo = organizationApiMode === 'demo';
   const canManageProperties = propertyCreateRoles.includes(role);
   const canManageOwners = ownerManagerRoles.includes(role);
@@ -392,7 +393,23 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   const openProperty = async (propertyId: string) => {
     setSelected(await operationsApi.getProperty(propertyId));
     setTab('properties');
+    setNavOpen(false);
   };
+
+  const goTab = (next: OpsTab) => {
+    setTab(next);
+    setSelected(null);
+    setNavOpen(false);
+  };
+
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setNavOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [navOpen]);
 
   // Portfolio counts come from the server, so they cover every visible property
   // and do not follow the Properties tab's filters or the rows loaded so far.
@@ -459,8 +476,11 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   };
 
   return (
-    <div className="ops-shell">
-      <aside className="ops-sidebar">
+    <div className={navOpen ? 'ops-shell nav-open' : 'ops-shell'}>
+      {navOpen ? (
+        <button type="button" className="ops-nav-backdrop" aria-label="Dismiss navigation" onClick={() => setNavOpen(false)} />
+      ) : null}
+      <aside id="ops-sidebar" className={navOpen ? 'ops-sidebar open' : 'ops-sidebar'} aria-label="Workspace">
         <div className="ops-brand">
           <img
             className="ops-brand-logo"
@@ -472,16 +492,16 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
           />
         </div>
         <nav>
-          <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => { setTab('dashboard'); setSelected(null); }}>
+          <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => goTab('dashboard')}>
             <LayoutDashboard size={17} /> Dashboard
           </button>
-          <button className={tab === 'projects' ? 'active' : ''} onClick={() => { setTab('projects'); setSelected(null); }}>
+          <button className={tab === 'projects' ? 'active' : ''} onClick={() => goTab('projects')}>
             <FolderKanban size={17} /> Projects
           </button>
-          <button className={tab === 'properties' ? 'active' : ''} onClick={() => { setTab('properties'); setSelected(null); }}>
+          <button className={tab === 'properties' ? 'active' : ''} onClick={() => goTab('properties')}>
             <Map size={17} /> Properties
           </button>
-          <button className={tab === 'team' ? 'active' : ''} onClick={() => { setTab('team'); setSelected(null); }}>
+          <button className={tab === 'team' ? 'active' : ''} onClick={() => goTab('team')}>
             <ShieldCheck size={17} /> Team & access
           </button>
         </nav>
@@ -496,9 +516,21 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
       </aside>
       <main className="ops-main">
         <header className="ops-header">
-          <div>
-            <span className="mini-label">NORTH CORRIDOR PROGRAM</span>
-            <h1>{titles[tab]}</h1>
+          <div className="ops-header-title">
+            <button
+              type="button"
+              className="ops-nav-toggle"
+              aria-expanded={navOpen}
+              aria-controls="ops-sidebar"
+              aria-label={navOpen ? 'Close navigation' : 'Open navigation'}
+              onClick={() => setNavOpen((open) => !open)}
+            >
+              <Menu size={18} aria-hidden="true" />
+            </button>
+            <div>
+              <span className="mini-label">NORTH CORRIDOR PROGRAM</span>
+              <h1>{titles[tab]}</h1>
+            </div>
           </div>
           <div className="ops-header-actions">
             <ThemeAppearanceControl />
