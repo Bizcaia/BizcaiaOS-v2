@@ -1232,6 +1232,13 @@ describe('OpsApp property workflow', () => {
     expect(screen.getByRole('button', { name: 'Open navigation' })).toHaveAttribute('aria-expanded', 'false');
   });
 
+  it('sends Website to the Bizcaia Holdings site', async () => {
+    renderOpsApp();
+    const website = await screen.findByRole('link', { name: 'Website' });
+    expect(website).toHaveAttribute('href', 'https://www.bizcaia.com/');
+    expect(website).not.toHaveAttribute('target');
+  });
+
   it('renders negotiator activity KPI with period switching and drill-down', async () => {
     const user = userEvent.setup();
     const spy = vi.spyOn(operationsApi, 'getNegotiatorActivity').mockResolvedValue({

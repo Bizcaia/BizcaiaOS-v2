@@ -211,6 +211,7 @@ select { font: inherit; }
 [data-theme="dark"] .ops-nav-toggle{background:#1c1b1a;border-color:#34312f;color:#f2ebe4}
 [data-theme="dark"] .ops-nav-toggle:hover{background:#2a2826}
 
+a.ops-exit{text-decoration:none}
 .onboarding-brand-logo{display:block;height:36px;width:auto;max-width:min(220px,68vw);object-fit:contain;object-position:left center}
 .ops-brand-logo{height:auto;max-height:44px;object-fit:contain;object-position:center}
 @media (max-width:700px){

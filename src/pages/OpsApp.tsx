@@ -57,6 +57,8 @@ import AuthGate from '../auth/AuthGate';
 import { BRAND_LOCKUP_HEIGHT, BRAND_LOCKUP_SRC, BRAND_LOCKUP_WIDTH } from '../brand/lockup';
 import { getSupabaseAuth } from '../auth/supabaseAuth';
 
+const HOLDINGS_SITE_HREF = 'https://www.bizcaia.com/';
+
 const stageLabels: Record<AcquisitionStage, string> = {
   identified: 'Identified',
   initial_contact: 'Initial contact',
@@ -508,9 +510,9 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
             <LogOut size={16} /> Sign out
           </button>
         )}
-        <button className="ops-exit" onClick={onExit}>
+        <a className="ops-exit" href={HOLDINGS_SITE_HREF}>
           <ArrowLeft size={16} /> Website
-        </button>
+        </a>
       </aside>
       <main className="ops-main">
         <header className="ops-header">
