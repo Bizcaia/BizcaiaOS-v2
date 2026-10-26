@@ -21,6 +21,7 @@ describe('OrganizationOnboarding', () => {
   it('renders the security proposition and starts with submission disabled', () => {
     render(<OrganizationOnboarding onComplete={vi.fn()} />);
 
+    expect(screen.getByRole('img', { name: 'BizcaiaOS' })).toBeVisible();
     expect(screen.getByRole('heading', { name: /build your acquisition/i })).toBeVisible();
     expect(screen.getByText('Tenant isolated')).toBeVisible();
     expect(screen.getByText('Role controlled')).toBeVisible();

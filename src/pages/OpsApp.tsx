@@ -54,9 +54,7 @@ import { NEGOTIATOR_ACTIVITY_PERIOD_LABELS, NEGOTIATOR_ACTIVITY_PERIODS } from '
 import TeamManagement from './TeamManagement';
 import OrganizationOnboarding from './OrganizationOnboarding';
 import AuthGate from '../auth/AuthGate';
-
-/** Static public asset — served from /brand/ in production (Vite public/). */
-const OPS_SIDEBAR_LOGO_SRC = '/brand/bizcaiaos-logo-hd.jpg';
+import { BRAND_LOCKUP_HEIGHT, BRAND_LOCKUP_SRC, BRAND_LOCKUP_WIDTH } from '../brand/lockup';
 import { getSupabaseAuth } from '../auth/supabaseAuth';
 
 const stageLabels: Record<AcquisitionStage, string> = {
@@ -484,10 +482,10 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
         <div className="ops-brand">
           <img
             className="ops-brand-logo"
-            src={OPS_SIDEBAR_LOGO_SRC}
+            src={BRAND_LOCKUP_SRC}
             alt="BizcaiaOS"
-            width={1024}
-            height={342}
+            width={BRAND_LOCKUP_WIDTH}
+            height={BRAND_LOCKUP_HEIGHT}
             decoding="async"
           />
         </div>

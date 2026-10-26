@@ -1,5 +1,6 @@
 import React, { useState, type FormEvent } from 'react';
 import { ArrowRight, Check, LockKeyhole, X } from 'lucide-react';
+import BrandLockup from '../components/BrandLockup';
 
 type Props = {
   onSignIn: (email: string, password: string) => Promise<void>;
@@ -32,7 +33,7 @@ export default function SignIn({ onSignIn, onCancel }: Props) {
 
   return (
     <div className="onboarding-screen">
-      <div className="onboarding-brand"><div className="brand-mark"><i /><i /><i /></div><span>bizcaia<span>os</span></span></div>
+      <div className="onboarding-brand"><BrandLockup className="onboarding-brand-logo" /></div>
       {onCancel && <button className="onboarding-close" onClick={onCancel} aria-label="Back to website"><X size={20} /></button>}
       <div className="onboarding-layout">
         <section className="onboarding-story">

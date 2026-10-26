@@ -1,6 +1,7 @@
 import React, { useMemo, useState, type FormEvent } from 'react';
 import { ArrowRight, Building2, Check, Database, ShieldCheck, Users, X } from 'lucide-react';
 import { organizationApi, organizationApiMode } from '../api/organizationApi';
+import BrandLockup from '../components/BrandLockup';
 
 type Props = {
   onComplete: (organizationId: string) => void;
@@ -39,7 +40,7 @@ export default function OrganizationOnboarding({ onComplete, onCancel }: Props) 
 
   return (
     <div className="onboarding-screen">
-      <div className="onboarding-brand"><div className="brand-mark"><i /><i /><i /></div><span>bizcaia<span>os</span></span></div>
+      <div className="onboarding-brand"><BrandLockup className="onboarding-brand-logo" /></div>
       {onCancel && <button className="onboarding-close" onClick={onCancel} aria-label="Close onboarding"><X size={20} /></button>}
       <div className="onboarding-layout">
         <section className="onboarding-story">
