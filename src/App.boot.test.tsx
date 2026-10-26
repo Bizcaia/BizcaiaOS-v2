@@ -1,7 +1,6 @@
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
-import { BOOT_TOTAL_MS } from './pages/BootScreen';
 
 vi.mock('./pages/OpsApp', () => ({
   default: ({ onExit }: { onExit: () => void }) => (
@@ -41,20 +40,14 @@ describe('App boot entry', () => {
     vi.restoreAllMocks();
   });
 
-  it('shows the boot screen at root then transitions into the application', () => {
+  it('opens the application at root without the boot screen', () => {
     render(<App />);
-    expect(screen.getByLabelText('BizcaiaOS starting')).toBeInTheDocument();
-    expect(screen.queryByText('Mocked OpsApp')).not.toBeInTheDocument();
-
-    act(() => {
-      vi.advanceTimersByTime(BOOT_TOTAL_MS);
-    });
-
+    expect(screen.queryByLabelText('BizcaiaOS starting')).not.toBeInTheDocument();
     expect(screen.getByText('Mocked OpsApp')).toBeInTheDocument();
-    expect(window.location.hash).toBe('#app');
+    expect(window.location.hash).toBe('');
   });
 
-  it('skips the boot screen when the URL already targets #app', () => {
+  it('opens the application when the URL already targets #app', () => {
     window.location.hash = '#app';
     render(<App />);
     expect(screen.queryByLabelText('BizcaiaOS starting')).not.toBeInTheDocument();

@@ -270,7 +270,7 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   const [showImportProperties, setShowImportProperties] = useState(false);
   const [exportingProperties, setExportingProperties] = useState(false);
   const [showCreateProject, setShowCreateProject] = useState(false);
-  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(() => organizationApiMode === 'demo');
   const [organizationId, setOrganizationId] = useState<string | null>(null);
   const [role, setRole] = useState<OrganizationRole>('viewer');
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
@@ -289,7 +289,6 @@ function OpsWorkspace({ onExit, onSignOut }: { onExit: () => void; onSignOut?: (
   useEffect(() => {
     if (isDemo) {
       setOrganizationId(DEMO_ORGANIZATION_ID);
-      setShowOnboarding(false);
       setOrgContextError('');
     }
     let cancelled = false;

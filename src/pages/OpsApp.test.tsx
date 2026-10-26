@@ -48,11 +48,13 @@ import OpsApp from './OpsApp';
 import { ThemeProvider } from '../contexts/ThemeContext';
 
 function renderOpsApp(onExit: () => void = vi.fn()) {
-  return render(
+  const view = render(
     <ThemeProvider>
       <OpsApp onExit={onExit} />
     </ThemeProvider>,
   );
+  fireEvent.click(screen.getByRole('button', { name: 'Close onboarding' }));
+  return view;
 }
 
 describe('OpsApp property workflow', () => {
@@ -81,6 +83,18 @@ describe('OpsApp property workflow', () => {
       organizations: [organization],
     });
     apiMocks.listMembers.mockResolvedValue(members);
+  });
+
+  it('lands on organization setup in demo before the workspace', () => {
+    render(
+      <ThemeProvider>
+        <OpsApp onExit={vi.fn()} />
+      </ThemeProvider>,
+    );
+    expect(screen.getByRole('heading', { name: /build your acquisition/i })).toBeVisible();
+    expect(screen.getByText('ORGANIZATION SETUP')).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Name your organization' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Portfolio overview' })).not.toBeInTheDocument();
   });
 
   it('creates a project in demo mode and a property with assignments and owners', async () => {
