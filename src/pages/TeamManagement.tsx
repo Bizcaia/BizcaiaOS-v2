@@ -104,7 +104,7 @@ export default function TeamManagement({ organizationId, onPreviewOnboarding, no
   return (
     <div className="team-page">
       <div className="admin-hero">
-        <div><div className="eyebrow">ACCESS CONTROL</div><h1>Organization & people</h1><p>Manage the tenant profile, invitations, roles, and active access from one governed workspace.</p></div>
+        <div><div className="eyebrow">ACCESS CONTROL</div><h1 className="visually-hidden">Organization & people</h1><p>Manage the tenant profile, invitations, roles, and active access from one governed workspace.</p></div>
         <div className="admin-hero-actions"><span className={`api-mode ${organizationApiMode}`}><i />{organizationApiMode === 'demo' ? 'Preview data' : 'Live API'}</span><button className="secondary-button" onClick={onPreviewOnboarding}><Building2 size={16} /> Preview onboarding</button><button className="primary-button" onClick={() => setInviteOpen(true)}><MailPlus size={16} /> Invite member</button></div>
       </div>
 

@@ -80,6 +80,10 @@ describe('TeamManagement', () => {
 
     expect(document.querySelector('.team-skeleton')).toBeInTheDocument();
     const adminRow = await loadedMemberRow('Alex Villanueva');
+    const pageHeading = screen.getByRole('heading', { name: 'Organization & people', level: 1 });
+    expect(pageHeading).toHaveClass('visually-hidden');
+    expect(screen.getByText('ACCESS CONTROL')).toBeVisible();
+    expect(screen.getByText(/Manage the tenant profile/)).toBeVisible();
     expect(screen.getByText('Active members').nextElementSibling).toHaveTextContent('2');
     expect(screen.getByText('System administrators').nextElementSibling).toHaveTextContent('1');
     expect(screen.getByText('Pending invitations').nextElementSibling).toHaveTextContent('1');
